@@ -1,6 +1,6 @@
 # split-domains
 
-Domain lists for EN1GMA split mode.
+Domain lists for split mode.
 
 ## Structure
 
