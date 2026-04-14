@@ -1,4 +1,4 @@
 .DS_Store
-__pycache__/
-*.pyc
 state/*.db
+/split-engine
+/split-engine.exe

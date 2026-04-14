@@ -36,12 +36,28 @@ Automatically discover domains that should go through split routing, unlock them
 
 ## Repository layout
 
+- `cmd/split-engine/` — CLI entry point
+- `internal/storage/` — SQLite access layer + embedded schema
+- `internal/watcher/` — DNS event ingest
+- `internal/prober/` — staged DNS/TCP/TLS probes
+- `internal/decision/` — probe → verdict (stub)
+- `internal/scorer/` — evidence accumulation and promotion (stub)
 - `docs/` — architecture and design notes
 - `domains/` — manual and curated domain sources
-- `engine/` — watcher, prober, scorer, state logic
-- `schema/` — SQLite schema and migrations
-- `scripts/` — helper scripts and builders
-- `state/` — local state files for development only
+- `state/` — local state files for development only (SQLite DB, gitignored)
+
+## Build & run
+
+Requires Go 1.23+.
+
+```sh
+go build ./cmd/split-engine
+./split-engine init-db
+./split-engine probe example.com
+./split-engine observe some.domain.dev 10.10.0.2
+./split-engine list
+go test ./...
+```
 
 ## States
 
