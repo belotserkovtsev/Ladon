@@ -74,8 +74,12 @@ func Probe(ctx context.Context, domain string, timeout time.Duration) Result {
 		return r
 	}
 
+	// We probe TLS for *reachability*, not trust: the ultimate consumer is the
+	// user's device (which may trust CAs we don't, e.g. Russian Mincifry CA).
+	// Cert validity is not the engine's concern — connect + handshake bytes is.
 	tlsConn, err := tls.DialWithDialer(&dialer, "tcp", net.JoinHostPort(reachable, "443"), &tls.Config{
-		ServerName: domain,
+		ServerName:         domain,
+		InsecureSkipVerify: true, // #nosec G402 — intentional, see comment above
 	})
 	if err != nil {
 		r.FailureReason = "tls:" + err.Error()
