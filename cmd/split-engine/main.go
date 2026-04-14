@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/belotserkovtsev/split-engine/internal/dnsmasq"
+	"github.com/belotserkovtsev/split-engine/internal/engine"
 	"github.com/belotserkovtsev/split-engine/internal/prober"
 	"github.com/belotserkovtsev/split-engine/internal/storage"
 	"github.com/belotserkovtsev/split-engine/internal/tail"
@@ -34,7 +35,9 @@ commands:
   probe <domain>
   observe <domain> [peer]
   list [N]
-  tail [-from-start] <logfile>`)
+  hot
+  tail [-from-start] <logfile>
+  run  [-from-start] <logfile>`)
 }
 
 func main() {
@@ -118,6 +121,18 @@ func main() {
 	case "tail":
 		tailCmd(ctx, store, args[1:])
 
+	case "run":
+		runCmd(ctx, store, args[1:])
+
+	case "hot":
+		hots, err := store.ListHotEntries(ctx, time.Now().UTC())
+		if err != nil {
+			fatal("hot: %v", err)
+		}
+		for _, h := range hots {
+			fmt.Println(h)
+		}
+
 	default:
 		fatal("unknown command: %s", args[0])
 	}
@@ -181,6 +196,21 @@ func tailCmd(ctx context.Context, store *storage.Store, rest []string) {
 			fmt.Fprintf(os.Stderr, "tail: ingested=%d skipped=%d\n", ingested, skipped)
 		}
 	}
+}
+
+func runCmd(ctx context.Context, store *storage.Store, rest []string) {
+	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	fromStart := fs.Bool("from-start", false, "process whole log from the beginning")
+	_ = fs.Parse(rest)
+	if fs.NArg() < 1 {
+		fatal("run: missing logfile")
+	}
+	cfg := engine.Defaults(fs.Arg(0))
+	cfg.FromStart = *fromStart
+	if err := engine.Run(ctx, store, cfg); err != nil {
+		fatal("engine: %v", err)
+	}
+	fmt.Fprintln(os.Stderr, "engine: stopped")
 }
 
 func toStorageResult(r prober.Result) storage.ProbeResult {

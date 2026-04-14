@@ -56,13 +56,19 @@ go build ./cmd/split-engine
 ./split-engine probe example.com
 ./split-engine observe some.domain.dev 10.10.0.2
 ./split-engine list
-./split-engine tail /var/log/dnsmasq.log              # follow live
-./split-engine tail -from-start /var/log/dnsmasq.log  # process existing content
+./split-engine hot                                    # currently-live hot entries
+./split-engine tail /var/log/dnsmasq.log              # follow log only
+./split-engine run /var/log/dnsmasq.log               # tail + probe + publish
 go test ./...
 ```
 
-`tail` ingests one observation per client `query[A|AAAA]` line emitted by
-dnsmasq (`log-queries=extra`). Gateway's own queries (10.10.0.1) are skipped.
+`run` boots the full pipeline: log tail → ingest → probe queue → decision →
+hot_entries → publisher (writes the current routable set to
+`state/published-domains.txt`).
+
+Probes flag a domain as `hot` when DNS resolves but TCP:443 or TLS handshake
+fails — typical signature of a blocked or untrusted-CA destination. A short
+cooldown prevents re-probing on every observation.
 
 ## States
 

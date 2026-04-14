@@ -144,6 +144,99 @@ type Domain struct {
 	LastProbeID   *int64
 }
 
+// ListProbeCandidates returns domains that are ready for a probe — eligible
+// states, cooldown expired (or null). Ordered by oldest cooldown first, then
+// most-recent observations first.
+func (s *Store) ListProbeCandidates(ctx context.Context, limit int, now time.Time) ([]Domain, error) {
+	ts := formatTime(now)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT domain, COALESCE(etld_plus_one, ''), COALESCE(first_seen_at, ''),
+		       COALESCE(last_seen_at, ''), hit_count, peer_count, state, score,
+		       COALESCE(cooldown_until, ''), last_probe_id
+		FROM domains
+		WHERE state IN ('new', 'watch', 'hot')
+		  AND (cooldown_until IS NULL OR cooldown_until <= ?)
+		ORDER BY COALESCE(cooldown_until, first_seen_at) ASC, last_seen_at DESC
+		LIMIT ?
+	`, ts, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Domain
+	for rows.Next() {
+		var d Domain
+		if err := rows.Scan(
+			&d.Domain, &d.ETLDPlusOne, &d.FirstSeenAt, &d.LastSeenAt,
+			&d.HitCount, &d.PeerCount, &d.State, &d.Score,
+			&d.CooldownUntil, &d.LastProbeID,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// SetDomainState updates state and cooldown_until atomically.
+func (s *Store) SetDomainState(ctx context.Context, domain, state string, cooldownUntil time.Time) error {
+	var cd any
+	if cooldownUntil.IsZero() {
+		cd = nil
+	} else {
+		cd = formatTime(cooldownUntil)
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE domains SET state = ?, cooldown_until = ? WHERE domain = ?`,
+		state, cd, domain)
+	return err
+}
+
+// UpsertHotEntry adds or refreshes a hot_entries row.
+func (s *Store) UpsertHotEntry(ctx context.Context, domain, reason string, expiresAt time.Time) error {
+	now := formatTime(time.Now().UTC())
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO hot_entries (domain, expires_at, reason, created_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(domain) DO UPDATE SET
+		  expires_at = excluded.expires_at,
+		  reason = excluded.reason
+	`, domain, formatTime(expiresAt), reason, now)
+	return err
+}
+
+// ListHotEntries returns currently-live hot_entries (expires_at > now).
+func (s *Store) ListHotEntries(ctx context.Context, now time.Time) ([]string, error) {
+	ts := formatTime(now)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT domain FROM hot_entries WHERE expires_at > ? ORDER BY domain`, ts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// ExpireHotEntries deletes rows where expires_at <= now. Returns deleted count.
+func (s *Store) ExpireHotEntries(ctx context.Context, now time.Time) (int64, error) {
+	ts := formatTime(now)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM hot_entries WHERE expires_at <= ?`, ts)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 func (s *Store) ListRecentDomains(ctx context.Context, limit int) ([]Domain, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT domain, COALESCE(etld_plus_one, ''), COALESCE(first_seen_at, ''),
