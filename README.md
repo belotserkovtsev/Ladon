@@ -1,8 +1,8 @@
-# split-engine
+# ladon
 
-[![CI](https://github.com/belotserkovtsev/split-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/belotserkovtsev/split-engine/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/belotserkovtsev/split-engine?include_prereleases&sort=semver)](https://github.com/belotserkovtsev/split-engine/releases)
-[![Go](https://img.shields.io/github/go-mod/go-version/belotserkovtsev/split-engine)](go.mod)
+[![CI](https://github.com/belotserkovtsev/ladon/actions/workflows/ci.yml/badge.svg)](https://github.com/belotserkovtsev/ladon/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/belotserkovtsev/ladon?include_prereleases&sort=semver)](https://github.com/belotserkovtsev/ladon/releases)
+[![Go](https://img.shields.io/github/go-mod/go-version/belotserkovtsev/ladon)](go.mod)
 
 Умный движок split-маршрутизации для VPN-шлюзов в сетях с DPI.
 Наблюдает DNS-трафик клиентов, проверяет доменам достижимость напрямую,
@@ -121,15 +121,15 @@ flowchart LR
 ```bash
 # 1. Скачать релиз
 TAG=v0.1.0
-curl -L "https://github.com/belotserkovtsev/split-engine/releases/download/${TAG}/split-engine-linux-amd64.tar.gz" \
+curl -L "https://github.com/belotserkovtsev/ladon/releases/download/${TAG}/ladon-linux-amd64.tar.gz" \
   | sudo tar -xz -C /opt
 
-sudo mv /opt/split-engine-linux-amd64-${TAG} /opt/split-engine
-sudo mkdir -p /opt/split-engine/state /etc/split-engine
+sudo mv /opt/ladon-linux-amd64-${TAG} /opt/ladon
+sudo mkdir -p /opt/ladon/state /etc/ladon
 
 # 2. Примеры manual-списков
-sudo cp /opt/split-engine/manual-allow.txt.example /etc/split-engine/manual-allow.txt
-sudo cp /opt/split-engine/manual-deny.txt.example  /etc/split-engine/manual-deny.txt
+sudo cp /opt/ladon/manual-allow.txt.example /etc/ladon/manual-allow.txt
+sudo cp /opt/ladon/manual-deny.txt.example  /etc/ladon/manual-deny.txt
 
 # 3. Создать ipset и правило в iptables mangle
 sudo ipset create prod hash:ip family inet maxelem 65536
@@ -138,16 +138,16 @@ sudo iptables -t mangle -A WG_ROUTE -m set --match-set prod dst \
 sudo ipset save > /etc/iptables/ipsets   # чтобы переживало reboot
 
 # 4. Инициализировать БД и поставить сервис
-sudo /opt/split-engine/split-engine \
-  -db /opt/split-engine/state/engine.db init-db
-sudo install -m 0644 /opt/split-engine/split-engine.service \
+sudo /opt/ladon/ladon \
+  -db /opt/ladon/state/engine.db init-db
+sudo install -m 0644 /opt/ladon/ladon.service \
   /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now split-engine
+sudo systemctl enable --now ladon
 
 # 5. Проверить
-systemctl status split-engine
-journalctl -u split-engine -f
+systemctl status ladon
+journalctl -u ladon -f
 ```
 
 Подробнее — см. [release/INSTALL.md](release/INSTALL.md).
@@ -156,10 +156,10 @@ journalctl -u split-engine -f
 
 ## 🛠 Конфигурация
 
-Все флаги передаются через systemd unit (`/etc/systemd/system/split-engine.service`):
+Все флаги передаются через systemd unit (`/etc/systemd/system/ladon.service`):
 
 ```
-split-engine -db <path> run [-from-start] [-manual-allow <path>] [-manual-deny <path>] <dnsmasq-log-path>
+ladon -db <path> run [-from-start] [-manual-allow <path>] [-manual-deny <path>] <dnsmasq-log-path>
 ```
 
 Внутри [`internal/engine/engine.go`](internal/engine/engine.go) в `Defaults()`:
@@ -183,7 +183,7 @@ split-engine -db <path> run [-from-start] [-manual-allow <path>] [-manual-deny <
 Вся state-data живёт в SQLite. Полезные запросы:
 
 ```bash
-DB=/opt/split-engine/state/engine.db
+DB=/opt/ladon/state/engine.db
 
 # Распределение по состояниям
 sqlite3 "$DB" "SELECT state, COUNT(*) FROM domains GROUP BY state"
@@ -209,7 +209,7 @@ sqlite3 -column "$DB" \
    WHERE promoted_at > datetime('now','-1 hour')"
 ```
 
-Live-логи engine: `journalctl -u split-engine -f`.
+Live-логи engine: `journalctl -u ladon -f`.
 
 ---
 
@@ -223,14 +223,14 @@ go test -race -short ./...
 go test -v -run TestPipeline ./internal/engine/
 
 # Кросс-компиляция под Linux
-GOOS=linux GOARCH=amd64 go build -o dist/split-engine ./cmd/split-engine
+GOOS=linux GOARCH=amd64 go build -o dist/ladon ./cmd/ladon
 ```
 
 ### Структура пакетов
 
 | Путь | Ответственность |
 |---|---|
-| `cmd/split-engine/` | CLI: `init-db`, `run`, `probe`, `observe`, `list`, `hot`, `tail` |
+| `cmd/ladon/` | CLI: `init-db`, `run`, `probe`, `observe`, `list`, `hot`, `tail` |
 | `internal/tail/` | fsnotify-based follower для dnsmasq-лога |
 | `internal/dnsmasq/` | Парсер log-строк (query / reply / cached / forwarded) |
 | `internal/watcher/` | Нормализация и ingest DNS-событий |

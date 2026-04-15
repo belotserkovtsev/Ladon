@@ -26,19 +26,19 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           mkdir -p dist
           for ARCH in amd64 arm64; do
-            STAGE="dist/split-engine-linux-${ARCH}-${TAG}"
+            STAGE="dist/ladon-linux-${ARCH}-${TAG}"
             mkdir -p "${STAGE}"
             CGO_ENABLED=0 GOOS=linux GOARCH="${ARCH}" \
               go build -trimpath -ldflags="-s -w -X main.version=${TAG}" \
-              -o "${STAGE}/split-engine" ./cmd/split-engine
-            cp release/split-engine.service          "${STAGE}/"
+              -o "${STAGE}/ladon" ./cmd/ladon
+            cp release/ladon.service          "${STAGE}/"
             cp release/manual-allow.txt.example      "${STAGE}/"
             cp release/manual-deny.txt.example       "${STAGE}/"
             cp release/INSTALL.md                    "${STAGE}/"
             cp README.md                             "${STAGE}/"
-            tar -czf "dist/split-engine-linux-${ARCH}.tar.gz" -C dist "split-engine-linux-${ARCH}-${TAG}"
-            sha256sum "dist/split-engine-linux-${ARCH}.tar.gz" \
-              > "dist/split-engine-linux-${ARCH}.tar.gz.sha256"
+            tar -czf "dist/ladon-linux-${ARCH}.tar.gz" -C dist "ladon-linux-${ARCH}-${TAG}"
+            sha256sum "dist/ladon-linux-${ARCH}.tar.gz" \
+              > "dist/ladon-linux-${ARCH}.tar.gz.sha256"
           done
           ls -la dist/
 

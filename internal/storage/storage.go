@@ -1,4 +1,4 @@
-// Package storage is the SQLite access layer for split-engine.
+// Package storage is the SQLite access layer for ladon.
 package storage
 
 import (
@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/belotserkovtsev/split-engine/internal/etld"
+	"github.com/belotserkovtsev/ladon/internal/etld"
 	_ "modernc.org/sqlite"
 )
 

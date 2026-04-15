@@ -9,17 +9,17 @@ import (
 	"net"
 	"time"
 
-	"github.com/belotserkovtsev/split-engine/internal/decision"
-	"github.com/belotserkovtsev/split-engine/internal/dnsmasq"
-	"github.com/belotserkovtsev/split-engine/internal/etld"
-	"github.com/belotserkovtsev/split-engine/internal/ipset"
-	"github.com/belotserkovtsev/split-engine/internal/manual"
-	"github.com/belotserkovtsev/split-engine/internal/prober"
-	"github.com/belotserkovtsev/split-engine/internal/publisher"
-	"github.com/belotserkovtsev/split-engine/internal/scorer"
-	"github.com/belotserkovtsev/split-engine/internal/storage"
-	"github.com/belotserkovtsev/split-engine/internal/tail"
-	"github.com/belotserkovtsev/split-engine/internal/watcher"
+	"github.com/belotserkovtsev/ladon/internal/decision"
+	"github.com/belotserkovtsev/ladon/internal/dnsmasq"
+	"github.com/belotserkovtsev/ladon/internal/etld"
+	"github.com/belotserkovtsev/ladon/internal/ipset"
+	"github.com/belotserkovtsev/ladon/internal/manual"
+	"github.com/belotserkovtsev/ladon/internal/prober"
+	"github.com/belotserkovtsev/ladon/internal/publisher"
+	"github.com/belotserkovtsev/ladon/internal/scorer"
+	"github.com/belotserkovtsev/ladon/internal/storage"
+	"github.com/belotserkovtsev/ladon/internal/tail"
+	"github.com/belotserkovtsev/ladon/internal/watcher"
 )
 
 // Config holds runtime knobs.

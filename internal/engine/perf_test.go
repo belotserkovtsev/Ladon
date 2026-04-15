@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/belotserkovtsev/split-engine/internal/storage"
+	"github.com/belotserkovtsev/ladon/internal/storage"
 )
 
 // unreachableIP is reserved TEST-NET-1 (RFC 5737) — it never answers; kernel

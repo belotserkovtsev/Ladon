@@ -1,17 +1,17 @@
 [Unit]
-Description=split-engine — smart split routing for DPI-censored networks
-Documentation=https://github.com/belotserkovtsev/split-engine
+Description=ladon — smart split routing for DPI-censored networks
+Documentation=https://github.com/belotserkovtsev/ladon
 After=network-online.target dnsmasq.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/split-engine
-ExecStart=/opt/split-engine/split-engine \
-  -db /opt/split-engine/state/engine.db \
+WorkingDirectory=/opt/ladon
+ExecStart=/opt/ladon/ladon \
+  -db /opt/ladon/state/engine.db \
   run \
-  -manual-allow /etc/split-engine/manual-allow.txt \
-  -manual-deny  /etc/split-engine/manual-deny.txt \
+  -manual-allow /etc/ladon/manual-allow.txt \
+  -manual-deny  /etc/ladon/manual-deny.txt \
   /var/log/dnsmasq.log
 Restart=always
 RestartSec=5

@@ -9,7 +9,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/belotserkovtsev/split-engine/internal/storage"
+	"github.com/belotserkovtsev/ladon/internal/storage"
 )
 
 // Config tunes promotion thresholds.

@@ -15,7 +15,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/belotserkovtsev/split-engine/internal/storage"
+	"github.com/belotserkovtsev/ladon/internal/storage"
 )
 
 // PublishDomains writes the current routable domain set to outPath atomically.

@@ -10,7 +10,7 @@
 // We'll refine these rules in Phase 4 (scorer) once we have repeated evidence.
 package decision
 
-import "github.com/belotserkovtsev/split-engine/internal/prober"
+import "github.com/belotserkovtsev/ladon/internal/prober"
 
 type Verdict string
 

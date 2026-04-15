@@ -1,4 +1,4 @@
-# split-engine: manual deny list
+# ladon: manual deny list
 #
 # Один домен на строку. Пустые строки и '#' комментарии игнорируются.
 #
