@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/belotserkovtsev/split-engine/internal/etld"
 	_ "modernc.org/sqlite"
 )
 
@@ -25,8 +26,43 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) Init(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, schemaSQL)
+	if _, err := s.db.ExecContext(ctx, schemaSQL); err != nil {
+		return err
+	}
+	// Backfill etld_plus_one for any rows that pre-date the column population.
+	_, err := s.BackfillETLDPlusOne(ctx)
 	return err
+}
+
+// BackfillETLDPlusOne fills etld_plus_one for rows where it is NULL or empty.
+// Returns the number of rows updated.
+func (s *Store) BackfillETLDPlusOne(ctx context.Context) (int, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT domain FROM domains WHERE etld_plus_one IS NULL OR etld_plus_one = ''`)
+	if err != nil {
+		return 0, err
+	}
+	var todo []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		todo = append(todo, d)
+	}
+	rows.Close()
+
+	updated := 0
+	for _, d := range todo {
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE domains SET etld_plus_one = ? WHERE domain = ?`,
+			etld.Compute(d), d); err != nil {
+			return updated, err
+		}
+		updated++
+	}
+	return updated, nil
 }
 
 func formatTime(t time.Time) string {
@@ -60,9 +96,9 @@ func (s *Store) UpsertDomain(ctx context.Context, domain, peer string, seenAt ti
 			peerCount = 1
 		}
 		_, err = tx.ExecContext(ctx, `
-			INSERT INTO domains (domain, first_seen_at, last_seen_at, hit_count, peer_count, state)
-			VALUES (?, ?, ?, 1, ?, 'new')
-		`, domain, ts, ts, peerCount)
+			INSERT INTO domains (domain, etld_plus_one, first_seen_at, last_seen_at, hit_count, peer_count, state)
+			VALUES (?, ?, ?, ?, 1, ?, 'new')
+		`, domain, etld.Compute(domain), ts, ts, peerCount)
 	}
 	if err != nil {
 		return err
