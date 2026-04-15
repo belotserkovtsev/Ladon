@@ -3,6 +3,7 @@
 [![CI](https://github.com/belotserkovtsev/ladon/actions/workflows/ci.yml/badge.svg)](https://github.com/belotserkovtsev/ladon/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/belotserkovtsev/ladon?include_prereleases&sort=semver)](https://github.com/belotserkovtsev/ladon/releases)
 [![Go](https://img.shields.io/github/go-mod/go-version/belotserkovtsev/ladon)](go.mod)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Автоматический split-tunneling для VPN-шлюзов в сетях с DPI**
 
@@ -125,20 +126,44 @@ flowchart LR
 
 ## 🧭 Состояния домена
 
+Каждый домен, который видит dnsmasq, проходит через конечный автомат.
+Состояние хранится в колонке `domains.state`, пара таблиц `hot_entries` и
+`cache_entries` хранят «живые» списки для роутинга.
+
 ```
- new  ──probe──▶  hot  ──≥50 fails / 24 ч──▶  cache  (постоянный)
-  │                │
-  │                └──expire 24 ч──▶ out of ipset (если не в cache)
-  │
-  └──probe direct OK──▶  ignore
+                  ┌─── probe: direct OK ──▶ ignore
+                  │
+ новая            │
+ query ──▶ new ───┤
+                  │
+                  └─── probe: TCP/TLS fail ──▶ hot ──≥50 fails/24 ч──▶ cache
+                                                │
+                                                └── TTL 24 ч истёк → запись
+                                                    удаляется из hot_entries
+                                                    (state остаётся пока
+                                                     следующий probe не
+                                                     переопределит)
 ```
 
-`manual-allow` и `manual-deny` — ручные override-ы оператора:
+| Состояние | Что значит | Как попадает | Как уходит |
+|---|---|---|---|
+| `new` | Видели DNS-query, но ещё не пробовали коннектиться | Первая ingest-строка | После первого probe |
+| `watch` | Промежуточное, зарезервировано под будущий scorer | — | — |
+| `ignore` | Прямой путь работает, тунель не нужен | Probe прошёл TCP+TLS | Следующий probe может вернуть в цикл, если начнёт падать |
+| `hot` | Probe обнаружил блок — домен временно в ipset | Probe упал на TCP или TLS | Домен выпадает из `hot_entries` через 24 ч после последнего fail; если столько же раз подтверждалось — scorer продвигает в `cache` |
+| `cache` | Стабильно заблокирован, в ipset навсегда | Scorer: ≥50 fails за 24 ч | Только оператором вручную (в v0.2.0 появится демоушн при обратном пробе) |
+| `manual` / `deny` | Override от оператора | Файлы `manual-allow.txt` / `manual-deny.txt` | Только редактированием файла + рестартом |
 
-- `manual-allow` — домен всегда в ipset, probe не выполняется.
-- `manual-deny` — домен никогда не пробуется и не туннелируется
-  (полезно для внутренних / LAN-сервисов и гео-fenced РФ-сервисов,
-  которые ломаются через VPN).
+### Manual override-ы
+
+- **`manual-allow`** — домен попадает в ipset без probe. Полезно, когда
+  блок проявляется на слое, который наш probe не видит (HTTP content
+  filtering, SNI-спуфинг), или когда вы хотите форсировать домен через
+  туннель из приватных соображений.
+- **`manual-deny`** — домен никогда не пробуется и не туннелируется.
+  Полезно для внутренних LAN-сервисов, гео-fenced российских сервисов
+  (Госуслуги, банки), которые ломаются через иностранный exit, и для
+  разного шумного мониторинга.
 
 ---
 
@@ -297,4 +322,6 @@ GOOS=linux GOARCH=amd64 go build -o dist/ladon ./cmd/ladon
 
 ## 📜 Лицензия
 
-Пока private — будет определена при публикации.
+[MIT](LICENSE). Делайте что хотите — форкайте, встраивайте, коммерческое
+использование, всё разрешено. Требуется только сохранить упоминание автора
+в копиях.
