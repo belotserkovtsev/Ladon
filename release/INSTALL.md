@@ -24,8 +24,12 @@ log-facility=/var/log/dnsmasq.log
 ## 2. Установка бинаря
 
 ```bash
-TAG=v0.1.0
 ARCH=amd64    # или arm64 для Raspberry Pi / ARM-серверов
+# Возьмём последнюю опубликованную версию.
+# Можно зафиксировать конкретную — например, TAG=v0.2.0
+TAG=$(curl -sSL "https://api.github.com/repos/belotserkovtsev/ladon/releases/latest" \
+  | grep '"tag_name":' | head -1 | cut -d'"' -f4)
+echo "installing $TAG for $ARCH"
 
 mkdir -p /opt/ladon/state /etc/ladon
 cd /tmp

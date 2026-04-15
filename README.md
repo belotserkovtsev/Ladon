@@ -249,8 +249,9 @@ flowchart TB
 ### Quickstart
 
 ```bash
-# 1. Скачать релиз
-TAG=v0.1.0
+# 1. Скачать последний релиз (или зафиксировать версию: TAG=v0.2.0)
+TAG=$(curl -sSL "https://api.github.com/repos/belotserkovtsev/ladon/releases/latest" \
+  | grep '"tag_name":' | head -1 | cut -d'"' -f4)
 curl -L "https://github.com/belotserkovtsev/ladon/releases/download/${TAG}/ladon-linux-amd64.tar.gz" \
   | sudo tar -xz -C /opt
 
