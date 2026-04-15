@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build + publish tarballs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build release tarballs
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p dist
+          for ARCH in amd64 arm64; do
+            STAGE="dist/split-engine-linux-${ARCH}-${TAG}"
+            mkdir -p "${STAGE}"
+            CGO_ENABLED=0 GOOS=linux GOARCH="${ARCH}" \
+              go build -trimpath -ldflags="-s -w -X main.version=${TAG}" \
+              -o "${STAGE}/split-engine" ./cmd/split-engine
+            cp release/split-engine.service          "${STAGE}/"
+            cp release/manual-allow.txt.example      "${STAGE}/"
+            cp release/manual-deny.txt.example       "${STAGE}/"
+            cp release/INSTALL.md                    "${STAGE}/"
+            cp README.md                             "${STAGE}/"
+            tar -czf "dist/split-engine-linux-${ARCH}.tar.gz" -C dist "split-engine-linux-${ARCH}-${TAG}"
+            sha256sum "dist/split-engine-linux-${ARCH}.tar.gz" \
+              > "dist/split-engine-linux-${ARCH}.tar.gz.sha256"
+          done
+          ls -la dist/
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

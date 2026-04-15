@@ -1,0 +1,27 @@
+[Unit]
+Description=split-engine — smart split routing for DPI-censored networks
+Documentation=https://github.com/belotserkovtsev/split-engine
+After=network-online.target dnsmasq.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/split-engine
+ExecStart=/opt/split-engine/split-engine \
+  -db /opt/split-engine/state/engine.db \
+  run \
+  -manual-allow /etc/split-engine/manual-allow.txt \
+  -manual-deny  /etc/split-engine/manual-deny.txt \
+  /var/log/dnsmasq.log
+Restart=always
+RestartSec=5
+
+# Hardening — engine only needs CAP_NET_ADMIN for ipset mutations if it ever
+# moves from exec'ing the CLI to netlink. Today it's root because `ipset add`
+# is root-only anyway.
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
