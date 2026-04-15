@@ -113,7 +113,7 @@ func TestPipelineLatencyQueryToHot(t *testing.T) {
 	// Default tail poll is 200ms, so the floor on detection is ~200ms + probe
 	// timeout. Budget 3s to cover slow-CI noise.
 	elapsed := waitForState(t, ctx, s, "blocked.test", "hot", 3*time.Second)
-	t.Logf("query→hot latency: %v (probe_timeout=%v, tail_poll=200ms)", elapsed, probeTimeout)
+	t.Logf("query→hot latency: %v (probe_timeout=%v, tailer=fsnotify)", elapsed, probeTimeout)
 
 	// Headroom for slower CI runners; any regression past the probe timeout
 	// envelope still fails loudly.
