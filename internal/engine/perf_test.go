@@ -175,8 +175,10 @@ func TestPipelineThroughput(t *testing.T) {
 
 	// Wait for all N domains to have completed at least one probe (state !=
 	// 'new'). Walking skeleton: we don't care about verdict, just that every
-	// domain made it through the pipeline.
-	deadline := 10 * time.Second
+	// domain made it through the pipeline. Generous deadline because GitHub
+	// Actions runners (2-CPU shared) routinely burst into other tenants and
+	// starve our probe goroutines for seconds at a time.
+	deadline := 30 * time.Second
 	t0 := time.Now()
 	for time.Since(t0) < deadline {
 		doms, err := s.ListRecentDomains(ctx, N+10)
