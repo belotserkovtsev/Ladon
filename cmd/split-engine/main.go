@@ -201,12 +201,16 @@ func tailCmd(ctx context.Context, store *storage.Store, rest []string) {
 func runCmd(ctx context.Context, store *storage.Store, rest []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	fromStart := fs.Bool("from-start", false, "process whole log from the beginning")
+	allow := fs.String("manual-allow", "", "path to manual allow list (optional)")
+	deny := fs.String("manual-deny", "", "path to manual deny list (optional)")
 	_ = fs.Parse(rest)
 	if fs.NArg() < 1 {
 		fatal("run: missing logfile")
 	}
 	cfg := engine.Defaults(fs.Arg(0))
 	cfg.FromStart = *fromStart
+	cfg.ManualAllowPath = *allow
+	cfg.ManualDenyPath = *deny
 	if err := engine.Run(ctx, store, cfg); err != nil {
 		fatal("engine: %v", err)
 	}

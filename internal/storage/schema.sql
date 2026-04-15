@@ -33,8 +33,18 @@ CREATE TABLE IF NOT EXISTS hot_entries (
 
 CREATE TABLE IF NOT EXISTS manual_entries (
     domain TEXT PRIMARY KEY,
-    list_name TEXT NOT NULL,
+    list_name TEXT NOT NULL,   -- 'allow' or 'deny'
     created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_manual_entries_list ON manual_entries(list_name);
+
+-- cache_entries is hot's older, steadier sibling: promoted only after
+-- repeated probe-failure evidence accumulates. No TTL; entries stay until
+-- an explicit re-probe reverses them (Phase 7) or operator deletes.
+CREATE TABLE IF NOT EXISTS cache_entries (
+    domain TEXT PRIMARY KEY,
+    promoted_at TEXT NOT NULL,
+    reason TEXT
 );
 
 -- Passive observation of upstream DNS replies: which IPs dnsmasq actually

@@ -1,12 +1,89 @@
-// Package scorer accumulates evidence and promotes stable domains from hot to cache.
-//
-// This is a stub. Real logic lands in Phase 4.
+// Package scorer promotes hot domains into cache once repeated-failure
+// evidence accumulates. Cache entries have no TTL and survive the 24h
+// hot_entries expiry sweep — engine will keep tunneling them until the
+// operator clears them or a future re-probe (Phase 7) reverses the call.
 package scorer
 
-import "github.com/belotserkovtsev/split-engine/internal/storage"
+import (
+	"context"
+	"log"
+	"time"
 
-// Compute returns a long-term confidence score for promotion into cache.
-// Currently always returns 0.
-func Compute(_ storage.Domain, _ []storage.ProbeResult) float64 {
-	return 0
+	"github.com/belotserkovtsev/split-engine/internal/storage"
+)
+
+// Config tunes promotion thresholds.
+type Config struct {
+	Interval      time.Duration // how often the scorer wakes up
+	Window        time.Duration // probes outside this window are ignored
+	FailThreshold int           // minimum failing probes required in window
+}
+
+// Defaults returns reasonable values: scan every 10 minutes, look at the last
+// 24 hours of probes, promote when ≥3 independent probes failed. A single
+// transient probe-fail won't promote — that's hot_entries' job.
+func Defaults() Config {
+	return Config{
+		Interval:      10 * time.Minute,
+		Window:        24 * time.Hour,
+		FailThreshold: 3,
+	}
+}
+
+// Run is a long-running goroutine. Cancel ctx to stop.
+func Run(ctx context.Context, store *storage.Store, cfg Config) error {
+	if cfg.FailThreshold <= 0 {
+		cfg.FailThreshold = 3
+	}
+	if cfg.Window <= 0 {
+		cfg.Window = 24 * time.Hour
+	}
+	if cfg.Interval <= 0 {
+		cfg.Interval = 10 * time.Minute
+	}
+
+	ticker := time.NewTicker(cfg.Interval)
+	defer ticker.Stop()
+
+	promote := func() {
+		now := time.Now().UTC()
+		since := now.Add(-cfg.Window)
+
+		hots, err := store.ListHotEntries(ctx, now)
+		if err != nil {
+			log.Printf("scorer: list hot: %v", err)
+			return
+		}
+		promoted := 0
+		for _, d := range hots {
+			fails, err := store.CountFailingProbes(ctx, d, since)
+			if err != nil {
+				log.Printf("scorer: count probes %q: %v", d, err)
+				continue
+			}
+			if fails < cfg.FailThreshold {
+				continue
+			}
+			if err := store.PromoteCache(ctx, d, "repeated_fail", now); err != nil {
+				log.Printf("scorer: promote %q: %v", d, err)
+				continue
+			}
+			promoted++
+		}
+		if promoted > 0 {
+			log.Printf("scorer: promoted %d hot → cache (window=%s threshold=%d)",
+				promoted, cfg.Window, cfg.FailThreshold)
+		}
+	}
+
+	promote() // initial pass so newly-started engine doesn't wait a full interval
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			promote()
+		}
+	}
 }

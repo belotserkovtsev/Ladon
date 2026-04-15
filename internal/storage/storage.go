@@ -219,6 +219,112 @@ func (s *Store) LookupIPs(ctx context.Context, domain string, freshSince time.Ti
 	return out, rows.Err()
 }
 
+// PromoteCache upserts a cache_entries row and flips the domain's state to
+// 'cache'. Cache entries have no TTL — they persist until a re-probe reverses
+// them or the operator clears the row.
+func (s *Store) PromoteCache(ctx context.Context, domain, reason string, at time.Time) error {
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	ts := formatTime(at)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO cache_entries (domain, promoted_at, reason)
+		VALUES (?, ?, ?)
+		ON CONFLICT(domain) DO UPDATE SET promoted_at = excluded.promoted_at, reason = excluded.reason
+	`, domain, ts, nullableString(reason)); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE domains SET state = 'cache' WHERE domain = ?`, domain); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ListCacheEntries returns all cached domains.
+func (s *Store) ListCacheEntries(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT domain FROM cache_entries ORDER BY domain`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// CountFailingProbes returns how many probes for `domain` since `since`
+// recorded a failure (TCP or TLS not OK). Used by scorer to decide when
+// repeated evidence warrants a hot → cache promotion.
+func (s *Store) CountFailingProbes(ctx context.Context, domain string, since time.Time) (int, error) {
+	ts := formatTime(since)
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM probes
+		WHERE domain = ? AND created_at >= ? AND (COALESCE(tcp_ok, 0) = 0 OR COALESCE(tls_ok, 0) = 0)
+	`, domain, ts).Scan(&n)
+	return n, err
+}
+
+// UpsertManual adds a row to manual_entries. listName is 'allow' or 'deny'.
+func (s *Store) UpsertManual(ctx context.Context, domain, listName string) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO manual_entries (domain, list_name, created_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(domain) DO UPDATE SET list_name = excluded.list_name
+	`, domain, listName, formatTime(time.Now().UTC()))
+	return err
+}
+
+// ListManualByList returns domains in a given list.
+func (s *Store) ListManualByList(ctx context.Context, listName string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT domain FROM manual_entries WHERE list_name = ? ORDER BY domain`, listName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// IsInDenyList reports whether domain (or its eTLD+1, if different) is in
+// the manual deny list. Callers should use this at ingest time to short-
+// circuit noisy probing of intentionally-excluded destinations.
+func (s *Store) IsInDenyList(ctx context.Context, domain, etldPlusOne string) (bool, error) {
+	args := []any{domain}
+	q := `SELECT 1 FROM manual_entries WHERE list_name = 'deny' AND domain = ?`
+	if etldPlusOne != "" && etldPlusOne != domain {
+		q += ` OR (list_name = 'deny' AND domain = ?)`
+		args = append(args, etldPlusOne)
+	}
+	q += ` LIMIT 1`
+	var one int
+	err := s.db.QueryRowContext(ctx, q, args...).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 // LookupIPsByETLD returns distinct IPs observed for any subdomain of etld+1.
 // Used by ipset-syncer to expand a single hot domain to the CDN family —
 // Meta's `netseer` UUID subdomains, for instance, all share fbcdn.net IPs.

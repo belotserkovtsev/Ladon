@@ -13,8 +13,10 @@ import (
 	"github.com/belotserkovtsev/split-engine/internal/dnsmasq"
 	"github.com/belotserkovtsev/split-engine/internal/etld"
 	"github.com/belotserkovtsev/split-engine/internal/ipset"
+	"github.com/belotserkovtsev/split-engine/internal/manual"
 	"github.com/belotserkovtsev/split-engine/internal/prober"
 	"github.com/belotserkovtsev/split-engine/internal/publisher"
+	"github.com/belotserkovtsev/split-engine/internal/scorer"
 	"github.com/belotserkovtsev/split-engine/internal/storage"
 	"github.com/belotserkovtsev/split-engine/internal/tail"
 	"github.com/belotserkovtsev/split-engine/internal/watcher"
@@ -35,6 +37,9 @@ type Config struct {
 	IpsetName        string        // name of the ipset to reconcile (empty → disabled)
 	IpsetInterval    time.Duration // ipset reconcile cadence
 	DNSFreshness     time.Duration // how recent a dns_cache entry must be to ship IPs to ipset
+	Scorer           scorer.Config // hot → cache promotion settings
+	ManualAllowPath  string        // optional path to manual allow list file
+	ManualDenyPath   string        // optional path to manual deny list file
 	IgnorePeer       string        // peer IP to skip (gateway self, etc.)
 }
 
@@ -53,19 +58,35 @@ func Defaults(logPath string) Config {
 		IpsetName:       "prod",
 		IpsetInterval:   5 * time.Second,
 		DNSFreshness:    6 * time.Hour,
+		Scorer:          scorer.Defaults(),
+		ManualAllowPath: "",
+		ManualDenyPath:  "",
 		IgnorePeer:      "10.10.0.1",
 	}
 }
 
 // Run starts all pipeline stages and blocks until ctx is cancelled.
 func Run(ctx context.Context, store *storage.Store, cfg Config) error {
-	errCh := make(chan error, 5)
+	// Seed manual lists (best-effort — missing files are fine).
+	if n, err := manual.Load(ctx, store, cfg.ManualAllowPath, "allow"); err != nil {
+		log.Printf("manual allow load: %v", err)
+	} else if n > 0 {
+		log.Printf("manual allow: loaded %d entries from %s", n, cfg.ManualAllowPath)
+	}
+	if n, err := manual.Load(ctx, store, cfg.ManualDenyPath, "deny"); err != nil {
+		log.Printf("manual deny load: %v", err)
+	} else if n > 0 {
+		log.Printf("manual deny: loaded %d entries from %s", n, cfg.ManualDenyPath)
+	}
+
+	errCh := make(chan error, 6)
 
 	go func() { errCh <- runTailer(ctx, store, cfg) }()
 	go func() { errCh <- runProbeWorker(ctx, store, cfg) }()
 	go func() { errCh <- runExpirySweeper(ctx, store, cfg) }()
 	go func() { errCh <- runPublisher(ctx, store, cfg) }()
 	go func() { errCh <- runIpsetSyncer(ctx, store, cfg) }()
+	go func() { errCh <- scorer.Run(ctx, store, cfg.Scorer) }()
 
 	<-ctx.Done()
 	// Drain one error if any stage exited early with an actual error.
@@ -105,6 +126,12 @@ func runTailer(ctx context.Context, store *storage.Store, cfg Config) error {
 			switch ev.Action {
 			case dnsmasq.Query:
 				if ev.Peer == "" || ev.Peer == cfg.IgnorePeer {
+					skipped++
+					continue
+				}
+				// Honour the manual deny list — skip ingest entirely so the
+				// domain never reaches probes or hot_entries.
+				if deny, _ := store.IsInDenyList(ctx, ev.Domain, etld.Compute(ev.Domain)); deny {
 					skipped++
 					continue
 				}
@@ -293,21 +320,60 @@ func runIpsetSyncer(ctx context.Context, store *storage.Store, cfg Config) error
 			log.Printf("ipset: list hot: %v", err)
 			return
 		}
+		cache, err := store.ListCacheEntries(ctx)
+		if err != nil {
+			log.Printf("ipset: list cache: %v", err)
+		}
+		allow, err := store.ListManualByList(ctx, "allow")
+		if err != nil {
+			log.Printf("ipset: list allow: %v", err)
+		}
 
-		// Count hot siblings per eTLD+1. Aggregation across a family only
-		// makes sense when multiple subdomains confirm the same root is
-		// blocked — otherwise we'd over-tunnel generic eTLDs (amazonaws.com,
-		// googleapis.com) based on a single quirky subdomain.
-		hotByETLD := map[string]int{}
+		// Union of all "must-tunnel" sources. Dedupe along the way because
+		// one domain can sit in multiple lists (e.g. hot + just-promoted-cache).
+		sources := make([]string, 0, len(hots)+len(cache)+len(allow))
+		seenSrc := map[string]struct{}{}
+		for _, d := range hots {
+			if _, ok := seenSrc[d]; ok {
+				continue
+			}
+			seenSrc[d] = struct{}{}
+			sources = append(sources, d)
+		}
+		for _, d := range cache {
+			if _, ok := seenSrc[d]; ok {
+				continue
+			}
+			seenSrc[d] = struct{}{}
+			sources = append(sources, d)
+		}
+		for _, d := range allow {
+			if _, ok := seenSrc[d]; ok {
+				continue
+			}
+			seenSrc[d] = struct{}{}
+			sources = append(sources, d)
+		}
+
+		// Count confirmed-blocked siblings per eTLD+1 (hot + cache; manual
+		// allow doesn't count as blocking evidence, just explicit routing).
+		// Aggregation needs ≥2 confirmations to avoid over-tunneling on
+		// generic eTLDs (amazonaws.com, googleapis.com).
+		confirmedByETLD := map[string]int{}
 		for _, d := range hots {
 			if r := etld.Compute(d); r != "" {
-				hotByETLD[r]++
+				confirmedByETLD[r]++
+			}
+		}
+		for _, d := range cache {
+			if r := etld.Compute(d); r != "" {
+				confirmedByETLD[r]++
 			}
 		}
 
 		desired := map[string]struct{}{}
 		expandedETLDs := map[string]struct{}{}
-		for _, d := range hots {
+		for _, d := range sources {
 			ips, err := store.LookupIPs(ctx, d, freshSince)
 			if err != nil {
 				log.Printf("ipset: lookup ips %q: %v", d, err)
@@ -316,11 +382,8 @@ func runIpsetSyncer(ctx context.Context, store *storage.Store, cfg Config) error
 			for _, ip := range ips {
 				desired[ip] = struct{}{}
 			}
-			// Expand to all IPs of the eTLD+1 family when ≥2 siblings are hot.
-			// This auto-tunnels future unseen subdomains (Meta netseer UUIDs,
-			// Instagram scontent-*, CloudFront distributions).
 			root := etld.Compute(d)
-			if root == "" || hotByETLD[root] < 2 {
+			if root == "" || confirmedByETLD[root] < 2 {
 				continue
 			}
 			if _, done := expandedETLDs[root]; done {
