@@ -62,7 +62,7 @@ func TestInsertProbeLinksToDomain(t *testing.T) {
 		TCPOK:       &ok,
 		TLSOK:       &ok,
 		ResolvedIPs: []string{"93.184.216.34"},
-		LatencyMS:  42,
+		LatencyMS:   42,
 	}, time.Time{})
 	if err != nil {
 		t.Fatal(err)

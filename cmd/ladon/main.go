@@ -1,4 +1,4 @@
-// split-engine CLI.
+// ladon CLI.
 //
 // Subcommands:
 //
@@ -20,16 +20,16 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/belotserkovtsev/split-engine/internal/dnsmasq"
-	"github.com/belotserkovtsev/split-engine/internal/engine"
-	"github.com/belotserkovtsev/split-engine/internal/prober"
-	"github.com/belotserkovtsev/split-engine/internal/storage"
-	"github.com/belotserkovtsev/split-engine/internal/tail"
-	"github.com/belotserkovtsev/split-engine/internal/watcher"
+	"github.com/belotserkovtsev/ladon/internal/dnsmasq"
+	"github.com/belotserkovtsev/ladon/internal/engine"
+	"github.com/belotserkovtsev/ladon/internal/prober"
+	"github.com/belotserkovtsev/ladon/internal/storage"
+	"github.com/belotserkovtsev/ladon/internal/tail"
+	"github.com/belotserkovtsev/ladon/internal/watcher"
 )
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `usage: split-engine [-db PATH] <cmd> [args]
+	fmt.Fprintln(os.Stderr, `usage: ladon [-db PATH] <cmd> [args]
 commands:
   init-db
   probe <domain>
@@ -41,7 +41,7 @@ commands:
 }
 
 func main() {
-	dbPath := flag.String("db", filepath.Join("state", "split-engine.db"), "path to SQLite database")
+	dbPath := flag.String("db", filepath.Join("state", "ladon.db"), "path to SQLite database")
 	flag.Usage = usage
 	flag.Parse()
 	args := flag.Args()
@@ -232,6 +232,6 @@ func toStorageResult(r prober.Result) storage.ProbeResult {
 }
 
 func fatal(format string, a ...any) {
-	fmt.Fprintf(os.Stderr, "split-engine: "+format+"\n", a...)
+	fmt.Fprintf(os.Stderr, "ladon: "+format+"\n", a...)
 	os.Exit(1)
 }

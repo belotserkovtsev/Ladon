@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/belotserkovtsev/split-engine/internal/storage"
+	"github.com/belotserkovtsev/ladon/internal/storage"
 )
 
 // Event is a normalized DNS observation.

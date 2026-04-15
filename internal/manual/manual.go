@@ -10,7 +10,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/belotserkovtsev/split-engine/internal/storage"
+	"github.com/belotserkovtsev/ladon/internal/storage"
 )
 
 // Load reads path and upserts each domain into manual_entries under listName.

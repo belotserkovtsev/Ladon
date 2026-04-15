@@ -1,4 +1,4 @@
 .DS_Store
 state/*.db
-/split-engine
-/split-engine.exe
+/ladon
+/ladon.exe
