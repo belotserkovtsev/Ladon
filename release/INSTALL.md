@@ -48,7 +48,8 @@ install -m 0644 manual-deny.txt.example  /etc/ladon/manual-deny.txt
 ipset create prod hash:ip family inet maxelem 65536
 
 # Добавить правило в твою существующую mangle-цепочку WG_ROUTE.
-# Пример для pipeline, где peer 10.10.0.2 получает fwmark 0x1 → таблица enigma → stun0:
+# Пример для pipeline, где peer 10.10.0.2 получает fwmark 0x1 → custom
+# routing table → upstream tunnel interface:
 iptables -t mangle -A WG_ROUTE \
   -s 10.10.0.2/32 \
   -m set --match-set prod dst \
@@ -61,16 +62,18 @@ ipset save    > /etc/iptables/ipsets
 systemctl enable netfilter-persistent
 ```
 
-Подробная схема iptables/ip-rule для cascading gateway:
+Подробная схема iptables/ip-rule для cascading gateway (замени `tun0` на
+имя твоего upstream-интерфейса):
 
 ```
-ip rule add fwmark 0x1 table enigma priority 1000
-echo '666 enigma' >> /etc/iproute2/rt_tables
-ip route replace default dev stun0 table enigma
+ip rule add fwmark 0x1 table ladon priority 1000
+echo '666 ladon' >> /etc/iproute2/rt_tables
+ip route replace default dev tun0 table ladon
 ```
 
-(эта часть обычно уже настроена на вашем гейте — если нет, см. документацию
-к EN1GMA / аналогичному стеку)
+Эта часть обычно настраивается на стороне твоего VPN-стека — ladon
+предполагает что routing-таблица и fwmark → интерфейс уже готовы, и просто
+наполняет ipset `prod`.
 
 ## 4. Инициализация и запуск
 
