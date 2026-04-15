@@ -47,6 +47,10 @@ func Probe(ctx context.Context, domain string, timeout time.Duration) Result {
 	}
 	seen := map[string]struct{}{}
 	for _, a := range addrs {
+		// v4-only: gateway routing, stun0 and prod ipset are all v4.
+		if a.IP.To4() == nil {
+			continue
+		}
 		s := a.IP.String()
 		if _, ok := seen[s]; ok {
 			continue

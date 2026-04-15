@@ -155,7 +155,11 @@ func runTailer(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 				// sub-second, not after the next probe-worker tick.
 				tryInlineProbe(ctx, store, cfg, ev.Domain, sem, ipsetTrigger)
 			case dnsmasq.Reply:
-				if net.ParseIP(ev.Target) == nil {
+				parsed := net.ParseIP(ev.Target)
+				// We operate on v4 only — stun0, WG subnet, iptables rules
+				// and the prod ipset are all v4. v6 answers would just create
+				// probe-time "cannot assign" failures and pollute dns_cache.
+				if parsed == nil || parsed.To4() == nil {
 					skipped++
 					continue
 				}
