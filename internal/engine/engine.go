@@ -11,6 +11,7 @@ import (
 
 	"github.com/belotserkovtsev/split-engine/internal/decision"
 	"github.com/belotserkovtsev/split-engine/internal/dnsmasq"
+	"github.com/belotserkovtsev/split-engine/internal/etld"
 	"github.com/belotserkovtsev/split-engine/internal/ipset"
 	"github.com/belotserkovtsev/split-engine/internal/prober"
 	"github.com/belotserkovtsev/split-engine/internal/publisher"
@@ -292,7 +293,20 @@ func runIpsetSyncer(ctx context.Context, store *storage.Store, cfg Config) error
 			log.Printf("ipset: list hot: %v", err)
 			return
 		}
+
+		// Count hot siblings per eTLD+1. Aggregation across a family only
+		// makes sense when multiple subdomains confirm the same root is
+		// blocked — otherwise we'd over-tunnel generic eTLDs (amazonaws.com,
+		// googleapis.com) based on a single quirky subdomain.
+		hotByETLD := map[string]int{}
+		for _, d := range hots {
+			if r := etld.Compute(d); r != "" {
+				hotByETLD[r]++
+			}
+		}
+
 		desired := map[string]struct{}{}
+		expandedETLDs := map[string]struct{}{}
 		for _, d := range hots {
 			ips, err := store.LookupIPs(ctx, d, freshSince)
 			if err != nil {
@@ -300,6 +314,25 @@ func runIpsetSyncer(ctx context.Context, store *storage.Store, cfg Config) error
 				continue
 			}
 			for _, ip := range ips {
+				desired[ip] = struct{}{}
+			}
+			// Expand to all IPs of the eTLD+1 family when ≥2 siblings are hot.
+			// This auto-tunnels future unseen subdomains (Meta netseer UUIDs,
+			// Instagram scontent-*, CloudFront distributions).
+			root := etld.Compute(d)
+			if root == "" || hotByETLD[root] < 2 {
+				continue
+			}
+			if _, done := expandedETLDs[root]; done {
+				continue
+			}
+			expandedETLDs[root] = struct{}{}
+			siblingIPs, err := store.LookupIPsByETLD(ctx, root, freshSince)
+			if err != nil {
+				log.Printf("ipset: lookup etld %q: %v", root, err)
+				continue
+			}
+			for _, ip := range siblingIPs {
 				desired[ip] = struct{}{}
 			}
 		}
@@ -313,7 +346,8 @@ func runIpsetSyncer(ctx context.Context, store *storage.Store, cfg Config) error
 			return
 		}
 		if added > 0 || removed > 0 {
-			log.Printf("ipset %s: +%d -%d (total %d)", cfg.IpsetName, added, removed, len(list))
+			log.Printf("ipset %s: +%d -%d (total %d, etlds expanded %d)",
+				cfg.IpsetName, added, removed, len(list), len(expandedETLDs))
 		}
 	}
 	syncNow()

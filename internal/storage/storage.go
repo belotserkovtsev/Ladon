@@ -219,6 +219,34 @@ func (s *Store) LookupIPs(ctx context.Context, domain string, freshSince time.Ti
 	return out, rows.Err()
 }
 
+// LookupIPsByETLD returns distinct IPs observed for any subdomain of etld+1.
+// Used by ipset-syncer to expand a single hot domain to the CDN family —
+// Meta's `netseer` UUID subdomains, for instance, all share fbcdn.net IPs.
+func (s *Store) LookupIPsByETLD(ctx context.Context, etldPlusOne string, freshSince time.Time) ([]string, error) {
+	ts := formatTime(freshSince)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT c.ip
+		FROM dns_cache c
+		JOIN domains d ON d.domain = c.domain
+		WHERE d.etld_plus_one = ? AND c.last_seen_at >= ?
+		ORDER BY c.last_seen_at DESC
+	`, etldPlusOne, ts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var ip string
+		if err := rows.Scan(&ip); err != nil {
+			return nil, err
+		}
+		out = append(out, ip)
+	}
+	return out, rows.Err()
+}
+
 // ListProbeCandidates returns domains that are ready for a probe — eligible
 // states, cooldown expired (or null). Ordered by oldest cooldown first, then
 // most-recent observations first.
