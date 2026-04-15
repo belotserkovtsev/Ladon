@@ -9,40 +9,66 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: build + publish tarballs
+  build:
+    name: 🏗 build ${{ matrix.arch }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
 
-      - name: Build release tarballs
+      - name: build static binary
+        env:
+          ARCH: ${{ matrix.arch }}
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
-          mkdir -p dist
-          for ARCH in amd64 arm64; do
-            STAGE="dist/ladon-linux-${ARCH}-${TAG}"
-            mkdir -p "${STAGE}"
-            CGO_ENABLED=0 GOOS=linux GOARCH="${ARCH}" \
-              go build -trimpath -ldflags="-s -w -X main.version=${TAG}" \
-              -o "${STAGE}/ladon" ./cmd/ladon
-            cp release/ladon.service          "${STAGE}/"
-            cp release/manual-allow.txt.example      "${STAGE}/"
-            cp release/manual-deny.txt.example       "${STAGE}/"
-            cp release/INSTALL.md                    "${STAGE}/"
-            cp README.md                             "${STAGE}/"
-            tar -czf "dist/ladon-linux-${ARCH}.tar.gz" -C dist "ladon-linux-${ARCH}-${TAG}"
-            sha256sum "dist/ladon-linux-${ARCH}.tar.gz" \
-              > "dist/ladon-linux-${ARCH}.tar.gz.sha256"
-          done
-          ls -la dist/
+          STAGE="dist/ladon-linux-${ARCH}-${TAG}"
+          mkdir -p "${STAGE}"
+          CGO_ENABLED=0 GOOS=linux GOARCH="${ARCH}" \
+            go build -trimpath -ldflags="-s -w -X main.version=${TAG}" \
+            -o "${STAGE}/ladon" ./cmd/ladon
 
-      - name: Publish GitHub Release
+          cp release/ladon.service            "${STAGE}/"
+          cp release/manual-allow.txt.example "${STAGE}/"
+          cp release/manual-deny.txt.example  "${STAGE}/"
+          cp release/INSTALL.md               "${STAGE}/"
+          cp README.md                        "${STAGE}/"
+
+          tar -czf "dist/ladon-linux-${ARCH}.tar.gz" -C dist "ladon-linux-${ARCH}-${TAG}"
+          sha256sum "dist/ladon-linux-${ARCH}.tar.gz" \
+            > "dist/ladon-linux-${ARCH}.tar.gz.sha256"
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ladon-linux-${{ matrix.arch }}
+          path: |
+            dist/ladon-linux-${{ matrix.arch }}.tar.gz
+            dist/ladon-linux-${{ matrix.arch }}.tar.gz.sha256
+          retention-days: 7
+
+  publish:
+    name: 📦 publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: list bundle
+        run: ls -la dist/
+
+      - name: publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |

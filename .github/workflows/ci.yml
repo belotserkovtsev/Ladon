@@ -9,29 +9,57 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: build, vet, test
+  lint:
+    name: 🔍 lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
 
-      - name: Build
-        run: go build ./...
-
-      - name: Vet
+      - name: go vet
         run: go vet ./...
 
-      - name: Unit tests (-race, -short)
+      - name: gofmt
+        run: |
+          diff=$(gofmt -l .)
+          if [ -n "$diff" ]; then
+            echo "::error::gofmt would rewrite the following files:"
+            echo "$diff"
+            exit 1
+          fi
+
+  unit:
+    name: 🧪 unit + race
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build
+        run: go build ./...
+
+      - name: go test -race -short
         # -short skips perf tests that do real network probes; -race catches
         # channel / semaphore / goroutine mistakes cheaply.
         run: go test -race -short ./...
 
-      - name: Pipeline perf tests
+  e2e:
+    name: 🔌 end-to-end pipeline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: pipeline perf tests
         # Uses TEST-NET-1 (192.0.2.1, RFC 5737) which is dropped upstream —
         # gives clean TCP timeouts shaped like real DPI blocks, so tests
         # work on any runner with routable internet. Generous outer timeout
