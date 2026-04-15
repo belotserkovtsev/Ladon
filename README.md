@@ -5,6 +5,10 @@
 [![Go](https://img.shields.io/github/go-mod/go-version/belotserkovtsev/ladon)](go.mod)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+<p align="center">
+  <img src="assets/logo.jpg" alt="Ladon" width="360"/>
+</p>
+
 **Автоматический split-tunneling для VPN-шлюзов в сетях с DPI**
 
 Ladon наблюдает трафик клиентов шлюза, проверяет домены на достижимость
