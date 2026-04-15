@@ -19,14 +19,17 @@ type Config struct {
 	FailThreshold int           // minimum failing probes required in window
 }
 
-// Defaults returns reasonable values: scan every 10 minutes, look at the last
-// 24 hours of probes, promote when ≥3 independent probes failed. A single
-// transient probe-fail won't promote — that's hot_entries' job.
+// Defaults returns production-grade values: scan every 10 minutes, look at
+// the last 24 hours of probes, promote only when ≥50 probes have failed.
+// With cooldown=5m the same domain can't be probed more than ~288 times per
+// day, so 50 fails naturally implies 4+ hours of persistent failure — enough
+// to rule out transient network blips or one-off CDN hiccups. Hot_entries
+// (24h TTL) keeps shorter-lived blocks tunneled in the meantime.
 func Defaults() Config {
 	return Config{
 		Interval:      10 * time.Minute,
 		Window:        24 * time.Hour,
-		FailThreshold: 3,
+		FailThreshold: 50,
 	}
 }
 
