@@ -23,7 +23,7 @@ type Result struct {
 }
 
 const (
-	DefaultTimeout = 2 * time.Second
+	DefaultTimeout = 800 * time.Millisecond
 	MaxIPsToTry    = 3
 )
 
@@ -74,7 +74,10 @@ func ProbeIPs(ctx context.Context, domain string, ips []string, timeout time.Dur
 	return probeTCPTLS(ctx, r, started, timeout)
 }
 
-// probeTCPTLS assumes r.ResolvedIPs is populated (or empty → treat as DNS fail).
+// probeTCPTLS races TCP:443 connects across up to MaxIPsToTry IPs in parallel,
+// takes the first success, then runs TLS-SNI on that IP. Losing dials are
+// cancelled via the shared context. Compared to the sequential loop this
+// collapses worst-case latency from sum(timeouts) to max(timeouts).
 func probeTCPTLS(ctx context.Context, r Result, started time.Time, timeout time.Duration) Result {
 	r.DNSOK = len(r.ResolvedIPs) > 0
 	if !r.DNSOK {
@@ -83,34 +86,60 @@ func probeTCPTLS(ctx context.Context, r Result, started time.Time, timeout time.
 		return r
 	}
 
+	targets := r.ResolvedIPs
+	if len(targets) > MaxIPsToTry {
+		targets = targets[:MaxIPsToTry]
+	}
+
 	dialer := net.Dialer{Timeout: timeout}
+	dialCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type dialResult struct {
+		ip  string
+		err error
+	}
+	out := make(chan dialResult, len(targets))
+
+	for _, ip := range targets {
+		go func(ip string) {
+			conn, err := dialer.DialContext(dialCtx, "tcp", net.JoinHostPort(ip, "443"))
+			if err == nil {
+				conn.Close()
+			}
+			out <- dialResult{ip: ip, err: err}
+		}(ip)
+	}
+
 	var reachable string
-	for i, ip := range r.ResolvedIPs {
-		if i >= MaxIPsToTry {
+	var lastErr error
+	for i := 0; i < len(targets); i++ {
+		res := <-out
+		if res.err == nil && reachable == "" {
+			reachable = res.ip
+			cancel() // let the other dials unwind
 			break
 		}
-		conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, "443"))
-		if err != nil {
-			continue
+		if res.err != nil {
+			lastErr = res.err
 		}
-		conn.Close()
-		reachable = ip
-		r.TCPOK = true
-		break
 	}
-	if !r.TCPOK {
+	if reachable == "" {
 		r.FailureReason = "tcp_connect_failed"
+		if lastErr != nil {
+			r.FailureReason = "tcp:" + lastErr.Error()
+		}
 		r.LatencyMS = int(time.Since(started) / time.Millisecond)
 		return r
 	}
+	r.TCPOK = true
 
-	// We probe TLS for *reachability*, not trust: the ultimate consumer is the
-	// user's device (which may trust CAs we don't, e.g. Russian Mincifry CA).
-	// Cert validity is not the engine's concern — connect + handshake bytes is.
-	tlsConn, err := tls.DialWithDialer(&dialer, "tcp", net.JoinHostPort(reachable, "443"), &tls.Config{
-		ServerName:         r.Domain,
-		InsecureSkipVerify: true, // #nosec G402 — intentional, see comment above
-	})
+	// TLS handshake with SNI. We don't verify the cert — see comment in callers.
+	tlsConn, err := tls.DialWithDialer(&net.Dialer{Timeout: timeout},
+		"tcp", net.JoinHostPort(reachable, "443"), &tls.Config{
+			ServerName:         r.Domain,
+			InsecureSkipVerify: true, // #nosec G402 — intentional
+		})
 	if err != nil {
 		r.FailureReason = "tls:" + err.Error()
 	} else {

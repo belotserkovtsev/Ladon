@@ -24,44 +24,46 @@ import (
 
 // Config holds runtime knobs.
 type Config struct {
-	LogPath          string        // dnsmasq log to follow
-	FromStart        bool          // tail from beginning of file
-	ProbeInterval    time.Duration // how often probe worker wakes up
-	ProbeBatch       int           // how many candidates per wake
-	ProbeTimeout     time.Duration // per-stage probe timeout
-	ProbeCooldown    time.Duration // how long before re-probing a domain
-	HotTTL           time.Duration // lifetime of a hot_entries row
-	ExpiryInterval   time.Duration // hot_entries sweep cadence
-	PublishPath      string        // where to write the published domain set
-	PublishInterval  time.Duration // publisher cadence
-	IpsetName        string        // name of the ipset to reconcile (empty → disabled)
-	IpsetInterval    time.Duration // ipset reconcile cadence
-	DNSFreshness     time.Duration // how recent a dns_cache entry must be to ship IPs to ipset
-	Scorer           scorer.Config // hot → cache promotion settings
-	ManualAllowPath  string        // optional path to manual allow list file
-	ManualDenyPath   string        // optional path to manual deny list file
-	IgnorePeer       string        // peer IP to skip (gateway self, etc.)
+	LogPath                string        // dnsmasq log to follow
+	FromStart              bool          // tail from beginning of file
+	ProbeInterval          time.Duration // how often probe worker wakes up
+	ProbeBatch             int           // how many candidates per wake
+	ProbeTimeout           time.Duration // per-stage probe timeout
+	ProbeCooldown          time.Duration // how long before re-probing a domain
+	InlineProbeConcurrency int           // max concurrent inline probes (0 disables inline fast-path)
+	HotTTL                 time.Duration // lifetime of a hot_entries row
+	ExpiryInterval         time.Duration // hot_entries sweep cadence
+	PublishPath            string        // where to write the published domain set
+	PublishInterval        time.Duration // publisher cadence
+	IpsetName              string        // name of the ipset to reconcile (empty → disabled)
+	IpsetInterval          time.Duration // ipset reconcile cadence (periodic safety sweep)
+	DNSFreshness           time.Duration // how recent a dns_cache entry must be to ship IPs to ipset
+	Scorer                 scorer.Config // hot → cache promotion settings
+	ManualAllowPath        string        // optional path to manual allow list file
+	ManualDenyPath         string        // optional path to manual deny list file
+	IgnorePeer             string        // peer IP to skip (gateway self, etc.)
 }
 
 // Defaults returns a reasonable baseline config.
 func Defaults(logPath string) Config {
 	return Config{
-		LogPath:         logPath,
-		ProbeInterval:   2 * time.Second,
-		ProbeBatch:      4,
-		ProbeTimeout:    2 * time.Second,
-		ProbeCooldown:   5 * time.Minute,
-		HotTTL:          24 * time.Hour,
-		ExpiryInterval:  30 * time.Second,
-		PublishPath:     "state/published-domains.txt",
-		PublishInterval: 10 * time.Second,
-		IpsetName:       "prod",
-		IpsetInterval:   5 * time.Second,
-		DNSFreshness:    6 * time.Hour,
-		Scorer:          scorer.Defaults(),
-		ManualAllowPath: "",
-		ManualDenyPath:  "",
-		IgnorePeer:      "10.10.0.1",
+		LogPath:                logPath,
+		ProbeInterval:          2 * time.Second,
+		ProbeBatch:             4,
+		ProbeTimeout:           800 * time.Millisecond,
+		ProbeCooldown:          5 * time.Minute,
+		InlineProbeConcurrency: 8,
+		HotTTL:                 24 * time.Hour,
+		ExpiryInterval:         30 * time.Second,
+		PublishPath:            "state/published-domains.txt",
+		PublishInterval:        10 * time.Second,
+		IpsetName:              "prod",
+		IpsetInterval:          30 * time.Second, // fallback safety sweep; Hot events trigger immediate syncs
+		DNSFreshness:           6 * time.Hour,
+		Scorer:                 scorer.Defaults(),
+		ManualAllowPath:        "",
+		ManualDenyPath:         "",
+		IgnorePeer:             "10.10.0.1",
 	}
 }
 
@@ -79,17 +81,24 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 		log.Printf("manual deny: loaded %d entries from %s", n, cfg.ManualDenyPath)
 	}
 
+	// Inline probe semaphore caps concurrent fast-path probes from the tailer.
+	// Regular probe-worker remains for re-probes and semaphore-full fallback.
+	sem := make(chan struct{}, max(1, cfg.InlineProbeConcurrency))
+
+	// Buffered 1 so hot-probe senders never block. Drain-and-sync is idempotent;
+	// a single buffered slot coalesces storms of hot events into one sync pass.
+	ipsetTrigger := make(chan struct{}, 1)
+
 	errCh := make(chan error, 6)
 
-	go func() { errCh <- runTailer(ctx, store, cfg) }()
-	go func() { errCh <- runProbeWorker(ctx, store, cfg) }()
+	go func() { errCh <- runTailer(ctx, store, cfg, sem, ipsetTrigger) }()
+	go func() { errCh <- runProbeWorker(ctx, store, cfg, ipsetTrigger) }()
 	go func() { errCh <- runExpirySweeper(ctx, store, cfg) }()
 	go func() { errCh <- runPublisher(ctx, store, cfg) }()
-	go func() { errCh <- runIpsetSyncer(ctx, store, cfg) }()
+	go func() { errCh <- runIpsetSyncer(ctx, store, cfg, ipsetTrigger) }()
 	go func() { errCh <- scorer.Run(ctx, store, cfg.Scorer) }()
 
 	<-ctx.Done()
-	// Drain one error if any stage exited early with an actual error.
 	select {
 	case err := <-errCh:
 		if err != nil && ctx.Err() == nil {
@@ -100,7 +109,7 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	return ctx.Err()
 }
 
-func runTailer(ctx context.Context, store *storage.Store, cfg Config) error {
+func runTailer(ctx context.Context, store *storage.Store, cfg Config, sem chan struct{}, ipsetTrigger chan<- struct{}) error {
 	lines, errs := tail.Follow(ctx, cfg.LogPath, tail.Options{StartAtEnd: !cfg.FromStart})
 	ingested, skipped := 0, 0
 	report := time.NewTicker(30 * time.Second)
@@ -129,8 +138,6 @@ func runTailer(ctx context.Context, store *storage.Store, cfg Config) error {
 					skipped++
 					continue
 				}
-				// Honour the manual deny list — skip ingest entirely so the
-				// domain never reaches probes or hot_entries.
 				if deny, _ := store.IsInDenyList(ctx, ev.Domain, etld.Compute(ev.Domain)); deny {
 					skipped++
 					continue
@@ -143,9 +150,11 @@ func runTailer(ctx context.Context, store *storage.Store, cfg Config) error {
 					continue
 				}
 				ingested++
+				// Inline probe fast-path: kick off right after ingest so a
+				// freshly-observed blocked domain lands in the ipset within
+				// sub-second, not after the next probe-worker tick.
+				tryInlineProbe(ctx, store, cfg, ev.Domain, sem, ipsetTrigger)
 			case dnsmasq.Reply:
-				// Target is the answer: an IP, <CNAME>, NODATA-IPv6, NXDOMAIN, etc.
-				// Only IPs go into dns_cache.
 				if net.ParseIP(ev.Target) == nil {
 					skipped++
 					continue
@@ -163,7 +172,30 @@ func runTailer(ctx context.Context, store *storage.Store, cfg Config) error {
 	}
 }
 
-func runProbeWorker(ctx context.Context, store *storage.Store, cfg Config) error {
+// tryInlineProbe kicks an immediate probe in a goroutine when the semaphore
+// has room. If the semaphore is full we simply drop the fast-path attempt —
+// the regular probe-worker ticks will pick the domain up shortly after, so
+// nothing is lost, we just don't beat the worker to it under heavy load.
+func tryInlineProbe(ctx context.Context, store *storage.Store, cfg Config, domain string, sem chan struct{}, ipsetTrigger chan<- struct{}) {
+	if cap(sem) == 0 || cfg.InlineProbeConcurrency == 0 {
+		return
+	}
+	select {
+	case sem <- struct{}{}:
+	default:
+		return
+	}
+	go func() {
+		defer func() { <-sem }()
+		eligible, err := store.ProbeEligible(ctx, domain, time.Now().UTC())
+		if err != nil || !eligible {
+			return
+		}
+		probeDomain(ctx, store, cfg, domain, ipsetTrigger)
+	}()
+}
+
+func runProbeWorker(ctx context.Context, store *storage.Store, cfg Config, ipsetTrigger chan<- struct{}) error {
 	ticker := time.NewTicker(cfg.ProbeInterval)
 	defer ticker.Stop()
 
@@ -172,14 +204,14 @@ func runProbeWorker(ctx context.Context, store *storage.Store, cfg Config) error
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if err := probeOnce(ctx, store, cfg); err != nil {
+			if err := probeOnce(ctx, store, cfg, ipsetTrigger); err != nil {
 				log.Printf("probe tick: %v", err)
 			}
 		}
 	}
 }
 
-func probeOnce(ctx context.Context, store *storage.Store, cfg Config) error {
+func probeOnce(ctx context.Context, store *storage.Store, cfg Config, ipsetTrigger chan<- struct{}) error {
 	now := time.Now().UTC()
 	candidates, err := store.ListProbeCandidates(ctx, cfg.ProbeBatch, now)
 	if err != nil {
@@ -189,68 +221,74 @@ func probeOnce(ctx context.Context, store *storage.Store, cfg Config) error {
 		if err := ctx.Err(); err != nil {
 			return nil
 		}
-		if err := prober.Validate(d.Domain); err != nil {
-			// Mark invalid domains as ignore so they stop cycling.
-			_ = store.SetDomainState(ctx, d.Domain, "ignore", time.Time{})
-			continue
-		}
-		// Prefer IPs that dnsmasq actually handed to the client over our own
-		// system-resolver answer — avoids engine/client view mismatch with
-		// CDNs that geo-route (Meta, Cloudflare, Akamai).
-		freshSince := time.Now().UTC().Add(-6 * time.Hour)
-		ips, err := store.LookupIPs(ctx, d.Domain, freshSince)
-		if err != nil {
-			log.Printf("lookup ips %q: %v", d.Domain, err)
-		}
-		var res prober.Result
-		if len(ips) > 0 {
-			res = prober.ProbeIPs(ctx, d.Domain, ips, cfg.ProbeTimeout)
-		} else {
-			// Fallback: no cached client resolution yet — probe with system DNS.
-			res = prober.Probe(ctx, d.Domain, cfg.ProbeTimeout)
-		}
-
-		dns, tcp, tls := res.DNSOK, res.TCPOK, res.TLSOK
-		if _, err := store.InsertProbe(ctx, storage.ProbeResult{
-			Domain:        res.Domain,
-			DNSOK:         &dns,
-			TCPOK:         &tcp,
-			TLSOK:         &tls,
-			HTTPOK:        res.HTTPOK,
-			ResolvedIPs:   res.ResolvedIPs,
-			FailureReason: res.FailureReason,
-			LatencyMS:     res.LatencyMS,
-		}, time.Time{}); err != nil {
-			log.Printf("persist probe %q: %v", d.Domain, err)
-			continue
-		}
-
-		verdict := decision.Classify(res)
-		cooldown := time.Now().UTC().Add(cfg.ProbeCooldown)
-
-		switch verdict {
-		case decision.Hot:
-			if err := store.SetDomainState(ctx, d.Domain, "hot", cooldown); err != nil {
-				log.Printf("set state hot %q: %v", d.Domain, err)
-			}
-			if err := store.UpsertHotEntry(ctx, d.Domain,
-				reasonFromProbe(res), time.Now().UTC().Add(cfg.HotTTL)); err != nil {
-				log.Printf("upsert hot %q: %v", d.Domain, err)
-			}
-			log.Printf("probe %s → HOT (%s, %dms)", d.Domain, res.FailureReason, res.LatencyMS)
-		case decision.Ignore:
-			// Keep ignore terminal for now; a stable direct path doesn't need re-checking often.
-			// We still set cooldown so that new observations don't re-queue immediately.
-			if err := store.SetDomainState(ctx, d.Domain, "ignore", cooldown); err != nil {
-				log.Printf("set state ignore %q: %v", d.Domain, err)
-			}
-		default:
-			if err := store.SetDomainState(ctx, d.Domain, "watch", cooldown); err != nil {
-				log.Printf("set state watch %q: %v", d.Domain, err)
-			}
-		}
+		probeDomain(ctx, store, cfg, d.Domain, ipsetTrigger)
 	}
 	return nil
+}
+
+// probeDomain runs one full probe→decision→persist cycle for a single domain.
+// Shared by the batch worker and the inline fast-path from the tailer.
+func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain string, ipsetTrigger chan<- struct{}) {
+	if err := prober.Validate(domain); err != nil {
+		_ = store.SetDomainState(ctx, domain, "ignore", time.Time{})
+		return
+	}
+	// Prefer IPs that dnsmasq actually handed to the client — avoids engine/
+	// client view mismatch with CDNs that geo-route.
+	freshSince := time.Now().UTC().Add(-cfg.DNSFreshness)
+	ips, err := store.LookupIPs(ctx, domain, freshSince)
+	if err != nil {
+		log.Printf("lookup ips %q: %v", domain, err)
+	}
+	var res prober.Result
+	if len(ips) > 0 {
+		res = prober.ProbeIPs(ctx, domain, ips, cfg.ProbeTimeout)
+	} else {
+		res = prober.Probe(ctx, domain, cfg.ProbeTimeout)
+	}
+
+	dns, tcp, tls := res.DNSOK, res.TCPOK, res.TLSOK
+	if _, err := store.InsertProbe(ctx, storage.ProbeResult{
+		Domain:        res.Domain,
+		DNSOK:         &dns,
+		TCPOK:         &tcp,
+		TLSOK:         &tls,
+		HTTPOK:        res.HTTPOK,
+		ResolvedIPs:   res.ResolvedIPs,
+		FailureReason: res.FailureReason,
+		LatencyMS:     res.LatencyMS,
+	}, time.Time{}); err != nil {
+		log.Printf("persist probe %q: %v", domain, err)
+		return
+	}
+
+	verdict := decision.Classify(res)
+	cooldown := time.Now().UTC().Add(cfg.ProbeCooldown)
+
+	switch verdict {
+	case decision.Hot:
+		if err := store.SetDomainState(ctx, domain, "hot", cooldown); err != nil {
+			log.Printf("set state hot %q: %v", domain, err)
+		}
+		if err := store.UpsertHotEntry(ctx, domain,
+			reasonFromProbe(res), time.Now().UTC().Add(cfg.HotTTL)); err != nil {
+			log.Printf("upsert hot %q: %v", domain, err)
+		}
+		log.Printf("probe %s → HOT (%s, %dms)", domain, res.FailureReason, res.LatencyMS)
+		// Nudge the ipset syncer — a new IP may now need to be tunneled.
+		select {
+		case ipsetTrigger <- struct{}{}:
+		default:
+		}
+	case decision.Ignore:
+		if err := store.SetDomainState(ctx, domain, "ignore", cooldown); err != nil {
+			log.Printf("set state ignore %q: %v", domain, err)
+		}
+	default:
+		if err := store.SetDomainState(ctx, domain, "watch", cooldown); err != nil {
+			log.Printf("set state watch %q: %v", domain, err)
+		}
+	}
 }
 
 func reasonFromProbe(r prober.Result) string {
@@ -275,7 +313,7 @@ func runPublisher(ctx context.Context, store *storage.Store, cfg Config) error {
 		}
 		log.Printf("published %d domains → %s", n, cfg.PublishPath)
 	}
-	publishNow() // initial publish so consumer sees something on startup
+	publishNow()
 
 	for {
 		select {
@@ -288,16 +326,15 @@ func runPublisher(ctx context.Context, store *storage.Store, cfg Config) error {
 }
 
 // runIpsetSyncer keeps the gateway-side ipset (e.g. "prod") in sync with
-// hot_entries ∪ (later) cache ∪ manual. Each tick: read live hot domains →
-// expand to IPs via dns_cache → reconcile set membership.
-func runIpsetSyncer(ctx context.Context, store *storage.Store, cfg Config) error {
+// hot_entries ∪ cache_entries ∪ manual-allow. Triggered both by a periodic
+// safety ticker and by the ipsetTrigger channel — hot probes signal the
+// channel so a just-observed blocked IP lands in `prod` within ~milliseconds.
+func runIpsetSyncer(ctx context.Context, store *storage.Store, cfg Config, trigger <-chan struct{}) error {
 	if cfg.IpsetName == "" {
 		return nil
 	}
 	mgr := ipset.New(cfg.IpsetName)
 
-	// Don't bother starting if the set doesn't exist — this is an operator
-	// concern and silently creating a set could mask misconfiguration.
 	ok, err := mgr.Exists(ctx)
 	if err != nil {
 		log.Printf("ipset exists check %q: %v", cfg.IpsetName, err)
@@ -329,8 +366,6 @@ func runIpsetSyncer(ctx context.Context, store *storage.Store, cfg Config) error
 			log.Printf("ipset: list allow: %v", err)
 		}
 
-		// Union of all "must-tunnel" sources. Dedupe along the way because
-		// one domain can sit in multiple lists (e.g. hot + just-promoted-cache).
 		sources := make([]string, 0, len(hots)+len(cache)+len(allow))
 		seenSrc := map[string]struct{}{}
 		for _, d := range hots {
@@ -355,10 +390,6 @@ func runIpsetSyncer(ctx context.Context, store *storage.Store, cfg Config) error
 			sources = append(sources, d)
 		}
 
-		// Count confirmed-blocked siblings per eTLD+1 (hot + cache; manual
-		// allow doesn't count as blocking evidence, just explicit routing).
-		// Aggregation needs ≥2 confirmations to avoid over-tunneling on
-		// generic eTLDs (amazonaws.com, googleapis.com).
 		confirmedByETLD := map[string]int{}
 		for _, d := range hots {
 			if r := etld.Compute(d); r != "" {
@@ -421,6 +452,8 @@ func runIpsetSyncer(ctx context.Context, store *storage.Store, cfg Config) error
 			return nil
 		case <-ticker.C:
 			syncNow()
+		case <-trigger:
+			syncNow()
 		}
 	}
 }
@@ -444,4 +477,11 @@ func runExpirySweeper(ctx context.Context, store *storage.Store, cfg Config) err
 			}
 		}
 	}
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

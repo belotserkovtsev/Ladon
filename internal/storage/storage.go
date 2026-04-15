@@ -219,6 +219,33 @@ func (s *Store) LookupIPs(ctx context.Context, domain string, freshSince time.Ti
 	return out, rows.Err()
 }
 
+// ProbeEligible reports whether domain is ready for an immediate probe —
+// i.e. in a probeable state with no active cooldown. Used by the inline
+// fast-path in the tailer to avoid duplicate probes when the worker has
+// already (or recently) probed the same domain.
+func (s *Store) ProbeEligible(ctx context.Context, domain string, now time.Time) (bool, error) {
+	ts := formatTime(now)
+	var state, cd sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		`SELECT state, cooldown_until FROM domains WHERE domain = ?`, domain).Scan(&state, &cd)
+	if err == sql.ErrNoRows {
+		// Unknown domain — definitely eligible (UpsertDomain is separate).
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	switch state.String {
+	case "new", "watch", "hot":
+	default:
+		return false, nil
+	}
+	if !cd.Valid || cd.String == "" {
+		return true, nil
+	}
+	return cd.String <= ts, nil
+}
+
 // PromoteCache upserts a cache_entries row and flips the domain's state to
 // 'cache'. Cache entries have no TTL — they persist until a re-probe reverses
 // them or the operator clears the row.
