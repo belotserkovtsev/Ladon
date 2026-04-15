@@ -151,9 +151,9 @@ func TestCountFailingProbes(t *testing.T) {
 	insert(&ok, &fail, &fail, now.Add(-10*time.Minute))
 	insert(&ok, &fail, &fail, now.Add(-20*time.Minute))
 	insert(&ok, &fail, &fail, now.Add(-30*time.Minute))
-	insert(&ok, &ok, &ok, now.Add(-40*time.Minute))        // success, not counted
-	insert(&ok, &ok, &ok, now.Add(-50*time.Minute))        // success
-	insert(&ok, &fail, &fail, now.Add(-48*time.Hour))      // old fail, outside window
+	insert(&ok, &ok, &ok, now.Add(-40*time.Minute))   // success, not counted
+	insert(&ok, &ok, &ok, now.Add(-50*time.Minute))   // success
+	insert(&ok, &fail, &fail, now.Add(-48*time.Hour)) // old fail, outside window
 
 	n, err := s.CountFailingProbes(ctx, "example.test", now.Add(-time.Hour))
 	if err != nil {

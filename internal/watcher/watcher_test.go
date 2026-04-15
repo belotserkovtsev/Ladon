@@ -31,9 +31,9 @@ func TestIngestNormalizesAndPersists(t *testing.T) {
 	}{
 		{"example.com", "example.com"},
 		{"Example.COM", "example.com"},
-		{"example.com.", "example.com"},           // trailing dot stripped
-		{"  padded.test  ", "padded.test"},        // whitespace
-		{"SUB.Example.COM.", "sub.example.com"},   // combined
+		{"example.com.", "example.com"},         // trailing dot stripped
+		{"  padded.test  ", "padded.test"},      // whitespace
+		{"SUB.Example.COM.", "sub.example.com"}, // combined
 	}
 
 	for _, tc := range cases {
