@@ -158,7 +158,21 @@ func probeOnce(ctx context.Context, store *storage.Store, cfg Config) error {
 			_ = store.SetDomainState(ctx, d.Domain, "ignore", time.Time{})
 			continue
 		}
-		res := prober.Probe(ctx, d.Domain, cfg.ProbeTimeout)
+		// Prefer IPs that dnsmasq actually handed to the client over our own
+		// system-resolver answer — avoids engine/client view mismatch with
+		// CDNs that geo-route (Meta, Cloudflare, Akamai).
+		freshSince := time.Now().UTC().Add(-6 * time.Hour)
+		ips, err := store.LookupIPs(ctx, d.Domain, freshSince)
+		if err != nil {
+			log.Printf("lookup ips %q: %v", d.Domain, err)
+		}
+		var res prober.Result
+		if len(ips) > 0 {
+			res = prober.ProbeIPs(ctx, d.Domain, ips, cfg.ProbeTimeout)
+		} else {
+			// Fallback: no cached client resolution yet — probe with system DNS.
+			res = prober.Probe(ctx, d.Domain, cfg.ProbeTimeout)
+		}
 
 		dns, tcp, tls := res.DNSOK, res.TCPOK, res.TLSOK
 		if _, err := store.InsertProbe(ctx, storage.ProbeResult{

@@ -28,6 +28,9 @@ const (
 )
 
 // Probe runs DNS → TCP:443 → TLS-SNI against domain, short-circuiting on failure.
+// Uses the system resolver; subject to whatever /etc/resolv.conf points at.
+// Prefer ProbeIPs when the caller already knows what the client resolved to —
+// keeps the engine's view consistent with the client's.
 func Probe(ctx context.Context, domain string, timeout time.Duration) Result {
 	if timeout <= 0 {
 		timeout = DefaultTimeout
@@ -51,7 +54,34 @@ func Probe(ctx context.Context, domain string, timeout time.Duration) Result {
 		seen[s] = struct{}{}
 		r.ResolvedIPs = append(r.ResolvedIPs, s)
 	}
+	return probeTCPTLS(ctx, r, started, timeout)
+}
+
+// ProbeIPs runs TCP:443 → TLS-SNI against a caller-supplied IP list.
+// Used when the client's resolver already gave us the answers (via dns_cache) —
+// avoids a redundant DNS lookup that might disagree with the client's view.
+func ProbeIPs(ctx context.Context, domain string, ips []string, timeout time.Duration) Result {
+	if timeout <= 0 {
+		timeout = DefaultTimeout
+	}
+	started := time.Now()
+	r := Result{Domain: domain, ResolvedIPs: ips}
+	if len(ips) == 0 {
+		r.FailureReason = "no_ips"
+		r.LatencyMS = int(time.Since(started) / time.Millisecond)
+		return r
+	}
+	return probeTCPTLS(ctx, r, started, timeout)
+}
+
+// probeTCPTLS assumes r.ResolvedIPs is populated (or empty → treat as DNS fail).
+func probeTCPTLS(ctx context.Context, r Result, started time.Time, timeout time.Duration) Result {
 	r.DNSOK = len(r.ResolvedIPs) > 0
+	if !r.DNSOK {
+		r.FailureReason = "no_ips"
+		r.LatencyMS = int(time.Since(started) / time.Millisecond)
+		return r
+	}
 
 	dialer := net.Dialer{Timeout: timeout}
 	var reachable string
@@ -78,7 +108,7 @@ func Probe(ctx context.Context, domain string, timeout time.Duration) Result {
 	// user's device (which may trust CAs we don't, e.g. Russian Mincifry CA).
 	// Cert validity is not the engine's concern — connect + handshake bytes is.
 	tlsConn, err := tls.DialWithDialer(&dialer, "tcp", net.JoinHostPort(reachable, "443"), &tls.Config{
-		ServerName:         domain,
+		ServerName:         r.Domain,
 		InsecureSkipVerify: true, // #nosec G402 — intentional, see comment above
 	})
 	if err != nil {
