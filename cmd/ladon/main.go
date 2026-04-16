@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/belotserkovtsev/ladon/internal/config"
 	"github.com/belotserkovtsev/ladon/internal/dnsmasq"
 	"github.com/belotserkovtsev/ladon/internal/engine"
 	"github.com/belotserkovtsev/ladon/internal/prober"
@@ -29,7 +30,7 @@ import (
 )
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `usage: ladon [-db PATH] <cmd> [args]
+	fmt.Fprintln(os.Stderr, `usage: ladon [-db PATH] [-config PATH] <cmd> [args]
 commands:
   init-db
   probe <domain>
@@ -37,11 +38,12 @@ commands:
   list [N]
   hot
   tail [-from-start] <logfile>
-  run  [-from-start] <logfile>`)
+  run  [-from-start] [-config PATH] <logfile>`)
 }
 
 func main() {
 	dbPath := flag.String("db", filepath.Join("state", "ladon.db"), "path to SQLite database")
+	configPath := flag.String("config", "", "path to YAML config file (optional — defaults apply if empty)")
 	flag.Usage = usage
 	flag.Parse()
 	args := flag.Args()
@@ -122,7 +124,7 @@ func main() {
 		tailCmd(ctx, store, args[1:])
 
 	case "run":
-		runCmd(ctx, store, args[1:])
+		runCmd(ctx, store, *configPath, args[1:])
 
 	case "hot":
 		hots, err := store.ListHotEntries(ctx, time.Now().UTC())
@@ -198,23 +200,105 @@ func tailCmd(ctx context.Context, store *storage.Store, rest []string) {
 	}
 }
 
-func runCmd(ctx context.Context, store *storage.Store, rest []string) {
+func runCmd(ctx context.Context, store *storage.Store, configPath string, rest []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	fromStart := fs.Bool("from-start", false, "process whole log from the beginning")
 	allow := fs.String("manual-allow", "", "path to manual allow list (optional)")
 	deny := fs.String("manual-deny", "", "path to manual deny list (optional)")
+	cfgFlag := fs.String("config", "", "path to YAML config (overrides other flags)")
 	_ = fs.Parse(rest)
-	if fs.NArg() < 1 {
-		fatal("run: missing logfile")
+
+	// Config path can come from either the global -config flag or the
+	// subcommand-local -config flag; subcommand wins if both set so operators
+	// can override a system-wide -config for one-off runs.
+	if *cfgFlag != "" {
+		configPath = *cfgFlag
 	}
-	cfg := engine.Defaults(fs.Arg(0))
+
+	file, err := config.Load(configPath)
+	if err != nil && err != config.ErrNotFound {
+		fatal("%v", err)
+	}
+
+	logPath := fs.Arg(0)
+	if file != nil && file.Logfile != "" && logPath == "" {
+		logPath = file.Logfile
+	}
+	if logPath == "" {
+		fatal("run: missing logfile (positional arg or config.logfile)")
+	}
+
+	cfg := engine.Defaults(logPath)
 	cfg.FromStart = *fromStart
 	cfg.ManualAllowPath = *allow
 	cfg.ManualDenyPath = *deny
+	applyConfigFile(&cfg, file)
 	if err := engine.Run(ctx, store, cfg); err != nil {
 		fatal("engine: %v", err)
 	}
 	fmt.Fprintln(os.Stderr, "engine: stopped")
+}
+
+// applyConfigFile overlays YAML values on top of the engine defaults and
+// builds the probe backend. Zero values in the YAML leave defaults untouched —
+// the operator only needs to list the knobs they actually want to change.
+func applyConfigFile(cfg *engine.Config, f *config.File) {
+	if f == nil {
+		cfg.Prober = prober.NewLocal(cfg.ProbeTimeout)
+		return
+	}
+	if f.ManualAllow != "" && cfg.ManualAllowPath == "" {
+		cfg.ManualAllowPath = f.ManualAllow
+	}
+	if f.ManualDeny != "" && cfg.ManualDenyPath == "" {
+		cfg.ManualDenyPath = f.ManualDeny
+	}
+	if f.Probe.Timeout > 0 {
+		cfg.ProbeTimeout = f.Probe.Timeout
+	}
+	if f.Probe.Cooldown > 0 {
+		cfg.ProbeCooldown = f.Probe.Cooldown
+	}
+	if f.Probe.Concurrency > 0 {
+		cfg.InlineProbeConcurrency = f.Probe.Concurrency
+	}
+	if f.Probe.Interval > 0 {
+		cfg.ProbeInterval = f.Probe.Interval
+	}
+	if f.Probe.Batch > 0 {
+		cfg.ProbeBatch = f.Probe.Batch
+	}
+	if f.Scorer.Interval > 0 {
+		cfg.Scorer.Interval = f.Scorer.Interval
+	}
+	if f.Scorer.Window > 0 {
+		cfg.Scorer.Window = f.Scorer.Window
+	}
+	if f.Scorer.FailThreshold > 0 {
+		cfg.Scorer.FailThreshold = f.Scorer.FailThreshold
+	}
+	if f.Ipset.Name != "" {
+		cfg.IpsetName = f.Ipset.Name
+	}
+	if f.Ipset.Interval > 0 {
+		cfg.IpsetInterval = f.Ipset.Interval
+	}
+	if f.HotTTL > 0 {
+		cfg.HotTTL = f.HotTTL
+	}
+	if f.DNSFreshness > 0 {
+		cfg.DNSFreshness = f.DNSFreshness
+	}
+	if f.PublishPath != "" {
+		cfg.PublishPath = f.PublishPath
+	}
+	if f.PublishInterval > 0 {
+		cfg.PublishInterval = f.PublishInterval
+	}
+	if f.IgnorePeer != "" {
+		cfg.IgnorePeer = f.IgnorePeer
+	}
+	cfg.Prober = f.BuildProber(cfg.ProbeTimeout)
 }
 
 func toStorageResult(r prober.Result) storage.ProbeResult {

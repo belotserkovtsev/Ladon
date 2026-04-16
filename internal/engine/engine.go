@@ -42,6 +42,7 @@ type Config struct {
 	ManualAllowPath        string        // optional path to manual allow list file
 	ManualDenyPath         string        // optional path to manual deny list file
 	IgnorePeer             string        // peer IP to skip (gateway self, etc.)
+	Prober                 prober.Prober // probe backend (defaults to LocalProber)
 }
 
 // Defaults returns a reasonable baseline config.
@@ -69,6 +70,10 @@ func Defaults(logPath string) Config {
 
 // Run starts all pipeline stages and blocks until ctx is cancelled.
 func Run(ctx context.Context, store *storage.Store, cfg Config) error {
+	if cfg.Prober == nil {
+		cfg.Prober = prober.NewLocal(cfg.ProbeTimeout)
+	}
+	log.Printf("probe backend: %s", cfg.Prober.Name())
 	// Seed manual lists (best-effort — missing files are fine).
 	if n, err := manual.Load(ctx, store, cfg.ManualAllowPath, "allow"); err != nil {
 		log.Printf("manual allow load: %v", err)
@@ -244,12 +249,7 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 	if err != nil {
 		log.Printf("lookup ips %q: %v", domain, err)
 	}
-	var res prober.Result
-	if len(ips) > 0 {
-		res = prober.ProbeIPs(ctx, domain, ips, cfg.ProbeTimeout)
-	} else {
-		res = prober.Probe(ctx, domain, cfg.ProbeTimeout)
-	}
+	res := cfg.Prober.Probe(ctx, domain, ips)
 
 	dns, tcp, tls := res.DNSOK, res.TCPOK, res.TLSOK
 	if _, err := store.InsertProbe(ctx, storage.ProbeResult{

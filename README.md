@@ -277,10 +277,12 @@ journalctl -u ladon -f
 
 ## 🛠 Конфигурация
 
+### CLI-флаги
+
 Флаги передаются через systemd unit (`/etc/systemd/system/ladon.service`):
 
 ```
-ladon -db <path> run [-from-start] [-manual-allow <path>] [-manual-deny <path>] <dnsmasq-log-path>
+ladon -db <path> run [-from-start] [-manual-allow <path>] [-manual-deny <path>] [-config <path>] <dnsmasq-log-path>
 ```
 
 Значения по умолчанию из [`internal/engine/engine.go`](internal/engine/engine.go),
@@ -297,6 +299,58 @@ ladon -db <path> run [-from-start] [-manual-allow <path>] [-manual-deny <path>] 
 | `Scorer.Window` | 24 ч | Окно для подсчёта fails |
 | `Scorer.FailThreshold` | 50 | Порог fails для промоушна hot → cache |
 | `Scorer.Interval` | 10 мин | Как часто scorer проходится |
+
+### YAML-конфиг (опционально, с v0.3.0)
+
+Для более гибкой настройки — YAML-файл, путь которого передаётся через
+`-config`. Если флаг не задан, используются значения по умолчанию — поведение
+не меняется. Любые поля в YAML опциональны, пропущенные берутся из defaults.
+
+Пример `/etc/ladon/config.yaml`:
+
+```yaml
+logfile: /var/log/dnsmasq.log
+manual_allow: /etc/ladon/manual-allow.txt
+manual_deny: /etc/ladon/manual-deny.txt
+
+probe:
+  mode: local         # local (по умолчанию) | remote
+  timeout: 800ms
+  cooldown: 5m
+  concurrency: 8
+
+scorer:
+  interval: 10m
+  window: 24h
+  fail_threshold: 50
+
+ipset:
+  name: prod
+  interval: 30s
+
+hot_ttl: 24h
+dns_freshness: 6h
+```
+
+### Внешний proб-сервер (remote mode)
+
+С v0.3.0 можно делегировать пробы внешнему HTTP-сервису. Полезно, когда
+нужно измерять доступность не с самого шлюза, а с другой точки —
+residential ISP, 4G-модема, офшорной VPS и т.п.
+
+```yaml
+probe:
+  mode: remote
+  remote:
+    url: https://my-probe-server.example.com/probe
+    timeout: 2s
+    auth_header: Authorization
+    auth_value: Bearer mysecrettoken
+```
+
+HTTP-контракт прост: ладон шлёт POST с доменом и IP, сервер возвращает
+JSON с вердиктом. Формат полностью описан в [`docs/probe-api.md`](docs/probe-api.md).
+Референсная имплементация на Go — в [`examples/probe-server/`](examples/probe-server/).
 
 ---
 
@@ -358,7 +412,8 @@ GOOS=linux GOARCH=amd64 go build -o dist/ladon ./cmd/ladon
 | `internal/watcher/` | Нормализация и ingest DNS-событий |
 | `internal/storage/` | SQLite access layer + embedded schema |
 | `internal/etld/` | Обёртка над `golang.org/x/net/publicsuffix` |
-| `internal/prober/` | Probe: параллельные TCP + TLS-SNI с `InsecureSkipVerify` |
+| `internal/prober/` | Probe: `LocalProber` (TCP + TLS-SNI) и `RemoteProber` (HTTP к внешнему сервису) за общим `Prober`-интерфейсом |
+| `internal/config/` | Загрузка и валидация YAML-конфига |
 | `internal/decision/` | Классификация probe → {Ignore, Watch, Hot} |
 | `internal/scorer/` | Промоушн hot → cache по количеству fails в окне |
 | `internal/manual/` | Загрузчик allow/deny-списков из файлов |

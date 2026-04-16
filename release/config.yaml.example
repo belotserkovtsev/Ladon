@@ -1,0 +1,57 @@
+# Example ladon config (YAML).
+#
+# Всё необязательно. Любое не указанное поле берётся из engine.Defaults()
+# — это ровно то, с чем ладон ездит, когда -config вообще не задан.
+#
+# Скопировать: cp /opt/ladon/config.yaml.example /etc/ladon/config.yaml
+# Передать в сервис: ladon -config /etc/ladon/config.yaml run <logfile>
+
+# --- пути (обычно задаются через CLI, но можно и здесь) ---
+
+# logfile: /var/log/dnsmasq.log
+# manual_allow: /etc/ladon/manual-allow.txt
+# manual_deny: /etc/ladon/manual-deny.txt
+
+# --- probe backend ---
+
+probe:
+  mode: local          # local (default) | remote
+  timeout: 800ms       # TCP/TLS dial timeout
+  cooldown: 5m         # минимальный интервал между probe одного домена
+  concurrency: 8       # семафор для inline-probe из tailer
+  # interval: 2s       # как часто ходит batch probe-worker
+  # batch: 4           # сколько кандидатов за тик
+
+  # --- работает только при mode: remote ---
+  # remote:
+  #   url: https://my-probe-server.example.com/probe
+  #   timeout: 2s
+  #   auth_header: Authorization
+  #   auth_value: Bearer mysecrettoken
+
+# --- scorer: когда hot → cache ---
+
+scorer:
+  interval: 10m        # как часто scorer проходится
+  window: 24h          # окно для подсчёта fails
+  fail_threshold: 50   # порог fails для промоушна
+
+# --- routing ---
+
+ipset:
+  name: prod
+  interval: 30s        # safety-reconcile; горячие события триггерят немедленный sync
+
+# --- TTL / freshness ---
+
+hot_ttl: 24h           # срок жизни записи в hot_entries
+dns_freshness: 6h      # возраст, после которого IP из dns_cache устаревает
+
+# --- публикация ---
+
+# publish_path: /opt/ladon/state/published-domains.txt
+# publish_interval: 10s
+
+# --- прочее ---
+
+# ignore_peer: 10.10.0.1   # peer, чьи DNS-запросы игнорируются (gateway self)
