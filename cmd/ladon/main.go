@@ -37,6 +37,7 @@ commands:
   observe <domain> [peer]
   list [N]
   hot
+  prune  [-cache] [-hot] [-probes] [-before <ISO date>] [-dry-run]
   tail [-from-start] <logfile>
   run  [-from-start] [-config PATH] <logfile>`)
 }
@@ -123,6 +124,9 @@ func main() {
 	case "tail":
 		tailCmd(ctx, store, args[1:])
 
+	case "prune":
+		pruneCmd(ctx, store, args[1:])
+
 	case "run":
 		runCmd(ctx, store, *configPath, args[1:])
 
@@ -197,6 +201,94 @@ func tailCmd(ctx context.Context, store *storage.Store, rest []string) {
 		case <-report.C:
 			fmt.Fprintf(os.Stderr, "tail: ingested=%d skipped=%d\n", ingested, skipped)
 		}
+	}
+}
+
+// pruneCmd is the operator-triggered cleanup. Use cases:
+//   - migrating from a pre-exit-compare deploy where cache may hold methodological
+//     FPs that the new logic would have suppressed
+//   - clearing accumulated probes history without losing routing state
+//   - one-off "wipe everything" reset
+//
+// We deliberately do NOT auto-prune on upgrade: cache_entries take effort to
+// promote (50 fails/24h) and silently throwing them out would create UX gaps.
+// Operators run this when they know they want to.
+func pruneCmd(ctx context.Context, store *storage.Store, rest []string) {
+	fs := flag.NewFlagSet("prune", flag.ExitOnError)
+	cache := fs.Bool("cache", false, "delete cache_entries rows")
+	hot := fs.Bool("hot", false, "delete hot_entries rows")
+	probes := fs.Bool("probes", false, "delete probes rows")
+	beforeStr := fs.String("before", "", "only delete rows older than this timestamp (RFC3339, e.g. 2026-04-16T11:14:00Z); empty = all")
+	dryRun := fs.Bool("dry-run", false, "show what would be deleted without executing")
+	_ = fs.Parse(rest)
+
+	if !*cache && !*hot && !*probes {
+		fatal("prune: need at least one of -cache, -hot, -probes")
+	}
+	var before time.Time
+	if *beforeStr != "" {
+		t, err := time.Parse(time.RFC3339, *beforeStr)
+		if err != nil {
+			fatal("prune: -before must be RFC3339 (e.g. 2026-04-16T11:14:00Z): %v", err)
+		}
+		before = t.UTC()
+	}
+
+	// Dry-run uses Count* helpers with the same WHERE shape as the prune,
+	// so the preview matches the real action exactly.
+	if *dryRun {
+		if *cache {
+			n, err := store.CountCache(ctx, before)
+			if err != nil {
+				fatal("count cache: %v", err)
+			}
+			fmt.Printf("would delete %d row(s) from cache_entries\n", n)
+		}
+		if *hot {
+			n, err := store.CountHot(ctx, before)
+			if err != nil {
+				fatal("count hot: %v", err)
+			}
+			fmt.Printf("would delete %d row(s) from hot_entries\n", n)
+		}
+		if *probes {
+			n, err := store.CountProbes(ctx, before)
+			if err != nil {
+				fatal("count probes: %v", err)
+			}
+			fmt.Printf("would delete %d row(s) from probes\n", n)
+		}
+		return
+	}
+
+	if *cache {
+		n, err := store.PruneCache(ctx, before)
+		if err != nil {
+			fatal("prune cache: %v", err)
+		}
+		fmt.Printf("deleted %d row(s) from cache_entries\n", n)
+	}
+	if *hot {
+		n, err := store.PruneHot(ctx, before)
+		if err != nil {
+			fatal("prune hot: %v", err)
+		}
+		fmt.Printf("deleted %d row(s) from hot_entries\n", n)
+	}
+	if *probes {
+		n, err := store.PruneProbes(ctx, before)
+		if err != nil {
+			fatal("prune probes: %v", err)
+		}
+		fmt.Printf("deleted %d row(s) from probes\n", n)
+	}
+	// After prune, domains stuck in hot/cache/ignore without a backing row are
+	// orphaned — flip them to 'new' so the engine re-probes from scratch on
+	// next traffic instead of leaving them in a stale terminal state.
+	if n, err := store.ResetOrphanedDomains(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "warn: reset orphaned domains: %v\n", err)
+	} else if n > 0 {
+		fmt.Printf("reset %d orphaned domain(s) to state='new'\n", n)
 	}
 }
 
