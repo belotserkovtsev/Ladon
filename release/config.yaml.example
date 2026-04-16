@@ -23,7 +23,9 @@ probe:
   # batch: 4           # сколько кандидатов за тик
 
   # --- exit-compare: добавляет remote-валидатор поверх локальной пробы ---
-  # local FAIL + remote OK = Hot (real block); local FAIL + remote FAIL = Ignore (FP).
+  # local FAIL + remote OK         = Hot (real block, exit confirms reachable)
+  # local FAIL + remote FAIL       = Ignore (methodological FP)
+  # local FAIL + remote unavailable = Hot (transport error → "no opinion", local stays)
   # Inline fast-path всегда только локальный — remote только в batch.
   # remote:
   #   url: https://my-probe-server.example.com/probe
