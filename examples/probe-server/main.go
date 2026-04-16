@@ -7,12 +7,7 @@
 // their own probe logic (a 4G SIM, a home Pi, a browser automation harness,
 // whatever suits their vantage point) behind the same contract.
 //
-// Build:  go build -o probe-server .
-// Run:    ./probe-server -listen :8080 -token mysecret
-// Test:   curl -X POST http://localhost:8080/probe \
-//	           -H 'Authorization: Bearer mysecret' \
-//	           -H 'Content-Type: application/json' \
-//	           -d '{"domain":"example.com","port":443,"sni":"example.com"}'
+// See examples/probe-server/README.md for build/run/curl examples.
 package main
 
 import (
