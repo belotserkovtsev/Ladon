@@ -473,6 +473,94 @@ func (s *Store) ExpireHotEntries(ctx context.Context, now time.Time) (int64, err
 	return res.RowsAffected()
 }
 
+// DeleteHotEntry removes one row by domain. Used when a fresher probe overrules
+// an earlier Hot verdict (e.g. exit-compare validator says the local fail was
+// methodological — domain shouldn't sit in ipset for 24h on a stale opinion).
+// Returns true if a row was deleted.
+func (s *Store) DeleteHotEntry(ctx context.Context, domain string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM hot_entries WHERE domain = ?`, domain)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// PruneCache deletes cache_entries rows. Pass a zero time to delete all, or a
+// specific cutoff to only delete rows promoted before it. Operator-triggered
+// cleanup (ladon prune -cache).
+func (s *Store) PruneCache(ctx context.Context, before time.Time) (int64, error) {
+	return deleteWithOptionalBefore(ctx, s.db, "cache_entries", "promoted_at", before)
+}
+
+// PruneHot deletes hot_entries rows. See PruneCache for semantics.
+func (s *Store) PruneHot(ctx context.Context, before time.Time) (int64, error) {
+	return deleteWithOptionalBefore(ctx, s.db, "hot_entries", "created_at", before)
+}
+
+// PruneProbes deletes probes rows. See PruneCache for semantics.
+func (s *Store) PruneProbes(ctx context.Context, before time.Time) (int64, error) {
+	return deleteWithOptionalBefore(ctx, s.db, "probes", "created_at", before)
+}
+
+// ResetOrphanedDomains flips `state` back to 'new' and clears cooldown_until
+// for domains no longer backed by a hot_entries or cache_entries row. Called
+// after a prune to make sure those domains can be re-probed from scratch
+// instead of sitting in a stale terminal state.
+func (s *Store) ResetOrphanedDomains(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE domains
+		SET state = 'new', cooldown_until = NULL, last_probe_id = NULL
+		WHERE state IN ('hot', 'cache', 'ignore')
+		  AND domain NOT IN (SELECT domain FROM hot_entries)
+		  AND domain NOT IN (SELECT domain FROM cache_entries)
+	`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// CountCache, CountHot, CountProbes are dry-run companions to the Prune*
+// helpers — same WHERE clause, no mutation. Used by `ladon prune -dry-run`.
+func (s *Store) CountCache(ctx context.Context, before time.Time) (int64, error) {
+	return countWithOptionalBefore(ctx, s.db, "cache_entries", "promoted_at", before)
+}
+func (s *Store) CountHot(ctx context.Context, before time.Time) (int64, error) {
+	return countWithOptionalBefore(ctx, s.db, "hot_entries", "created_at", before)
+}
+func (s *Store) CountProbes(ctx context.Context, before time.Time) (int64, error) {
+	return countWithOptionalBefore(ctx, s.db, "probes", "created_at", before)
+}
+
+// deleteWithOptionalBefore is the common shape of the three prune helpers.
+// Table/column names are trusted (hardcoded in callers) — no interpolation of
+// user input.
+func deleteWithOptionalBefore(ctx context.Context, db *sql.DB, table, tsColumn string, before time.Time) (int64, error) {
+	var res sql.Result
+	var err error
+	if before.IsZero() {
+		res, err = db.ExecContext(ctx, `DELETE FROM `+table)
+	} else {
+		res, err = db.ExecContext(ctx, `DELETE FROM `+table+` WHERE `+tsColumn+` < ?`, formatTime(before))
+	}
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func countWithOptionalBefore(ctx context.Context, db *sql.DB, table, tsColumn string, before time.Time) (int64, error) {
+	var n int64
+	var err error
+	if before.IsZero() {
+		err = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+table).Scan(&n)
+	} else {
+		err = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+table+` WHERE `+tsColumn+` < ?`, formatTime(before)).Scan(&n)
+	}
+	return n, err
+}
+
 func (s *Store) ListRecentDomains(ctx context.Context, limit int) ([]Domain, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT domain, COALESCE(etld_plus_one, ''), COALESCE(first_seen_at, ''),

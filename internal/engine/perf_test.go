@@ -178,8 +178,9 @@ func TestPipelineThroughput(t *testing.T) {
 	// domain made it through the pipeline. Generous deadline because GitHub
 	// Actions runners (2-CPU shared) routinely burst into other tenants and
 	// starve our probe goroutines for seconds at a time. Real wall-time on
-	// healthy hardware is ~1-2s.
-	deadline := 60 * time.Second
+	// healthy hardware is ~1-2s; we give 120s of headroom because we'd
+	// rather absorb a noisy runner than file a flaky-test issue every week.
+	deadline := 120 * time.Second
 	t0 := time.Now()
 	for time.Since(t0) < deadline {
 		doms, err := s.ListRecentDomains(ctx, N+10)

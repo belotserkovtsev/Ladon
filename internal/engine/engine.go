@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/belotserkovtsev/ladon/internal/decision"
@@ -42,6 +43,18 @@ type Config struct {
 	ManualAllowPath        string        // optional path to manual allow list file
 	ManualDenyPath         string        // optional path to manual deny list file
 	IgnorePeer             string        // peer IP to skip (gateway self, etc.)
+
+	// LocalProber is the always-on baseline. Used by the inline fast-path from
+	// the tailer (where remote round-trips would blow the sub-second latency
+	// budget) and as the first stage of the batch worker. Defaults to NewLocal.
+	LocalProber prober.Prober
+
+	// RemoteProber is the optional exit-compare validator. When non-nil, the
+	// batch worker runs it ONLY after a local FAIL, and uses the combined
+	// verdict: local FAIL + remote OK = real DPI block (Hot); local FAIL +
+	// remote FAIL = methodological FP (Ignore — port wrong, dead server,
+	// geofence on both vantage points). Inline path never uses this.
+	RemoteProber prober.Prober
 }
 
 // Defaults returns a reasonable baseline config.
@@ -69,6 +82,15 @@ func Defaults(logPath string) Config {
 
 // Run starts all pipeline stages and blocks until ctx is cancelled.
 func Run(ctx context.Context, store *storage.Store, cfg Config) error {
+	if cfg.LocalProber == nil {
+		cfg.LocalProber = prober.NewLocal(cfg.ProbeTimeout)
+	}
+	if cfg.RemoteProber != nil {
+		log.Printf("probe backends: %s (baseline) + %s (exit-compare)",
+			cfg.LocalProber.Name(), cfg.RemoteProber.Name())
+	} else {
+		log.Printf("probe backend: %s", cfg.LocalProber.Name())
+	}
 	// Seed manual lists (best-effort — missing files are fine).
 	if n, err := manual.Load(ctx, store, cfg.ManualAllowPath, "allow"); err != nil {
 		log.Printf("manual allow load: %v", err)
@@ -195,7 +217,10 @@ func tryInlineProbe(ctx context.Context, store *storage.Store, cfg Config, domai
 		if err != nil || !eligible {
 			return
 		}
-		probeDomain(ctx, store, cfg, domain, ipsetTrigger)
+		// Inline path: local-only. The exit-compare validator (if configured)
+		// runs on the batch worker's cooldown re-probe — it would blow the
+		// inline latency budget here.
+		probeDomain(ctx, store, cfg, domain, ipsetTrigger, false)
 	}()
 }
 
@@ -225,14 +250,18 @@ func probeOnce(ctx context.Context, store *storage.Store, cfg Config, ipsetTrigg
 		if err := ctx.Err(); err != nil {
 			return nil
 		}
-		probeDomain(ctx, store, cfg, d.Domain, ipsetTrigger)
+		// Batch worker uses exit-compare when RemoteProber is configured —
+		// gives the operator's vantage point a vote on borderline calls.
+		probeDomain(ctx, store, cfg, d.Domain, ipsetTrigger, true)
 	}
 	return nil
 }
 
 // probeDomain runs one full probe→decision→persist cycle for a single domain.
-// Shared by the batch worker and the inline fast-path from the tailer.
-func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain string, ipsetTrigger chan<- struct{}) {
+// Shared by the batch worker and the inline fast-path from the tailer; the
+// useExitCompare flag turns on the optional remote validator stage that only
+// the batch path opts into.
+func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain string, ipsetTrigger chan<- struct{}, useExitCompare bool) {
 	if err := prober.Validate(domain); err != nil {
 		_ = store.SetDomainState(ctx, domain, "ignore", time.Time{})
 		return
@@ -244,13 +273,84 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 	if err != nil {
 		log.Printf("lookup ips %q: %v", domain, err)
 	}
-	var res prober.Result
-	if len(ips) > 0 {
-		res = prober.ProbeIPs(ctx, domain, ips, cfg.ProbeTimeout)
-	} else {
-		res = prober.Probe(ctx, domain, cfg.ProbeTimeout)
+
+	// Phase 1: local probe (always). This is the gateway-side view; if it says
+	// the destination is reachable, no exit comparison can change that.
+	res := cfg.LocalProber.Probe(ctx, domain, ips)
+	persistProbe(ctx, store, res)
+	verdict := decision.Classify(res)
+	hotReason := reasonFromProbe(res)
+
+	// Phase 2: exit-compare validator. Only runs when local already failed —
+	// that's both the only case where remote can change the verdict (it can
+	// never veto a local OK; if the gateway can reach it, no need to tunnel),
+	// and the bandwidth-cheapest filter for the operator's remote server.
+	if useExitCompare && verdict == decision.Hot && cfg.RemoteProber != nil {
+		rres := cfg.RemoteProber.Probe(ctx, domain, ips)
+		persistProbe(ctx, store, rres)
+		switch {
+		case rres.TCPOK && rres.TLSOK:
+			// Real DPI block: direct path dead, exit confirms target is alive.
+			hotReason = "local:" + reasonFromProbe(res) + "|remote:ok"
+		case isRemoteTransportFailure(rres):
+			// Remote prober itself unreachable / timed out / returned non-200.
+			// Treat as "no opinion" — never let an outage of the operator's
+			// probe-server cascade into Ignore-ing real DPI blocks. Stick with
+			// the local Hot verdict.
+			hotReason = "local:" + reasonFromProbe(res) + "|remote:unavailable:" + reasonFromProbe(rres)
+		default:
+			// Both probers reported a real failure: methodological FP (port
+			// wrong, dead server, geofence on both vantage points).
+			verdict = decision.Ignore
+			hotReason = "local:" + reasonFromProbe(res) + "|remote:" + reasonFromProbe(rres)
+		}
 	}
 
+	cooldown := time.Now().UTC().Add(cfg.ProbeCooldown)
+
+	switch verdict {
+	case decision.Hot:
+		if err := store.SetDomainState(ctx, domain, "hot", cooldown); err != nil {
+			log.Printf("set state hot %q: %v", domain, err)
+		}
+		if err := store.UpsertHotEntry(ctx, domain,
+			hotReason, time.Now().UTC().Add(cfg.HotTTL)); err != nil {
+			log.Printf("upsert hot %q: %v", domain, err)
+		}
+		log.Printf("probe %s → HOT (%s, %dms)", domain, hotReason, res.LatencyMS)
+		// Nudge the ipset syncer — a new IP may now need to be tunneled.
+		select {
+		case ipsetTrigger <- struct{}{}:
+		default:
+		}
+	case decision.Ignore:
+		if err := store.SetDomainState(ctx, domain, "ignore", cooldown); err != nil {
+			log.Printf("set state ignore %q: %v", domain, err)
+		}
+		// If a previous probe (often the inline fast-path) put this domain in
+		// hot_entries, drop it now that we've confirmed it's not actually
+		// blocked. Without this the FP would sit in ipset for the full HotTTL.
+		if removed, err := store.DeleteHotEntry(ctx, domain); err != nil {
+			log.Printf("delete hot %q: %v", domain, err)
+		} else if removed {
+			log.Printf("probe %s → IGNORE (overruled prior hot, %s)", domain, hotReason)
+			select {
+			case ipsetTrigger <- struct{}{}:
+			default:
+			}
+		}
+	default:
+		if err := store.SetDomainState(ctx, domain, "watch", cooldown); err != nil {
+			log.Printf("set state watch %q: %v", domain, err)
+		}
+	}
+}
+
+// persistProbe writes one probes row. Both local and remote results go through
+// here so the probes table keeps a per-backend audit trail without any schema
+// change — the FailureReason text already distinguishes them when callers
+// prefix it (e.g. "remote:tcp:timeout").
+func persistProbe(ctx context.Context, store *storage.Store, res prober.Result) {
 	dns, tcp, tls := res.DNSOK, res.TCPOK, res.TLSOK
 	if _, err := store.InsertProbe(ctx, storage.ProbeResult{
 		Domain:        res.Domain,
@@ -262,36 +362,7 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 		FailureReason: res.FailureReason,
 		LatencyMS:     res.LatencyMS,
 	}, time.Time{}); err != nil {
-		log.Printf("persist probe %q: %v", domain, err)
-		return
-	}
-
-	verdict := decision.Classify(res)
-	cooldown := time.Now().UTC().Add(cfg.ProbeCooldown)
-
-	switch verdict {
-	case decision.Hot:
-		if err := store.SetDomainState(ctx, domain, "hot", cooldown); err != nil {
-			log.Printf("set state hot %q: %v", domain, err)
-		}
-		if err := store.UpsertHotEntry(ctx, domain,
-			reasonFromProbe(res), time.Now().UTC().Add(cfg.HotTTL)); err != nil {
-			log.Printf("upsert hot %q: %v", domain, err)
-		}
-		log.Printf("probe %s → HOT (%s, %dms)", domain, res.FailureReason, res.LatencyMS)
-		// Nudge the ipset syncer — a new IP may now need to be tunneled.
-		select {
-		case ipsetTrigger <- struct{}{}:
-		default:
-		}
-	case decision.Ignore:
-		if err := store.SetDomainState(ctx, domain, "ignore", cooldown); err != nil {
-			log.Printf("set state ignore %q: %v", domain, err)
-		}
-	default:
-		if err := store.SetDomainState(ctx, domain, "watch", cooldown); err != nil {
-			log.Printf("set state watch %q: %v", domain, err)
-		}
+		log.Printf("persist probe %q: %v", res.Domain, err)
 	}
 }
 
@@ -299,7 +370,15 @@ func reasonFromProbe(r prober.Result) string {
 	if r.FailureReason != "" {
 		return r.FailureReason
 	}
-	return "hot"
+	return "ok"
+}
+
+// isRemoteTransportFailure reports whether a remote prober result represents
+// the prober itself being unreachable (network error, timeout, non-200) rather
+// than a real verdict from a working remote. RemoteProber.Probe prefixes those
+// reasons with "remote:" — see internal/prober/remote.go failedRemote.
+func isRemoteTransportFailure(r prober.Result) bool {
+	return strings.HasPrefix(r.FailureReason, "remote:")
 }
 
 func runPublisher(ctx context.Context, store *storage.Store, cfg Config) error {

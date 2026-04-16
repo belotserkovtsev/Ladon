@@ -38,6 +38,7 @@ jobs:
           cp release/ladon.service            "${STAGE}/"
           cp release/manual-allow.txt.example "${STAGE}/"
           cp release/manual-deny.txt.example  "${STAGE}/"
+          cp release/config.yaml.example      "${STAGE}/"
           cp release/INSTALL.md               "${STAGE}/"
           cp README.md                        "${STAGE}/"
 
