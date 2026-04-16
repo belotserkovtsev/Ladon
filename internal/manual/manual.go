@@ -47,3 +47,37 @@ func Load(ctx context.Context, store *storage.Store, path, listName string) (int
 	}
 	return n, sc.Err()
 }
+
+// ReadDomains parses the same format as Load (one domain per line, '#'
+// comments, blanks ignored) and returns the lowercased / trimmed domains
+// without touching the database. Used by callers that delegate the list to
+// dnsmasq's native ipset= directive instead of storing in manual_entries.
+// A missing file returns an empty slice and no error.
+func ReadDomains(path string) ([]string, error) {
+	if path == "" {
+		return nil, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+
+	var out []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		domain := strings.ToLower(strings.TrimRight(line, "."))
+		if domain == "" {
+			continue
+		}
+		out = append(out, domain)
+	}
+	return out, sc.Err()
+}

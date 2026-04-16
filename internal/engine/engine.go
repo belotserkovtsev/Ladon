@@ -14,6 +14,7 @@ import (
 
 	"github.com/belotserkovtsev/ladon/internal/decision"
 	"github.com/belotserkovtsev/ladon/internal/dnsmasq"
+	"github.com/belotserkovtsev/ladon/internal/dnsmasqcfg"
 	"github.com/belotserkovtsev/ladon/internal/etld"
 	"github.com/belotserkovtsev/ladon/internal/ipset"
 	"github.com/belotserkovtsev/ladon/internal/manual"
@@ -24,6 +25,46 @@ import (
 	"github.com/belotserkovtsev/ladon/internal/tail"
 	"github.com/belotserkovtsev/ladon/internal/watcher"
 )
+
+// collectManualDomains reads the operator's manual-allow file plus every
+// enabled extension, returns a single deduplicated domain list. dnsmasq
+// then turns each into an `ipset=/domain/<set>` directive.
+func collectManualDomains(cfg Config) ([]string, error) {
+	seen := map[string]struct{}{}
+	var out []string
+	add := func(domains []string) {
+		for _, d := range domains {
+			if _, ok := seen[d]; ok {
+				continue
+			}
+			seen[d] = struct{}{}
+			out = append(out, d)
+		}
+	}
+
+	if cfg.ManualAllowPath != "" {
+		ds, err := manual.ReadDomains(cfg.ManualAllowPath)
+		if err != nil {
+			return out, fmt.Errorf("manual-allow %q: %w", cfg.ManualAllowPath, err)
+		}
+		add(ds)
+	}
+	for _, name := range cfg.Extensions {
+		path := filepath.Join(cfg.ExtensionsPath, name+".txt")
+		if _, err := os.Stat(path); err != nil {
+			log.Printf("extension %q: file not found at %s — check extensions_path", name, path)
+			continue
+		}
+		ds, err := manual.ReadDomains(path)
+		if err != nil {
+			log.Printf("extension %q read: %v", name, err)
+			continue
+		}
+		log.Printf("extension %s: %d domains from %s", name, len(ds), path)
+		add(ds)
+	}
+	return out, nil
+}
 
 // Config holds runtime knobs.
 type Config struct {
@@ -38,7 +79,8 @@ type Config struct {
 	ExpiryInterval         time.Duration // hot_entries sweep cadence
 	PublishPath            string        // where to write the published domain set
 	PublishInterval        time.Duration // publisher cadence
-	IpsetName              string        // name of the ipset to reconcile (empty → disabled)
+	IpsetName              string        // engine-managed ipset name (default ladon_engine)
+	ManualIpsetName        string        // dnsmasq-managed ipset name (default ladon_manual)
 	IpsetInterval          time.Duration // ipset reconcile cadence (periodic safety sweep)
 	DNSFreshness           time.Duration // how recent a dns_cache entry must be to ship IPs to ipset
 	Scorer                 scorer.Config // hot → cache promotion settings
@@ -80,7 +122,8 @@ func Defaults(logPath string) Config {
 		ExpiryInterval:         30 * time.Second,
 		PublishPath:            "state/published-domains.txt",
 		PublishInterval:        10 * time.Second,
-		IpsetName:              "prod",
+		IpsetName:              "ladon_engine",
+		ManualIpsetName:        "ladon_manual",
 		IpsetInterval:          30 * time.Second, // fallback safety sweep; Hot events trigger immediate syncs
 		DNSFreshness:           6 * time.Hour,
 		Scorer:                 scorer.Defaults(),
@@ -101,32 +144,36 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	} else {
 		log.Printf("probe backend: %s", cfg.LocalProber.Name())
 	}
-	// Seed manual lists (best-effort — missing files are fine).
-	if n, err := manual.Load(ctx, store, cfg.ManualAllowPath, "allow"); err != nil {
-		log.Printf("manual allow load: %v", err)
-	} else if n > 0 {
-		log.Printf("manual allow: loaded %d entries from %s", n, cfg.ManualAllowPath)
-	}
+	// Manual-deny still goes through the database — engine consults
+	// IsInDenyList during ingest to skip those domains entirely.
 	if n, err := manual.Load(ctx, store, cfg.ManualDenyPath, "deny"); err != nil {
 		log.Printf("manual deny load: %v", err)
 	} else if n > 0 {
 		log.Printf("manual deny: loaded %d entries from %s", n, cfg.ManualDenyPath)
 	}
-	// Extensions — same parser, same destination as manual-allow. A missing
-	// extension file is treated as a real error (operator explicitly opted in,
-	// shouldn't silently get nothing).
-	for _, name := range cfg.Extensions {
-		path := filepath.Join(cfg.ExtensionsPath, name+".txt")
-		if _, err := os.Stat(path); err != nil {
-			log.Printf("extension %q: file not found at %s — check extensions_path", name, path)
-			continue
+
+	// Manual-allow + extensions are delegated to dnsmasq's native ipset=
+	// directive. Reasons for the architectural split:
+	//   1. dnsmasq adds resolved IPs to the kernel set BEFORE returning the
+	//      DNS answer, so the client's first TCP SYN already finds the IP.
+	//      Our tail-and-reconcile loop can never win that race.
+	//   2. dnsmasq walks CNAME chains internally — no need for ladon-side
+	//      query-id tracking or eTLD+1 expansion to compensate.
+	//   3. Manual list = operator's stated intent; doesn't need probe-driven
+	//      verification. Letting dnsmasq own it keeps that mental model clean.
+	manualDomains, err := collectManualDomains(cfg)
+	if err != nil {
+		log.Printf("manual: %v", err)
+	}
+	if cfg.ManualIpsetName != "" {
+		if err := dnsmasqcfg.Write(cfg.ManualIpsetName, manualDomains); err != nil {
+			log.Printf("dnsmasq config write: %v", err)
+		} else {
+			log.Printf("manual: wrote %d domains → %s (ipset=%s)", len(manualDomains), dnsmasqcfg.Path, cfg.ManualIpsetName)
+			if err := dnsmasqcfg.Reload(ctx); err != nil {
+				log.Printf("dnsmasq reload: %v — manual list will activate on next dnsmasq restart", err)
+			}
 		}
-		n, err := manual.Load(ctx, store, path, "allow")
-		if err != nil {
-			log.Printf("extension %q load: %v", name, err)
-			continue
-		}
-		log.Printf("extension %s: loaded %d entries from %s", name, n, path)
 	}
 
 	// Inline probe semaphore caps concurrent fast-path probes from the tailer.
@@ -163,6 +210,17 @@ func runTailer(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 	report := time.NewTicker(30 * time.Second)
 	defer report.Stop()
 
+	// chainOrigin tracks dnsmasq query-id → the domain the client originally
+	// asked for. dnsmasq emits ALL replies in a CNAME chain under the same
+	// query-id, but only the terminal A-record carries an IP, and that
+	// reply's domain is the LAST hop in the chain (e.g. vercel-dns-013.com
+	// for a query against developers.openai.com). Without this map, that IP
+	// would land in dns_cache under vercel-dns-013.com — and our manual-allow
+	// eTLD+1 expansion of openai.com would never see it. Map size is bounded
+	// by the dnsmasq query-id space (~65k); each entry is overwritten when
+	// the id wraps around, so no explicit cleanup needed.
+	chainOrigin := make(map[string]string)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -185,6 +243,12 @@ func runTailer(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 				if ev.Peer == "" || ev.Peer == cfg.IgnorePeer {
 					skipped++
 					continue
+				}
+				// Remember the original queried domain — we'll use it to
+				// re-attribute IP replies that come back through CNAME hops
+				// to a different domain family.
+				if ev.QueryID != "" {
+					chainOrigin[ev.QueryID] = ev.Domain
 				}
 				if deny, _ := store.IsInDenyList(ctx, ev.Domain, etld.Compute(ev.Domain)); deny {
 					skipped++
@@ -211,8 +275,16 @@ func runTailer(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 					skipped++
 					continue
 				}
-				if err := store.UpsertDNSObservation(ctx, ev.Domain, ev.Target, time.Time{}); err != nil {
-					log.Printf("dns_cache %q→%s: %v", ev.Domain, ev.Target, err)
+				// CNAME re-attribution: if we tracked the original query for
+				// this id, store the IP under THAT domain so eTLD+1 lookups
+				// from manual-allow can find it. Falls back to the raw reply
+				// domain when we don't have a record (log started mid-stream).
+				storeDomain := ev.Domain
+				if origin, ok := chainOrigin[ev.QueryID]; ok && origin != "" {
+					storeDomain = origin
+				}
+				if err := store.UpsertDNSObservation(ctx, storeDomain, ev.Target, time.Time{}); err != nil {
+					log.Printf("dns_cache %q→%s: %v", storeDomain, ev.Target, err)
 					continue
 				}
 			default:
@@ -491,10 +563,15 @@ func runIpsetSyncer(ctx context.Context, store *storage.Store, cfg Config, trigg
 	}
 }
 
-// computeDesiredIPs walks hot+cache+manual-allow and returns the union of
-// IPs that should sit in the kernel ipset. Pulled out of runIpsetSyncer's
-// inline closure so tests can validate the manual-allow eTLD+1 expansion
-// without needing root / a real ipset on the host.
+// computeDesiredIPs walks hot ∪ cache and returns the union of IPs that
+// should sit in the engine-managed ipset (ladon_engine). Pulled out of
+// runIpsetSyncer's inline closure so tests can validate the eTLD+1
+// expansion logic without needing root / a real kernel ipset.
+//
+// Manual-allow lives in a SEPARATE ipset (ladon_manual) populated by
+// dnsmasq directly via ipset= directives — it's intentionally absent from
+// this function's union so ladon's destructive reconcile never strips an
+// IP that dnsmasq added but ladon doesn't know about.
 func computeDesiredIPs(ctx context.Context, store *storage.Store, cfg Config) (map[string]struct{}, int, error) {
 	now := time.Now().UTC()
 	freshSince := now.Add(-cfg.DNSFreshness)
@@ -507,12 +584,8 @@ func computeDesiredIPs(ctx context.Context, store *storage.Store, cfg Config) (m
 	if err != nil {
 		return nil, 0, fmt.Errorf("list cache: %w", err)
 	}
-	allow, err := store.ListManualByList(ctx, "allow")
-	if err != nil {
-		return nil, 0, fmt.Errorf("list allow: %w", err)
-	}
 
-	sources := make([]string, 0, len(hots)+len(cache)+len(allow))
+	sources := make([]string, 0, len(hots)+len(cache))
 	seenSrc := map[string]struct{}{}
 	for _, d := range hots {
 		if _, ok := seenSrc[d]; ok {
@@ -528,27 +601,10 @@ func computeDesiredIPs(ctx context.Context, store *storage.Store, cfg Config) (m
 		seenSrc[d] = struct{}{}
 		sources = append(sources, d)
 	}
-	// manualSet remembers which sources came from the operator's manual-allow
-	// list (or extensions, which feed the same table). They're treated as
-	// authoritative — eTLD+1 expansion always runs for them, so listing
-	// `openai.com` automatically pulls in IPs that dnsmasq has resolved for
-	// any *.openai.com subdomain. Without this, CDN-routed assets
-	// (cdn.openai.com → Azure) would slip past the tunnel even though the
-	// operator clearly intended the whole family.
-	manualSet := make(map[string]struct{}, len(allow))
-	for _, d := range allow {
-		manualSet[d] = struct{}{}
-		if _, ok := seenSrc[d]; ok {
-			continue
-		}
-		seenSrc[d] = struct{}{}
-		sources = append(sources, d)
-	}
 
 	// confirmedByETLD counts hot+cache evidence per family. The ≥2 gate keeps
-	// auto-classified expansion conservative — one accidentally-failed probe
-	// shouldn't drag a whole CDN's IP space into the tunnel. Manual-allow
-	// bypasses this gate; operator intent is its own evidence.
+	// expansion conservative — one accidentally-failed probe shouldn't drag a
+	// whole CDN's IP space into the tunnel.
 	confirmedByETLD := map[string]int{}
 	for _, d := range hots {
 		if r := etld.Compute(d); r != "" {
@@ -572,11 +628,7 @@ func computeDesiredIPs(ctx context.Context, store *storage.Store, cfg Config) (m
 			desired[ip] = struct{}{}
 		}
 		root := etld.Compute(d)
-		if root == "" {
-			continue
-		}
-		_, isManual := manualSet[d]
-		if !isManual && confirmedByETLD[root] < 2 {
+		if root == "" || confirmedByETLD[root] < 2 {
 			continue
 		}
 		if _, done := expandedETLDs[root]; done {

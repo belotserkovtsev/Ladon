@@ -49,8 +49,9 @@ scorer:
 # --- routing ---
 
 ipset:
-  name: prod
-  interval: 30s        # safety-reconcile; горячие события триггерят немедленный sync
+  name: ladon_engine        # ipset для probe-driven hot/cache
+  manual_name: ladon_manual # ipset для manual-allow + extensions (populates dnsmasq'ом)
+  interval: 30s             # safety-reconcile; горячие события триггерят немедленный sync
 
 # --- TTL / freshness ---
 

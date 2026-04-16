@@ -54,15 +54,21 @@ install -m 0644 extensions/README.md /opt/ladon/extensions/
 ## 3. Подготовка netfilter
 
 ```bash
-# Создать ipset куда engine будет класть IP заблокированных доменов
-ipset create prod hash:ip family inet maxelem 65536
+# Два ipset'а с разной ответственностью:
+#   ladon_engine — управляется ладоном из probe-driven discovery (hot/cache)
+#   ladon_manual — populates dnsmasq из ladon-manual.conf (manual-allow + extensions)
+ipset create ladon_engine hash:ip family inet maxelem 65536
+ipset create ladon_manual hash:ip family inet maxelem 65536 timeout 86400
 
-# Добавить правило в твою существующую mangle-цепочку WG_ROUTE.
-# Пример для pipeline, где peer 10.10.0.2 получает fwmark 0x1 → custom
-# routing table → upstream tunnel interface:
+# Два iptables-правила в WG_ROUTE — оба ведут в один и тот же fwmark 0x1.
+# Пример для pipeline, где peer 10.10.0.2 → fwmark 0x1 → tunnel:
 iptables -t mangle -A WG_ROUTE \
   -s 10.10.0.2/32 \
-  -m set --match-set prod dst \
+  -m set --match-set ladon_engine dst \
+  -j MARK --set-mark 0x1
+iptables -t mangle -A WG_ROUTE \
+  -s 10.10.0.2/32 \
+  -m set --match-set ladon_manual dst \
   -j MARK --set-mark 0x1
 
 # Сохранить для переживания ребута
@@ -71,6 +77,8 @@ iptables-save > /etc/iptables/rules.v4
 ipset save    > /etc/iptables/ipsets
 systemctl enable netfilter-persistent
 ```
+
+**Почему два ipset'а:** `ladon_engine` — динамический, ладон периодически пересоздаёт его на основе hot/cache → reconcile удаляет лишнее. `ladon_manual` — populated dnsmasq'ом синхронно при резолве через `ipset=/domain/ladon_manual` директивы, которые ладон записывает в `/etc/dnsmasq.d/ladon-manual.conf`. Если бы они были одним ipset'ом, ладон при reconcile удалял бы IP-шки которые добавил dnsmasq и про которые ладон не знает. Timeout=86400 на `ladon_manual` — естественная эвикция стейл-IP'шек, dnsmasq refresh'ит timeout при каждом резолве.
 
 Подробная схема iptables/ip-rule для cascading gateway (замени `tun0` на
 имя твоего upstream-интерфейса):

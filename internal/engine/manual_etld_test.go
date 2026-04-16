@@ -3,19 +3,18 @@ package engine
 import (
 	"context"
 	"path/filepath"
-	"sort"
 	"testing"
 	"time"
 
 	"github.com/belotserkovtsev/ladon/internal/storage"
 )
 
-// TestComputeDesiredIPs_ManualAllowExpandsByETLD is the regression test for
-// the v0.3.1 fix: when the operator puts `openai.com` in manual-allow, the
-// engine must pull IPs from dns_cache for ANY observed *.openai.com
-// subdomain into the ipset — not just the bare domain. Without this,
-// CDN-routed subresources (cdn.openai.com → Azure IPs) slip through.
-func TestComputeDesiredIPs_ManualAllowExpandsByETLD(t *testing.T) {
+// TestComputeDesiredIPs_ManualAllowNotInUnion is the inverse regression
+// test for v0.3.1: manual-allow lives in a separate ipset (ladon_manual)
+// populated by dnsmasq, so it must NOT leak into the engine-managed ipset
+// (ladon_engine) — otherwise ladon's destructive reconcile would either
+// double-add or, worse, strip dnsmasq's adds it doesn't recognize.
+func TestComputeDesiredIPs_ManualAllowNotInUnion(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	s, err := storage.Open(filepath.Join(dir, "engine.db"))
@@ -28,38 +27,21 @@ func TestComputeDesiredIPs_ManualAllowExpandsByETLD(t *testing.T) {
 	}
 
 	now := time.Now().UTC()
-
-	// Operator says: openai.com belongs in tunnel.
+	// Operator put openai.com in manual_entries and the tailer observed
+	// some subdomain IPs in dns_cache. Engine's union must ignore both.
 	if err := s.UpsertManual(ctx, "openai.com", "allow"); err != nil {
 		t.Fatal(err)
 	}
-	// Operator never queries bare openai.com — only the assets/CDN subdomains
-	// the actual ChatGPT page loads. dns_cache reflects what dnsmasq saw.
 	mustObserve(t, s, "cdn.openai.com", "13.107.219.157", now)
-	mustObserve(t, s, "chat.openai.com", "104.18.39.85", now)
-	mustObserve(t, s, "api.openai.com", "162.159.135.42", now)
-	// And an unrelated domain that should NOT leak in.
-	mustObserve(t, s, "google.com", "142.251.142.238", now)
 
 	cfg := Defaults("/dev/null")
-	cfg.IpsetName = "" // we won't actually touch ipset; computeDesiredIPs is the unit
-	desired, expanded, err := computeDesiredIPs(ctx, s, cfg)
+	cfg.IpsetName = ""
+	desired, _, err := computeDesiredIPs(ctx, s, cfg)
 	if err != nil {
 		t.Fatalf("computeDesiredIPs: %v", err)
 	}
-
-	got := make([]string, 0, len(desired))
-	for ip := range desired {
-		got = append(got, ip)
-	}
-	sort.Strings(got)
-	want := []string{"104.18.39.85", "13.107.219.157", "162.159.135.42"}
-
-	if !equalStrings(got, want) {
-		t.Errorf("desired = %v, want %v\n  expected all 3 *.openai.com IPs, no google.com leak", got, want)
-	}
-	if expanded != 1 {
-		t.Errorf("expanded etlds = %d, want 1", expanded)
+	if len(desired) != 0 {
+		t.Errorf("desired = %v, want empty — manual-allow must not feed engine ipset", desired)
 	}
 }
 
@@ -158,14 +140,3 @@ func mustObserve(t *testing.T, s *storage.Store, domain, ip string, now time.Tim
 	}
 }
 
-func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}

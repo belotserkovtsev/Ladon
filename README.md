@@ -289,9 +289,9 @@ extensions:
 # extensions_path: /opt/ladon/extensions   # default
 ```
 
-Семантика — то же что у `manual-allow.txt`: домены всегда попадают в `prod` ipset (через туннель), минуя probe-пайплайн. Probe (даже с exit-compare) **не может выкинуть** extension-домен из ipset — manual-allow всегда в union ipset-syncer'а. IP-адреса добавляются в ipset как только клиент их разрешит через dnsmasq (proactive resolve мы не делаем).
+Семантика: домены **всегда** идут через туннель, минуя probe-пайплайн. Реализовано через делегирование dnsmasq: при старте ладон пишет `/etc/dnsmasq.d/ladon-manual.conf` со строками `ipset=/openai.com/ladon_manual`, `ipset=/twitch.tv/ladon_manual` и т.д., потом `systemctl reload dnsmasq`. Дальше **dnsmasq сам** при резолве каждого домена walks CNAME-цепочку и кладёт все финальные A-записи в kernel ipset `ladon_manual` — **до того как ответ DNS уйдёт клиенту**. Первый-же TCP SYN клиента уже находит свой destination в kernel set'е → tunnel.
 
-Достаточно указать корневой домен — `manual-allow` (и extensions, которые через него идут) автоматически расширяется по eTLD+1: в ipset попадут IP-шки **всех поддоменов**, которые dnsmasq уже резолвил для клиента. То есть `openai.com` подтянет `cdn.openai.com` (Azure-CDN), `chat.openai.com` (CloudFlare), `api.openai.com` и т.д. без необходимости перечислять субдомены руками.
+Достаточно указать корневой домен — dnsmasq матчит по суффиксу. `openai.com` покрывает `cdn.openai.com` (Azure-CDN), `chat.openai.com` (CloudFlare), `developers.openai.com` (Vercel) и любые другие поддомены без необходимости их перечислять. CNAME-цепочки уходят в правильный ipset нативно, без нашей ladon-side логики.
 
 Доступные пресеты:
 

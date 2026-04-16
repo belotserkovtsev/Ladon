@@ -372,6 +372,9 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 	if f.Ipset.Name != "" {
 		cfg.IpsetName = f.Ipset.Name
 	}
+	if f.Ipset.ManualName != "" {
+		cfg.ManualIpsetName = f.Ipset.ManualName
+	}
 	if f.Ipset.Interval > 0 {
 		cfg.IpsetInterval = f.Ipset.Interval
 	}
