@@ -224,34 +224,7 @@ journalctl -u ladon -f
 
 ## 🛠 Конфигурация
 
-### CLI-флаги
-
-Флаги передаются через systemd unit (`/etc/systemd/system/ladon.service`):
-
-```
-ladon -db <path> run [-from-start] [-manual-allow <path>] [-manual-deny <path>] [-config <path>] <dnsmasq-log-path>
-```
-
-Значения по умолчанию из [`internal/engine/engine.go`](internal/engine/engine.go),
-функция `Defaults()`:
-
-| Параметр | Значение | Смысл |
-|---|---|---|
-| `ProbeTimeout` | 800 мс | Максимум на TCP/TLS dial |
-| `ProbeCooldown` | 5 мин | Минимальный интервал между probe одного домена |
-| `InlineProbeConcurrency` | 8 | Семафор для inline probe из tailer |
-| `HotTTL` | 24 ч | Срок жизни записи в `hot_entries` |
-| `IpsetInterval` | 30 с | Safety-реконсил ipset (помимо event-driven) |
-| `DNSFreshness` | 6 ч | Возраст, после которого IP из dns_cache устаревает |
-| `Scorer.Window` | 24 ч | Окно для подсчёта fails |
-| `Scorer.FailThreshold` | 50 | Порог fails для промоушна hot → cache |
-| `Scorer.Interval` | 10 мин | Как часто scorer проходится |
-
-### YAML-конфиг (опционально, с v0.3.0)
-
-Для более гибкой настройки — YAML-файл, путь которого передаётся через
-`-config`. Если флаг не задан, используются значения по умолчанию — поведение
-не меняется. Любые поля в YAML опциональны, пропущенные берутся из defaults.
+Основной способ — YAML-файл, путь которого передаётся флагом `-config`. Без файла движок едет на дефолтах из [`internal/engine/engine.go`](internal/engine/engine.go).
 
 Пример `/etc/ladon/config.yaml`:
 
@@ -261,7 +234,7 @@ manual_allow: /etc/ladon/manual-allow.txt
 manual_deny: /etc/ladon/manual-deny.txt
 
 probe:
-  mode: local         # local (по умолчанию) | remote
+  mode: local         # local | remote
   timeout: 800ms
   cooldown: 5m
   concurrency: 8
@@ -279,11 +252,33 @@ hot_ttl: 24h
 dns_freshness: 6h
 ```
 
-### Внешний proб-сервер (remote mode)
+Все поля опциональны — пропущенные берутся из дефолтов:
 
-С v0.3.0 можно делегировать пробы внешнему HTTP-сервису. Полезно, когда
-нужно измерять доступность не с самого шлюза, а с другой точки —
-residential ISP, 4G-модема, офшорной VPS и т.п.
+| Параметр | Значение | Смысл |
+|---|---|---|
+| `probe.timeout` | 800 мс | Максимум на TCP/TLS dial |
+| `probe.cooldown` | 5 мин | Минимальный интервал между probe одного домена |
+| `probe.concurrency` | 8 | Семафор для inline probe из tailer |
+| `hot_ttl` | 24 ч | Срок жизни записи в `hot_entries` |
+| `ipset.interval` | 30 с | Safety-реконсил ipset (помимо event-driven) |
+| `dns_freshness` | 6 ч | Возраст, после которого IP из dns_cache устаревает |
+| `scorer.window` | 24 ч | Окно для подсчёта fails |
+| `scorer.fail_threshold` | 50 | Порог fails для промоушна hot → cache |
+| `scorer.interval` | 10 мин | Как часто scorer проходится |
+
+### CLI-флаги
+
+Дополнение к YAML — для простых случаев и для разовых override'ов:
+
+```
+ladon -db <path> [-config <path>] run [-from-start] [-manual-allow <path>] [-manual-deny <path>] <dnsmasq-log-path>
+```
+
+Пути (`-manual-allow`, `-manual-deny`) перебивают одноимённые поля YAML, если заданы оба. Тонкие knobs задаются только через файл.
+
+### Внешний пробинг-сервер (remote mode)
+
+Можно делегировать пробы внешнему HTTP-сервису — полезно, когда надо измерять доступность не с самого шлюза, а с другой точки: residential ISP, 4G-модем, офшорная VPS и т.п.
 
 ```yaml
 probe:
@@ -295,9 +290,7 @@ probe:
     auth_value: Bearer mysecrettoken
 ```
 
-HTTP-контракт прост: ладон шлёт POST с доменом и IP, сервер возвращает
-JSON с вердиктом. Формат полностью описан в [`docs/probe-api.md`](docs/probe-api.md).
-Референсная имплементация на Go — в [`examples/probe-server/`](examples/probe-server/).
+HTTP-контракт простой: ладон шлёт POST с доменом и IP, сервер возвращает JSON с вердиктом. Формат описан в [`docs/probe-api.md`](docs/probe-api.md), референсная имплементация на Go — в [`examples/probe-server/`](examples/probe-server/).
 
 ---
 
