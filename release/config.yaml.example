@@ -14,6 +14,12 @@
 
 # --- probe backend ---
 
+# Extensions — преднастроенные allow-списки. См. /opt/ladon/extensions/README.md
+# extensions:
+#   - ai
+#   - twitch
+# extensions_path: /opt/ladon/extensions   # default
+
 probe:
   mode: local          # local (default) | exit-compare
   timeout: 800ms       # TCP/TLS dial timeout
@@ -43,8 +49,9 @@ scorer:
 # --- routing ---
 
 ipset:
-  name: prod
-  interval: 30s        # safety-reconcile; горячие события триггерят немедленный sync
+  name: ladon_engine        # ipset для probe-driven hot/cache
+  manual_name: ladon_manual # ipset для manual-allow + extensions (populates dnsmasq'ом)
+  interval: 30s             # safety-reconcile; горячие события триггерят немедленный sync
 
 # --- TTL / freshness ---
 

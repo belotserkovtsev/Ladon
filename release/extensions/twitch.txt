@@ -1,0 +1,15 @@
+# ladon extension: Twitch
+#
+# Подключается через config.yaml:
+#   extensions: [twitch]
+#
+# Закомменченные домены (amazonaws.com, akamaihd.net) — overly broad,
+# зацепят кучу несвязанного трафика. Включай если знаешь что делаешь.
+
+twitch.tv
+ttvnw.net
+live-video.net
+twitchcdn.net
+ext-twitch.tv
+# amazonaws.com
+# akamaihd.net

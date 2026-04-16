@@ -372,6 +372,9 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 	if f.Ipset.Name != "" {
 		cfg.IpsetName = f.Ipset.Name
 	}
+	if f.Ipset.ManualName != "" {
+		cfg.ManualIpsetName = f.Ipset.ManualName
+	}
 	if f.Ipset.Interval > 0 {
 		cfg.IpsetInterval = f.Ipset.Interval
 	}
@@ -389,6 +392,12 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 	}
 	if f.IgnorePeer != "" {
 		cfg.IgnorePeer = f.IgnorePeer
+	}
+	if len(f.Extensions) > 0 {
+		cfg.Extensions = f.Extensions
+	}
+	if f.ExtensionsPath != "" {
+		cfg.ExtensionsPath = f.ExtensionsPath
 	}
 	cfg.LocalProber = f.BuildLocalProber(cfg.ProbeTimeout)
 	cfg.RemoteProber = f.BuildRemoteProber()

@@ -34,6 +34,12 @@ type File struct {
 	PublishPath     string        `yaml:"publish_path"`
 	PublishInterval time.Duration `yaml:"publish_interval"`
 	IgnorePeer      string        `yaml:"ignore_peer"`
+
+	// Extensions are bundled allow-list presets enabled by name. Each name
+	// resolves to <ExtensionsPath>/<name>.txt and is loaded with the same
+	// parser as ManualAllow.
+	Extensions     []string `yaml:"extensions"`
+	ExtensionsPath string   `yaml:"extensions_path"`
 }
 
 // ProbeSection covers both the shared probe tuning and the backend selector.
@@ -73,8 +79,9 @@ type ScorerSection struct {
 
 // IpsetSection mirrors the ipset knobs.
 type IpsetSection struct {
-	Name     string        `yaml:"name"`
-	Interval time.Duration `yaml:"interval"`
+	Name       string        `yaml:"name"`        // engine-managed (default ladon_engine)
+	ManualName string        `yaml:"manual_name"` // dnsmasq-managed (default ladon_manual; "" disables)
+	Interval   time.Duration `yaml:"interval"`
 }
 
 // Load reads and parses a YAML file. Returns ErrNotFound if the path is empty

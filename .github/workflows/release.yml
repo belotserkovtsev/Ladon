@@ -40,11 +40,16 @@ jobs:
           cp release/manual-deny.txt.example  "${STAGE}/"
           cp release/config.yaml.example      "${STAGE}/"
           cp release/INSTALL.md               "${STAGE}/"
+          cp release/install.sh               "${STAGE}/"
+          cp release/uninstall.sh             "${STAGE}/"
           cp README.md                        "${STAGE}/"
+          cp -r release/extensions            "${STAGE}/"
 
           tar -czf "dist/ladon-linux-${ARCH}.tar.gz" -C dist "ladon-linux-${ARCH}-${TAG}"
-          sha256sum "dist/ladon-linux-${ARCH}.tar.gz" \
-            > "dist/ladon-linux-${ARCH}.tar.gz.sha256"
+          # sha256 file must contain the bare filename so `sha256sum -c` works
+          # when the user downloads the tarball into an arbitrary directory.
+          (cd dist && sha256sum "ladon-linux-${ARCH}.tar.gz" \
+            > "ladon-linux-${ARCH}.tar.gz.sha256")
 
       - name: upload artifact
         uses: actions/upload-artifact@v4
@@ -60,6 +65,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -69,12 +76,23 @@ jobs:
       - name: list bundle
         run: ls -la dist/
 
+      - name: stage standalone install scripts
+        # Publish install.sh / uninstall.sh as separate release assets too,
+        # so the recommended curl one-liner can fetch them via the predictable
+        # /releases/latest/download/install.sh URL without unpacking a tarball.
+        run: |
+          cp release/install.sh   dist/install.sh
+          cp release/uninstall.sh dist/uninstall.sh
+          chmod +x dist/install.sh dist/uninstall.sh
+
       - name: publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/*.tar.gz
             dist/*.sha256
+            dist/install.sh
+            dist/uninstall.sh
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
