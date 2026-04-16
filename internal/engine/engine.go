@@ -458,86 +458,10 @@ func runIpsetSyncer(ctx context.Context, store *storage.Store, cfg Config, trigg
 	defer ticker.Stop()
 
 	syncNow := func() {
-		now := time.Now().UTC()
-		freshSince := now.Add(-cfg.DNSFreshness)
-
-		hots, err := store.ListHotEntries(ctx, now)
+		desired, expanded, err := computeDesiredIPs(ctx, store, cfg)
 		if err != nil {
-			log.Printf("ipset: list hot: %v", err)
+			log.Printf("ipset: compute desired: %v", err)
 			return
-		}
-		cache, err := store.ListCacheEntries(ctx)
-		if err != nil {
-			log.Printf("ipset: list cache: %v", err)
-		}
-		allow, err := store.ListManualByList(ctx, "allow")
-		if err != nil {
-			log.Printf("ipset: list allow: %v", err)
-		}
-
-		sources := make([]string, 0, len(hots)+len(cache)+len(allow))
-		seenSrc := map[string]struct{}{}
-		for _, d := range hots {
-			if _, ok := seenSrc[d]; ok {
-				continue
-			}
-			seenSrc[d] = struct{}{}
-			sources = append(sources, d)
-		}
-		for _, d := range cache {
-			if _, ok := seenSrc[d]; ok {
-				continue
-			}
-			seenSrc[d] = struct{}{}
-			sources = append(sources, d)
-		}
-		for _, d := range allow {
-			if _, ok := seenSrc[d]; ok {
-				continue
-			}
-			seenSrc[d] = struct{}{}
-			sources = append(sources, d)
-		}
-
-		confirmedByETLD := map[string]int{}
-		for _, d := range hots {
-			if r := etld.Compute(d); r != "" {
-				confirmedByETLD[r]++
-			}
-		}
-		for _, d := range cache {
-			if r := etld.Compute(d); r != "" {
-				confirmedByETLD[r]++
-			}
-		}
-
-		desired := map[string]struct{}{}
-		expandedETLDs := map[string]struct{}{}
-		for _, d := range sources {
-			ips, err := store.LookupIPs(ctx, d, freshSince)
-			if err != nil {
-				log.Printf("ipset: lookup ips %q: %v", d, err)
-				continue
-			}
-			for _, ip := range ips {
-				desired[ip] = struct{}{}
-			}
-			root := etld.Compute(d)
-			if root == "" || confirmedByETLD[root] < 2 {
-				continue
-			}
-			if _, done := expandedETLDs[root]; done {
-				continue
-			}
-			expandedETLDs[root] = struct{}{}
-			siblingIPs, err := store.LookupIPsByETLD(ctx, root, freshSince)
-			if err != nil {
-				log.Printf("ipset: lookup etld %q: %v", root, err)
-				continue
-			}
-			for _, ip := range siblingIPs {
-				desired[ip] = struct{}{}
-			}
 		}
 		list := make([]string, 0, len(desired))
 		for ip := range desired {
@@ -550,7 +474,7 @@ func runIpsetSyncer(ctx context.Context, store *storage.Store, cfg Config, trigg
 		}
 		if added > 0 || removed > 0 {
 			log.Printf("ipset %s: +%d -%d (total %d, etlds expanded %d)",
-				cfg.IpsetName, added, removed, len(list), len(expandedETLDs))
+				cfg.IpsetName, added, removed, len(list), expanded)
 		}
 	}
 	syncNow()
@@ -565,6 +489,109 @@ func runIpsetSyncer(ctx context.Context, store *storage.Store, cfg Config, trigg
 			syncNow()
 		}
 	}
+}
+
+// computeDesiredIPs walks hot+cache+manual-allow and returns the union of
+// IPs that should sit in the kernel ipset. Pulled out of runIpsetSyncer's
+// inline closure so tests can validate the manual-allow eTLD+1 expansion
+// without needing root / a real ipset on the host.
+func computeDesiredIPs(ctx context.Context, store *storage.Store, cfg Config) (map[string]struct{}, int, error) {
+	now := time.Now().UTC()
+	freshSince := now.Add(-cfg.DNSFreshness)
+
+	hots, err := store.ListHotEntries(ctx, now)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list hot: %w", err)
+	}
+	cache, err := store.ListCacheEntries(ctx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list cache: %w", err)
+	}
+	allow, err := store.ListManualByList(ctx, "allow")
+	if err != nil {
+		return nil, 0, fmt.Errorf("list allow: %w", err)
+	}
+
+	sources := make([]string, 0, len(hots)+len(cache)+len(allow))
+	seenSrc := map[string]struct{}{}
+	for _, d := range hots {
+		if _, ok := seenSrc[d]; ok {
+			continue
+		}
+		seenSrc[d] = struct{}{}
+		sources = append(sources, d)
+	}
+	for _, d := range cache {
+		if _, ok := seenSrc[d]; ok {
+			continue
+		}
+		seenSrc[d] = struct{}{}
+		sources = append(sources, d)
+	}
+	// manualSet remembers which sources came from the operator's manual-allow
+	// list (or extensions, which feed the same table). They're treated as
+	// authoritative — eTLD+1 expansion always runs for them, so listing
+	// `openai.com` automatically pulls in IPs that dnsmasq has resolved for
+	// any *.openai.com subdomain. Without this, CDN-routed assets
+	// (cdn.openai.com → Azure) would slip past the tunnel even though the
+	// operator clearly intended the whole family.
+	manualSet := make(map[string]struct{}, len(allow))
+	for _, d := range allow {
+		manualSet[d] = struct{}{}
+		if _, ok := seenSrc[d]; ok {
+			continue
+		}
+		seenSrc[d] = struct{}{}
+		sources = append(sources, d)
+	}
+
+	// confirmedByETLD counts hot+cache evidence per family. The ≥2 gate keeps
+	// auto-classified expansion conservative — one accidentally-failed probe
+	// shouldn't drag a whole CDN's IP space into the tunnel. Manual-allow
+	// bypasses this gate; operator intent is its own evidence.
+	confirmedByETLD := map[string]int{}
+	for _, d := range hots {
+		if r := etld.Compute(d); r != "" {
+			confirmedByETLD[r]++
+		}
+	}
+	for _, d := range cache {
+		if r := etld.Compute(d); r != "" {
+			confirmedByETLD[r]++
+		}
+	}
+
+	desired := map[string]struct{}{}
+	expandedETLDs := map[string]struct{}{}
+	for _, d := range sources {
+		ips, err := store.LookupIPs(ctx, d, freshSince)
+		if err != nil {
+			return nil, 0, fmt.Errorf("lookup ips %q: %w", d, err)
+		}
+		for _, ip := range ips {
+			desired[ip] = struct{}{}
+		}
+		root := etld.Compute(d)
+		if root == "" {
+			continue
+		}
+		_, isManual := manualSet[d]
+		if !isManual && confirmedByETLD[root] < 2 {
+			continue
+		}
+		if _, done := expandedETLDs[root]; done {
+			continue
+		}
+		expandedETLDs[root] = struct{}{}
+		siblingIPs, err := store.LookupIPsByETLD(ctx, root, freshSince)
+		if err != nil {
+			return nil, 0, fmt.Errorf("lookup etld %q: %w", root, err)
+		}
+		for _, ip := range siblingIPs {
+			desired[ip] = struct{}{}
+		}
+	}
+	return desired, len(expandedETLDs), nil
 }
 
 func runExpirySweeper(ctx context.Context, store *storage.Store, cfg Config) error {

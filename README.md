@@ -291,6 +291,8 @@ extensions:
 
 Семантика — то же что у `manual-allow.txt`: домены всегда попадают в `prod` ipset (через туннель), минуя probe-пайплайн. Probe (даже с exit-compare) **не может выкинуть** extension-домен из ipset — manual-allow всегда в union ipset-syncer'а. IP-адреса добавляются в ipset как только клиент их разрешит через dnsmasq (proactive resolve мы не делаем).
 
+Достаточно указать корневой домен — `manual-allow` (и extensions, которые через него идут) автоматически расширяется по eTLD+1: в ipset попадут IP-шки **всех поддоменов**, которые dnsmasq уже резолвил для клиента. То есть `openai.com` подтянет `cdn.openai.com` (Azure-CDN), `chat.openai.com` (CloudFlare), `api.openai.com` и т.д. без необходимости перечислять субдомены руками.
+
 Доступные пресеты:
 
 | Имя | Покрытие |
