@@ -191,14 +191,13 @@ flowchart TB
 
 ```bash
 curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/install.sh \
-  | sudo PEER_SUBNET=10.10.0.0/16 bash
+  | sudo bash
 ```
 
-Скрипт сам скачает последнюю версию, поставит зависимости, создаст ipset'ы,
-впишет iptables-правила, настроит dnsmasq и запустит ladon. `PEER_SUBNET` —
-обязательный параметр, диапазон WG-пиров чей трафик нужно маркировать
-(`/16` — все, `/32` — конкретный пир). Удаление: `uninstall.sh` с тем же
-`PEER_SUBNET`.
+Скрипт скачает последнюю версию, поставит зависимости, создаст ipset'ы
+`ladon_engine` + `ladon_manual`, настроит dnsmasq и запустит ladon. **Routing (iptables / ip rule / routing tables) — твоя зона ответственности**: скрипт в конце печатает example для типичного WireGuard split-tunnel сетапа, скопируй и адаптируй под свою конфигурацию.
+
+Удаление: `uninstall.sh` тем же curl-one-liner.
 
 Для пошаговой ручной установки или нестандартного сетапа — см.
 [release/INSTALL.md](release/INSTALL.md).

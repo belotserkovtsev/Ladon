@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
 # ladon installer — Debian/Ubuntu only.
 #
+# Scope: ladon's job is to keep two kernel ipsets populated:
+#   ladon_engine — IPs of probe-discovered blocked domains (hot/cache)
+#   ladon_manual — IPs of domains in manual-allow + extensions (via dnsmasq)
+#
+# Wiring those ipsets into actual routing (iptables MARK + ip rule fwmark
+# + custom routing table → tunnel interface) is the OPERATOR'S responsibility:
+# only you know your tunnel interface, peer subnet, fwmark scheme, etc.
+# This script DOES NOT touch iptables — it prints an example at the end so
+# you can copy-paste-adjust.
+#
 # Usage:
-#   PEER_SUBNET=10.10.0.0/16 sudo bash install.sh
+#   sudo bash install.sh
 #
 # Or:
 #   curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/install.sh \
-#     | sudo PEER_SUBNET=10.10.0.0/16 bash
-#
-# PEER_SUBNET is required — it's the WG peer range that should get its
-# tunnel-bound traffic marked. Pass /32 for a single peer or /16 for all.
+#     | sudo bash
 #
 # Optional env:
-#   FWMARK=0x1              fwmark applied by iptables; must match your routing setup
 #   IPSET_ENGINE=ladon_engine, IPSET_MANUAL=ladon_manual
-#   WG_ROUTE_CHAIN=WG_ROUTE existing iptables mangle chain to add the rules to
 #   LADON_PREFIX=/opt/ladon, LADON_CONFIG_DIR=/etc/ladon
 
 set -euo pipefail
@@ -25,28 +30,12 @@ log()  { printf "%b==>%b %s\n" "$GREEN" "$NC" "$*"; }
 warn() { printf "%b==>%b %s\n" "$YELLOW" "$NC" "$*"; }
 die()  { printf "%b==>%b %s\n" "$RED" "$NC" "$*" >&2; exit 1; }
 
-# --- args / env ---
-PEER_SUBNET="${PEER_SUBNET:-}"
-FWMARK="${FWMARK:-0x1}"
+# --- env ---
 IPSET_ENGINE="${IPSET_ENGINE:-ladon_engine}"
 IPSET_MANUAL="${IPSET_MANUAL:-ladon_manual}"
-WG_ROUTE_CHAIN="${WG_ROUTE_CHAIN:-WG_ROUTE}"
 LADON_PREFIX="${LADON_PREFIX:-/opt/ladon}"
 LADON_CONFIG_DIR="${LADON_CONFIG_DIR:-/etc/ladon}"
 GH_REPO="belotserkovtsev/ladon"
-
-if [[ -z "$PEER_SUBNET" ]]; then
-  cat <<EOF >&2
-PEER_SUBNET is required.
-
-Pass it via env:
-  PEER_SUBNET=10.10.0.0/16 sudo bash install.sh
-
-  /16 = mark all WG peers in 10.10.0.0/16
-  /32 = mark only the specific peer (e.g. 10.10.0.2/32)
-EOF
-  exit 2
-fi
 
 # --- preflight ---
 [[ $EUID -eq 0 ]] || die "must run as root (sudo)"
@@ -58,7 +47,6 @@ case "${ID:-}${ID_LIKE:-}" in
 esac
 command -v systemctl >/dev/null || die "systemd required"
 command -v curl       >/dev/null || die "curl required"
-command -v iptables   >/dev/null || warn "iptables missing — will install"
 
 # --- arch detection ---
 case "$(uname -m)" in
@@ -72,7 +60,7 @@ log "architecture: $ARCH"
 log "installing deps (apt)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq ipset iptables iptables-persistent sqlite3 dnsmasq >/dev/null
+apt-get install -y -qq ipset sqlite3 dnsmasq >/dev/null
 
 # --- step 2: fetch latest release ---
 log "querying latest release"
@@ -116,22 +104,11 @@ ipset list "$IPSET_ENGINE" -t >/dev/null 2>&1 || \
 ipset list "$IPSET_MANUAL" -t >/dev/null 2>&1 || \
   ipset create "$IPSET_MANUAL" hash:ip family inet maxelem 65536 timeout 86400
 
-# --- step 5: iptables (idempotent — bail-noop if rule already present) ---
-log "ensuring iptables rules in $WG_ROUTE_CHAIN"
-iptables -t mangle -L "$WG_ROUTE_CHAIN" -n >/dev/null 2>&1 || \
-  iptables -t mangle -N "$WG_ROUTE_CHAIN"
-for set in "$IPSET_ENGINE" "$IPSET_MANUAL"; do
-  iptables -t mangle -C "$WG_ROUTE_CHAIN" -s "$PEER_SUBNET" \
-    -m set --match-set "$set" dst -j MARK --set-mark "$FWMARK" 2>/dev/null || \
-  iptables -t mangle -A "$WG_ROUTE_CHAIN" -s "$PEER_SUBNET" \
-    -m set --match-set "$set" dst -j MARK --set-mark "$FWMARK"
-done
-
-log "persisting netfilter state"
+# Persist ipsets across reboot. iptables-persistent's `ipsets` file is the
+# Debian/Ubuntu standard location; works whether or not netfilter-persistent
+# is installed (operator's choice).
 mkdir -p /etc/iptables
-iptables-save > /etc/iptables/rules.v4
-ipset save    > /etc/iptables/ipsets
-systemctl enable netfilter-persistent >/dev/null 2>&1 || true
+ipset save > /etc/iptables/ipsets
 
 # --- step 6: dnsmasq CAP_NET_ADMIN drop-in ---
 log "granting dnsmasq CAP_NET_ADMIN (needed for ipset= directives)"
@@ -179,11 +156,29 @@ What's running:
   config:   $LADON_CONFIG_DIR/config.yaml
   ipsets:   $IPSET_ENGINE (probe-driven), $IPSET_MANUAL (dnsmasq-driven)
 
+${YELLOW}==> ROUTING IS YOUR JOB${NC}
+
+ladon only fills the ipsets — wiring traffic from peers through your tunnel
+when the destination IP matches one of those sets is up to you. A typical
+WireGuard split-tunnel setup looks like (adjust subnet/fwmark/iface):
+
+  iptables -t mangle -A WG_ROUTE -s 10.10.0.0/16 \\
+    -m set --match-set $IPSET_ENGINE dst -j MARK --set-mark 0x1
+  iptables -t mangle -A WG_ROUTE -s 10.10.0.0/16 \\
+    -m set --match-set $IPSET_MANUAL dst -j MARK --set-mark 0x1
+
+  ip rule add fwmark 0x1 table ladon priority 1000
+  echo '666 ladon' >> /etc/iproute2/rt_tables
+  ip route replace default dev tun0 table ladon
+
+  iptables-save > /etc/iptables/rules.v4   # persist across reboot
+
 Next steps:
-  1. Add domains to $LADON_CONFIG_DIR/manual-allow.txt and restart ladon
-  2. Or enable bundled extensions in $LADON_CONFIG_DIR/config.yaml:
+  1. Wire the iptables / ip rule above (or whatever your routing setup needs).
+  2. Add domains to $LADON_CONFIG_DIR/manual-allow.txt and restart ladon.
+  3. Or enable bundled extensions in $LADON_CONFIG_DIR/config.yaml:
        extensions: [ai, twitch]
-  3. (Optional) For exit-compare validator, set probe.mode: exit-compare
+  4. (Optional) For exit-compare validator, set probe.mode: exit-compare
      in config.yaml. See $LADON_PREFIX/README.md.
 
 To uninstall: download and run release/uninstall.sh from the same release.

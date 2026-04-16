@@ -4,33 +4,31 @@
 
 ```bash
 curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/install.sh \
-  | sudo PEER_SUBNET=10.10.0.0/16 bash
+  | sudo bash
 ```
-
-`PEER_SUBNET` — обязательный параметр, диапазон WG-пиров чей трафик нужно
-маркировать. `/16` — все пиры подсети, `/32` — конкретный пир (например
-`10.10.0.2/32`).
 
 Скрипт сам:
 - определит архитектуру (amd64/arm64) и скачает последнюю версию + проверит sha256;
-- поставит зависимости (`ipset`, `iptables-persistent`, `sqlite3`, `dnsmasq`);
+- поставит зависимости (`ipset`, `sqlite3`, `dnsmasq`);
 - разложит бинарь, systemd-unit, конфиги и extensions в `/opt/ladon` и `/etc/ladon`;
-- создаст ipset'ы `ladon_engine` + `ladon_manual` с правильными опциями;
-- добавит iptables-правила в `WG_ROUTE` (идемпотентно, повторный запуск безопасен);
+- создаст ipset'ы `ladon_engine` + `ladon_manual` с правильными опциями + сохранит ipset state в `/etc/iptables/ipsets`;
 - установит CAP_NET_ADMIN drop-in для dnsmasq (нужно для нативных `ipset=` директив);
 - инициализирует БД, перезапустит dnsmasq и запустит ladon;
-- напечатает чеклист «что дальше» (как добавить домены, включить extensions, exit-compare).
+- напечатает example iptables/routing-сетапа который **тебе нужно сделать руками**.
 
-Удаление: тот же `uninstall.sh` с тем же `PEER_SUBNET`.
+**Что скрипт НЕ делает:** не трогает iptables / ip rule / routing tables.
+Это зона ответственности оператора — только ты знаешь какой у тебя tunnel-интерфейс, fwmark-схема, peer-subnet и т.д. Ладон просто наполняет ipset'ы; куда направлять трафик при попадании destination IP в эти ipset'ы — твой выбор. Скрипт в конце печатает example для типичного WireGuard split-tunnel сетапа.
+
+Удаление:
 
 ```bash
 curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/uninstall.sh \
-  | sudo PEER_SUBNET=10.10.0.0/16 bash
+  | sudo bash
 ```
 
-Дополнительные опциональные env-переменные (для нестандартных сетапов):
-`FWMARK`, `IPSET_ENGINE`, `IPSET_MANUAL`, `WG_ROUTE_CHAIN`, `LADON_PREFIX`,
-`LADON_CONFIG_DIR` — посмотри их в [`install.sh`](install.sh) (они есть в коде с дефолтами).
+Опциональные env-переменные (для нестандартных сетапов): `IPSET_ENGINE`,
+`IPSET_MANUAL`, `LADON_PREFIX`, `LADON_CONFIG_DIR` — см. дефолты в
+[`install.sh`](install.sh).
 
 ---
 
