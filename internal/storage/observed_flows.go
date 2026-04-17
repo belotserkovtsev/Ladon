@@ -37,3 +37,24 @@ func (s *Store) CountObservedFlows(ctx context.Context) (int, error) {
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM observed_flows`).Scan(&n)
 	return n, err
 }
+
+// DomainHasUDPFlows reports whether any LAN-observed UDP flow since `since`
+// hit an IP that dns_cache associates with this domain. Used by v1.0's
+// multi-protocol classifier as the "do UDP clients actually use this
+// destination?" gate — without UDP evidence a QUIC probe result can't
+// change the domain's verdict.
+func (s *Store) DomainHasUDPFlows(ctx context.Context, domain string, since time.Time) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM observed_flows of
+		JOIN dns_cache dc ON dc.ip = of.dst_ip
+		WHERE dc.domain = ?
+		  AND of.proto = 'udp'
+		  AND of.observed_at >= ?
+	`, domain, formatTime(since)).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}

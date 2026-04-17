@@ -432,16 +432,30 @@ func probeOnce(ctx context.Context, store *storage.Store, cfg Config, ipsetTrigg
 			if err := ctx.Err(); err != nil {
 				return nil
 			}
-			probeDomainQUIC(ctx, store, cfg, domain)
+			probeDomainQUIC(ctx, store, cfg, domain, ipsetTrigger)
 		}
 	}
 	return nil
 }
 
-// probeDomainQUIC runs a QUIC handshake probe and records the result. Unlike
-// probeDomain it does NOT touch domain state, hot_entries, or ipset trigger —
-// step 5's contract is "collect probe history", classification is step 6.
-func probeDomainQUIC(ctx context.Context, store *storage.Store, cfg Config, domain string) {
+// probeDomainQUIC runs a QUIC handshake probe, records the result, and
+// applies v1.0's multi-protocol PROMOTE rule when evidence warrants.
+//
+// Promote rule (close UDP blind spot):
+//
+//	QUIC fail + UDP observed + latest TCP+TLS probe was OK → HOT
+//
+// Intuition: browser clients fall back from QUIC to TCP silently, but
+// voice/game clients and native HTTP/3 paths don't — they just fail.
+// If TCP says "reachable" our current pipeline marks the domain `ignore`
+// and doesn't route it, which leaves those UDP-only workloads broken.
+// QUIC probe gives us the signal to route the domain anyway.
+//
+// We do NOT demote in this step (HOT → ignore). Demote is higher-risk —
+// yanking a routing entry can break a working client. Only PROMOTE here.
+// Demote semantics land in a later step once observed_flows data tells us
+// which domains actually warrant it.
+func probeDomainQUIC(ctx context.Context, store *storage.Store, cfg Config, domain string, ipsetTrigger chan<- struct{}) {
 	if err := prober.Validate(domain); err != nil {
 		return
 	}
@@ -456,6 +470,61 @@ func probeDomainQUIC(ctx context.Context, store *storage.Store, cfg Config, doma
 		Proto:  "quic",
 	})
 	persistProbe(ctx, store, res)
+
+	// QUIC succeeded or short-circuited before dial (no signal) — nothing
+	// to promote on. The ignore path stays ignore.
+	if res.TCPOK && res.TLSOK {
+		return
+	}
+	if res.FailureReason == "" {
+		return
+	}
+
+	// Is the latest TCP+TLS verdict "ok"? If it failed already, the TCP
+	// pipeline has (or will) mark HOT on its own cooldown — QUIC adds
+	// nothing. Only the "TCP says OK, QUIC says fail" split needs action.
+	tcpOK, tcpExists, err := store.LatestProbeOK(ctx, domain, "tcp+tls")
+	if err != nil {
+		log.Printf("quic classify: latest tcp probe %q: %v", domain, err)
+		return
+	}
+	if !tcpExists || !tcpOK {
+		return
+	}
+
+	// UDP evidence gate: if no LAN client actually uses UDP to this
+	// destination, the QUIC-only block is noise. We only care when the
+	// signal maps to real user pain.
+	udpWindow := time.Now().UTC().Add(-cfg.HotTTL)
+	hasUDP, err := store.DomainHasUDPFlows(ctx, domain, udpWindow)
+	if err != nil {
+		log.Printf("quic classify: udp flows %q: %v", domain, err)
+		return
+	}
+	if !hasUDP {
+		return
+	}
+
+	// All three conditions met: UDP client present + QUIC blocked + TCP
+	// fine. Promote the domain to HOT so routing covers its IPs for all
+	// protocols (mangle MARK matches any proto — UDP gets tunneled too).
+	reason := "tcp+tls:ok|quic:" + res.FailureReason + " (udp-observed)"
+	cooldown := time.Now().UTC().Add(cfg.ProbeCooldown)
+	if err := store.SetDomainState(ctx, domain, "hot", cooldown); err != nil {
+		log.Printf("quic classify: set hot %q: %v", domain, err)
+		return
+	}
+	if err := store.UpsertHotEntry(ctx, domain, reason,
+		time.Now().UTC().Add(cfg.HotTTL)); err != nil {
+		log.Printf("quic classify: upsert hot entry %q: %v", domain, err)
+	}
+	log.Printf("quic classify: promoted %s → hot (%s)", domain, reason)
+	// Nudge the ipset syncer so the promotion takes effect promptly rather
+	// than waiting for the periodic safety sweep.
+	select {
+	case ipsetTrigger <- struct{}{}:
+	default:
+	}
 }
 
 // probeDomain runs one full probe→decision→persist cycle for a single domain.
