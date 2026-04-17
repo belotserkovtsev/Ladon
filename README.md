@@ -195,7 +195,7 @@ scorer:
   fail_threshold: 50
 
 ipset:
-  name: ladon_engine        # probe-driven hot/cache
+  engine_name: ladon_engine # probe-driven hot/cache
   manual_name: ladon_manual # populates dnsmasq'ом для manual-allow + extensions
   interval: 30s
 

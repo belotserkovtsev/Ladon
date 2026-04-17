@@ -86,7 +86,7 @@ type ScorerSection struct {
 
 // IpsetSection mirrors the ipset knobs.
 type IpsetSection struct {
-	Name       string        `yaml:"name"`        // engine-managed (default ladon_engine)
+	EngineName string        `yaml:"engine_name"` // engine-managed (default ladon_engine)
 	ManualName string        `yaml:"manual_name"` // dnsmasq-managed (default ladon_manual; "" disables)
 	Interval   time.Duration `yaml:"interval"`
 }

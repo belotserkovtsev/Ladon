@@ -378,8 +378,8 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 	if f.Scorer.FailThreshold > 0 {
 		cfg.Scorer.FailThreshold = f.Scorer.FailThreshold
 	}
-	if f.Ipset.Name != "" {
-		cfg.IpsetName = f.Ipset.Name
+	if f.Ipset.EngineName != "" {
+		cfg.IpsetName = f.Ipset.EngineName
 	}
 	if f.Ipset.ManualName != "" {
 		cfg.ManualIpsetName = f.Ipset.ManualName

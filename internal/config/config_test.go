@@ -109,7 +109,7 @@ scorer:
   fail_threshold: 100
 
 ipset:
-  name: prod
+  engine_name: prod
   interval: 1m
 
 hot_ttl: 48h
