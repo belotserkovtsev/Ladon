@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS domains (
 CREATE TABLE IF NOT EXISTS probes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     domain TEXT NOT NULL,
+    proto TEXT NOT NULL DEFAULT 'tcp+tls',
     dns_ok INTEGER,
     tcp_ok INTEGER,
     tls_ok INTEGER,
@@ -23,6 +24,7 @@ CREATE TABLE IF NOT EXISTS probes (
     latency_ms INTEGER,
     created_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_probes_domain_proto ON probes(domain, proto);
 
 CREATE TABLE IF NOT EXISTS hot_entries (
     domain TEXT PRIMARY KEY,
@@ -61,3 +63,19 @@ CREATE TABLE IF NOT EXISTS dns_cache (
 );
 CREATE INDEX IF NOT EXISTS idx_dns_cache_domain ON dns_cache(domain);
 CREATE INDEX IF NOT EXISTS idx_dns_cache_last_seen ON dns_cache(last_seen_at);
+
+-- Passive observation of actual LAN-client flows from nf_conntrack events.
+-- Populated by the Observer when enabled. Unlike dns_cache (which records
+-- resolve-side evidence), this records connect-side evidence — which IP /
+-- protocol / port clients actually reach. Correlation with domain happens
+-- via JOIN on dns_cache.ip. Append-only with retention pruning.
+CREATE TABLE IF NOT EXISTS observed_flows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dst_ip TEXT NOT NULL,
+    proto TEXT NOT NULL,       -- 'tcp' | 'udp'
+    dst_port INTEGER NOT NULL,
+    src_client TEXT NOT NULL,  -- LAN client IP that initiated the flow
+    observed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_flows_dst ON observed_flows(dst_ip);
+CREATE INDEX IF NOT EXISTS idx_flows_observed_at ON observed_flows(observed_at);

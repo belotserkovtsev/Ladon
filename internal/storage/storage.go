@@ -26,11 +26,48 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) Init(ctx context.Context) error {
+	// Pre-schemaSQL migrations handle pre-v1.0 databases where tables exist
+	// but are missing newly-introduced columns. Schema.sql's CREATE TABLE
+	// IF NOT EXISTS is idempotent for table creation but does NOT add
+	// columns to pre-existing tables — and some schema.sql statements
+	// (indexes on new columns) would fail before migration runs.
+	if err := s.migrateProbesProtoColumn(ctx); err != nil {
+		return err
+	}
 	if _, err := s.db.ExecContext(ctx, schemaSQL); err != nil {
 		return err
 	}
 	// Backfill etld_plus_one for any rows that pre-date the column population.
 	_, err := s.BackfillETLDPlusOne(ctx)
+	return err
+}
+
+// migrateProbesProtoColumn adds the `proto` column to `probes` for databases
+// initialized before v1.0's multi-protocol pipeline. Existing rows are
+// backfilled with 'tcp+tls' — the only protocol ladon probed pre-v1.0.
+// On a fresh install `probes` doesn't exist yet; we skip and let schema.sql
+// create it with the column already in place.
+func (s *Store) migrateProbesProtoColumn(ctx context.Context) error {
+	var tableExists int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='probes'`).
+		Scan(&tableExists); err != nil {
+		return err
+	}
+	if tableExists == 0 {
+		return nil
+	}
+	var columnExists int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pragma_table_info('probes') WHERE name = 'proto'`).
+		Scan(&columnExists); err != nil {
+		return err
+	}
+	if columnExists > 0 {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx,
+		`ALTER TABLE probes ADD COLUMN proto TEXT NOT NULL DEFAULT 'tcp+tls'`)
 	return err
 }
 
