@@ -15,6 +15,7 @@ extensions:
 |---|---|
 | `ai` | OpenAI / ChatGPT, Anthropic / Claude |
 | `twitch` | Стриминг (twitch.tv + CDN-домены) |
+| `tiktok` | TikTok / ByteDance (основные домены, CDN, backbone) |
 
 ## Семантика
 
