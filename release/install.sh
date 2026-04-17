@@ -191,9 +191,13 @@ WireGuard split-tunnel setup looks like (adjust subnet/fwmark/iface):
 
 Next steps:
   1. Wire the iptables / ip rule above (or whatever your routing setup needs).
-  2. Add domains to $LADON_CONFIG_DIR/manual-allow.txt and restart ladon.
-  3. Or enable bundled extensions in $LADON_CONFIG_DIR/config.yaml:
-       extensions: [ai, twitch]
+  2. Add domains to $LADON_CONFIG_DIR/manual-allow.txt or
+     $LADON_CONFIG_DIR/manual-deny.txt and restart ladon.
+  3. Or enable bundled allow presets in $LADON_CONFIG_DIR/config.yaml:
+       allow_extensions: [ai, twitch, tiktok]
+     No deny presets ship — edit $LADON_CONFIG_DIR/manual-deny.txt or
+     write a custom one and reference it in deny_extensions: [...].
+     Full catalogue + semantics: $LADON_PREFIX/extensions/README.md.
   4. (Optional) For exit-compare validator, set probe.mode: exit-compare
      in config.yaml. See $LADON_PREFIX/README.md.
 

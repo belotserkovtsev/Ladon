@@ -1,59 +1,119 @@
-# Extensions — преднастроенные allow-списки
+# Extensions — преднастроенные allow/deny-списки
 
-Готовые подборки доменов для типовых сервисов, которые часто хочется
-завернуть в туннель целиком. Включаются опционально через `config.yaml`:
+Готовые подборки доменов для типовых сервисов. Два типа:
+
+- **Allow-extensions** — домены, которые всегда идут через туннель
+  (параллельно `manual-allow.txt`). Bundled пресеты — см. таблицу ниже.
+- **Deny-extensions** — домены, которые всегда остаются direct и никогда
+  не пробуются (параллельно `manual-deny.txt`). Bundled deny-пресетов
+  ladon **не шипает** — deny-списки сильно зависят от среды оператора
+  (РФ-услуги, LAN, internal corp). Оператор ведёт свой
+  `manual-deny.txt` или пишет собственный deny-preset.
+
+Оба типа включаются опционально через `config.yaml`:
 
 ```yaml
-extensions:
-  - ai
-  - twitch
+allow_extensions: [ai, twitch, tiktok]
+# deny_extensions: [my-corp-internal]   # кастомные пресеты оператора
 ```
 
-Доступные пресеты сейчас:
+## Bundled пресеты
 
-| Имя | Что покрывает |
-|---|---|
-| `ai` | OpenAI / ChatGPT, Anthropic / Claude |
-| `twitch` | Стриминг (twitch.tv + CDN-домены) |
-| `tiktok` | TikTok / ByteDance (основные домены, CDN, backbone) |
+| Имя | Тип | Что покрывает |
+|---|---|---|
+| `ai` | allow | OpenAI / ChatGPT, Anthropic / Claude |
+| `twitch` | allow | Стриминг (twitch.tv + CDN-домены) |
+| `tiktok` | allow | TikTok / ByteDance overseas (core, regional CDN, backbone, SDK) |
 
 ## Семантика
 
-При старте ladon для каждого включённого имени читает
-`<extensions_path>/<name>.txt` и грузит домены в `manual_entries` с
-`list_name='allow'` — то есть точно так же, как обычный `manual-allow.txt`.
+**Allow-extensions** при старте ladon для каждого включённого имени читает
+`<extensions_path>/<name>.txt` и добавляет домены в manual-allow через
+dnsmasq's native `ipset=` directive. Эффект:
 
-Эффект:
+- Домен всегда в ipset `ladon_manual` (минуя probe).
+- IP-адреса добавляются, как только клиент их разрешит через dnsmasq —
+  proactive resolve не делаем.
+- Probe-пайплайн не может выкинуть extension-домен из ipset: ladon не
+  трогает `ladon_manual`.
 
-- Домен всегда в ipset `prod` (минуя probe).
-- IP-адреса добавляются в ipset, как только клиент их разрешит через dnsmasq —
-  proactive resolve мы не делаем.
-- Probe-пайплайн (даже с exit-compare) **не может выкинуть** extension-домен
-  из ipset: ipset-syncer всегда включает manual-allow в union.
+**Deny-extensions** при старте читают `<extensions_path>/<name>.txt` и
+грузят домены в `manual_entries` с `list_name='deny'`:
+
+- tailer пропускает их (skip-at-ingest), в `domains` table не попадают.
+- probe-worker исключает их из `ListProbeCandidates`.
+- `ladon prune` вычищает любые ранее накопленные denied rows через
+  `DeleteDeniedDomains`.
+- Фильтр срабатывает по точному домену ИЛИ по eTLD+1: `mail.ru` в списке
+  закроет `privacy-cs.mail.ru` без явной записи.
+
+### Что значит eTLD+1 раскрытие для allow
+
+Allow-extensions тоже разворачиваются по eTLD+1 — `openai.com` в файле
+превращается в `ipset=/openai.com/ladon_manual`, что у dnsmasq покрывает
+все поддомены сразу (`api.openai.com`, `cdn.openai.com` и т.д.). Поэтому
+в пресете достаточно перечислить регистрируемые домены — не надо
+руками раскатывать `*.cdn.service.com`.
 
 ## Где живут файлы
 
-После install из tarball: `/opt/ladon/extensions/`. Можно переопределить
-через config:
+После install из tarball: `/opt/ladon/extensions/`. Общий пул для allow и
+deny — один и тот же файл может быть включён только с одной стороны
+(config.Validate отвергает пересечение имён). Переопределяется через:
 
 ```yaml
-extensions: [ai, twitch]
 extensions_path: /etc/ladon/extensions
 ```
 
+## Конфликт имён
+
+Пресет, указанный одновременно в `allow_extensions` и `deny_extensions`,
+ladon отклонит при старте: домен, который и в allow, и в deny, — признак
+операторской ошибки, а не полезный паттерн.
+
+## Как включить и проверить
+
+1. Отредактируйте `/etc/ladon/config.yaml`, добавьте имя пресета в
+   нужный список.
+2. Перезапустите ladon: `systemctl restart ladon`. Ladon перепишет
+   `/etc/dnsmasq.d/ladon-manual.conf` и сам рестартанёт dnsmasq —
+   руками трогать не надо.
+3. Убедитесь в журнале:
+
+   ```
+   journalctl -u ladon -n 20 | grep extension
+   # ожидается:
+   #   allow extension ai: 8 domains from /opt/ladon/extensions/ai.txt
+   #   deny extension my-corp: 3 domains from /opt/ladon/extensions/my-corp.txt
+   ```
+
+4. Для allow — проверьте, что ipset наполнился после резолва:
+
+   ```
+   nslookup <домен-из-пресета> <ladon-host>
+   ipset list ladon_manual | grep -c -vE 'timeout|Name|Type|Revision|Header|Size|References|Number|Members'
+   ```
+
 ## Свои списки
 
-Никто не мешает положить в `extensions_path/<свое-имя>.txt` собственный
-файл с тем же форматом (один домен на строку, `#` — комменты) и включить
-его в config так же, как пресеты:
+Положите `<extensions_path>/<свое-имя>.txt` с тем же форматом (один домен
+на строку, `#` — комменты) и включите в config:
 
 ```yaml
-extensions: [ai, twitch, my-vpn-only]
+allow_extensions: [ai, twitch, my-vpn-only]
+deny_extensions:  [corp-internal]
 ```
 
-Альтернатива — обычный `/etc/ladon/manual-allow.txt`, формат тот же.
-Разница только организационная: extensions удобно держать как
-тематические подборки.
+Альтернатива — обычные `/etc/ladon/manual-allow.txt` и
+`/etc/ladon/manual-deny.txt`. Формат тот же. Разница только
+организационная: extensions удобно держать тематическими подборками,
+которые легко включать/выключать одной строкой в config.
+
+> **Переживёт ли кастомный пресет upgrade?** install.sh перезаписывает
+> `/opt/ladon/extensions/*.txt` из tarball'а при каждом запуске. Если вы
+> хотите сохранить кастомный файл между апгрейдами — держите его в
+> отдельном каталоге и укажите `extensions_path:` на него, или
+> отправьте PR чтобы заапстримить пресет в репозиторий.
 
 ## Формат файла
 
@@ -67,4 +127,4 @@ sub.example.com
 ```
 
 Один домен на строку. Без `https://`, без портов, без слэшей.
-Регистронезависимо.
+Регистронезависимо. Точка в конце (`example.com.`) отрезается.

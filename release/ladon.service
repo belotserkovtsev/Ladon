@@ -23,7 +23,8 @@ NoNewPrivileges=true
 ProtectSystem=full
 PrivateTmp=true
 # ladon writes /etc/dnsmasq.d/ladon-manual.conf at startup with ipset=
-# directives for manual-allow + extensions, then SIGHUPs dnsmasq.
+# directives for manual-allow + extensions, then restarts dnsmasq so the
+# new directives take effect.
 ReadWritePaths=/etc/dnsmasq.d
 
 [Install]

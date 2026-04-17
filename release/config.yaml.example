@@ -14,10 +14,13 @@
 
 # --- probe backend ---
 
-# Extensions — преднастроенные allow-списки. См. /opt/ladon/extensions/README.md
-# extensions:
+# Extensions — преднастроенные allow/deny-списки. См. /opt/ladon/extensions/README.md
+# allow_extensions:
 #   - ai
 #   - twitch
+#   - tiktok
+# deny_extensions:                         # bundled deny-пресетов не шипается
+#   - my-corp-internal                     # свои — положить в extensions_path и включить здесь
 # extensions_path: /opt/ladon/extensions   # default
 
 probe:
@@ -49,7 +52,7 @@ scorer:
 # --- routing ---
 
 ipset:
-  name: ladon_engine        # ipset для probe-driven hot/cache
+  engine_name: ladon_engine # ipset для probe-driven hot/cache
   manual_name: ladon_manual # ipset для manual-allow + extensions (populates dnsmasq'ом)
   interval: 30s             # safety-reconcile; горячие события триггерят немедленный sync
 

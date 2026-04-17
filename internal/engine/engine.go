@@ -26,6 +26,30 @@ import (
 	"github.com/belotserkovtsev/ladon/internal/watcher"
 )
 
+// loadDenyExtensions walks cfg.DenyExtensions, reads each preset from
+// ExtensionsPath/<name>.txt, and upserts its domains into manual_entries
+// with list_name='deny'. Missing files log a warning and skip — same
+// forgiving behavior as allow-extensions.
+//
+// Unlike allow-extensions (which are delegated to dnsmasq via ipset=),
+// deny-extensions go through the DB because the engine's ingest-time
+// skip and probe-worker filter both query manual_entries directly.
+func loadDenyExtensions(ctx context.Context, store *storage.Store, cfg Config) {
+	for _, name := range cfg.DenyExtensions {
+		path := filepath.Join(cfg.ExtensionsPath, name+".txt")
+		if _, err := os.Stat(path); err != nil {
+			log.Printf("deny extension %q: file not found at %s — check extensions_path", name, path)
+			continue
+		}
+		n, err := manual.Load(ctx, store, path, "deny")
+		if err != nil {
+			log.Printf("deny extension %q load: %v", name, err)
+			continue
+		}
+		log.Printf("deny extension %s: %d domains from %s", name, n, path)
+	}
+}
+
 // collectManualDomains reads the operator's manual-allow file plus every
 // enabled extension, returns a single deduplicated domain list. dnsmasq
 // then turns each into an `ipset=/domain/<set>` directive.
@@ -49,18 +73,18 @@ func collectManualDomains(cfg Config) ([]string, error) {
 		}
 		add(ds)
 	}
-	for _, name := range cfg.Extensions {
+	for _, name := range cfg.AllowExtensions {
 		path := filepath.Join(cfg.ExtensionsPath, name+".txt")
 		if _, err := os.Stat(path); err != nil {
-			log.Printf("extension %q: file not found at %s — check extensions_path", name, path)
+			log.Printf("allow extension %q: file not found at %s — check extensions_path", name, path)
 			continue
 		}
 		ds, err := manual.ReadDomains(path)
 		if err != nil {
-			log.Printf("extension %q read: %v", name, err)
+			log.Printf("allow extension %q read: %v", name, err)
 			continue
 		}
-		log.Printf("extension %s: %d domains from %s", name, len(ds), path)
+		log.Printf("allow extension %s: %d domains from %s", name, len(ds), path)
 		add(ds)
 	}
 	return out, nil
@@ -88,12 +112,18 @@ type Config struct {
 	ManualDenyPath         string        // optional path to manual deny list file
 	IgnorePeer             string        // peer IP to skip (gateway self, etc.)
 
-	// Extensions are bundled allow-list presets (e.g. "ai", "twitch") that
-	// ship with ladon and are opt-in by name. Each name resolves to
+	// AllowExtensions are bundled allow-list presets (e.g. "ai", "twitch")
+	// that ship with ladon and are opt-in by name. Each name resolves to
 	// ExtensionsPath/<name>.txt, which is loaded with the same parser as
 	// ManualAllowPath. See release/extensions/ for the shipped presets.
-	Extensions     []string
-	ExtensionsPath string // default "extensions" (relative to WorkingDirectory)
+	AllowExtensions []string
+	ExtensionsPath  string // default "extensions" (relative to WorkingDirectory)
+
+	// DenyExtensions are bundled deny-list presets loaded from the same
+	// ExtensionsPath pool. Each name resolves to ExtensionsPath/<name>.txt
+	// and is upserted into manual_entries with list_name='deny' — same tier
+	// as ManualDenyPath, so tailer skip and probe-worker filter both honor it.
+	DenyExtensions []string
 
 	// LocalProber is the always-on baseline. Used by the inline fast-path from
 	// the tailer (where remote round-trips would blow the sub-second latency
@@ -151,6 +181,7 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	} else if n > 0 {
 		log.Printf("manual deny: loaded %d entries from %s", n, cfg.ManualDenyPath)
 	}
+	loadDenyExtensions(ctx, store, cfg)
 
 	// Manual-allow + extensions are delegated to dnsmasq's native ipset=
 	// directive. Reasons for the architectural split:
@@ -170,8 +201,8 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 			log.Printf("dnsmasq config write: %v", err)
 		} else {
 			log.Printf("manual: wrote %d domains → %s (ipset=%s)", len(manualDomains), dnsmasqcfg.Path, cfg.ManualIpsetName)
-			if err := dnsmasqcfg.Reload(ctx); err != nil {
-				log.Printf("dnsmasq reload: %v — manual list will activate on next dnsmasq restart", err)
+			if err := dnsmasqcfg.Restart(ctx); err != nil {
+				log.Printf("dnsmasq restart: %v — manual list will activate on next dnsmasq restart", err)
 			}
 		}
 	}

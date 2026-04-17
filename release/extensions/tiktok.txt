@@ -3,31 +3,55 @@
 # Подключается через config.yaml:
 #   extensions: [tiktok]
 #
-# Покрывает TikTok web + mobile, CDN-домены (tiktokcdn.*), ByteDance
-# инфраструктуру (byted*/bytedance) и legacy musical.ly. Полезно если
-# провайдер роняет конкретные edge-IP или при geo-ограничениях сервиса.
+# eTLD+1 домены TikTok и ByteDance-инфраструктуры (overseas edition).
+# Все поддомены покрываются автоматически — ladon раскрывает manual-allow
+# по eTLD+1 в dnsmasq ipset= директивах.
+#
+# Scope: только TikTok. Toutiao (новости) и defunct-продукты (musical.ly,
+# Hypstar, Vigo) намеренно не включены — живую инфраструктуру TikTok они
+# не затрагивают. Для полной картины ByteDance-сервисов добавьте свои
+# домены в manual-allow.txt или заведите отдельный preset.
 
-# Основные домены
+# TikTok core
 tiktok.com
 tiktokv.com
-tiktok.net
-v.tiktok.com
-tiktokv.us
-tiktokw.us
 
-# CDN
+# TikTok CDN (regional)
 tiktokcdn.com
-tiktokcdn-us.com
 tiktokcdn-eu.com
-tiktokcdn.liveplay.myqcloud.com
-p16-tiktokcdn-com.akamaized.net
+tiktokcdn-us.com
+tiktokcdn-in.com
 
-# Legacy
-musical.ly
-muscdn.com
+# TikTok Live CDN
+tlivecdn.com
+ttlivecdn.com
 
-# ByteDance backbone
-bytecdn.cn
+# TikTok overseas infrastructure
+ttoversea.net
+ttoverseaus.net
+tiktokd.org
+worldfcdn.com
+worldfcdn2.com
+bytefcdn-oversea.com
+bytefcdn-ttpeu.com
+
+# ByteDance backbone (TikTok-адресуемая часть)
+bytedance.com
+bytedance.net
 byteoversea.com
-byted.org
+byteoversea.net
+bytecdn.cn
+byteicdn.com
+bytetcdn.com
+byteimg.com
+ibyteimg.com
 ibytedtos.com
+bytedns.net
+
+# Телеметрия / SDK / статика (snssdk = Douyin SDK shared, pstatp = static)
+snssdk.com
+isnssdk.com
+sgsnssdk.com
+pstatp.com
+ipstatp.com
+sgpstatp.com
