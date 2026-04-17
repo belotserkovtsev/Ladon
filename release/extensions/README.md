@@ -3,25 +3,27 @@
 Готовые подборки доменов для типовых сервисов. Два типа:
 
 - **Allow-extensions** — домены, которые всегда идут через туннель
-  (параллельно `manual-allow.txt`).
+  (параллельно `manual-allow.txt`). Bundled пресеты — см. таблицу ниже.
 - **Deny-extensions** — домены, которые всегда остаются direct и никогда
-  не пробуются (параллельно `manual-deny.txt`).
+  не пробуются (параллельно `manual-deny.txt`). Bundled deny-пресетов
+  ladon **не шипает** — deny-списки сильно зависят от среды оператора
+  (РФ-услуги, LAN, internal corp). Оператор ведёт свой
+  `manual-deny.txt` или пишет собственный deny-preset.
 
-Оба включаются опционально через `config.yaml`:
+Оба типа включаются опционально через `config.yaml`:
 
 ```yaml
 allow_extensions: [ai, twitch, tiktok]
-deny_extensions:  [ru]
+# deny_extensions: [my-corp-internal]   # кастомные пресеты оператора
 ```
 
-## Пресеты
+## Bundled пресеты
 
 | Имя | Тип | Что покрывает |
 |---|---|---|
 | `ai` | allow | OpenAI / ChatGPT, Anthropic / Claude |
 | `twitch` | allow | Стриминг (twitch.tv + CDN-домены) |
 | `tiktok` | allow | TikTok / ByteDance overseas (core, regional CDN, backbone, SDK) |
-| `ru` | deny | RU-порталы и госсервисы, которым оффшорный VPN не нужен / вреден |
 
 ## Семантика
 
@@ -82,7 +84,7 @@ ladon отклонит при старте: домен, который и в all
    journalctl -u ladon -n 20 | grep extension
    # ожидается:
    #   allow extension ai: 8 domains from /opt/ladon/extensions/ai.txt
-   #   deny extension ru: 4 domains from /opt/ladon/extensions/ru.txt
+   #   deny extension my-corp: 3 domains from /opt/ladon/extensions/my-corp.txt
    ```
 
 4. Для allow — проверьте, что ipset наполнился после резолва:
@@ -99,7 +101,7 @@ ladon отклонит при старте: домен, который и в all
 
 ```yaml
 allow_extensions: [ai, twitch, my-vpn-only]
-deny_extensions:  [corp-internal, ru]
+deny_extensions:  [corp-internal]
 ```
 
 Альтернатива — обычные `/etc/ladon/manual-allow.txt` и

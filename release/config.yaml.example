@@ -19,8 +19,8 @@
 #   - ai
 #   - twitch
 #   - tiktok
-# deny_extensions:
-#   - ru
+# deny_extensions:                         # bundled deny-пресетов не шипается
+#   - my-corp-internal                     # свои — положить в extensions_path и включить здесь
 # extensions_path: /opt/ladon/extensions   # default
 
 probe:
