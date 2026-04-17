@@ -39,8 +39,6 @@ curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/ins
   | sudo bash
 ```
 
-**Routing — твоя зона ответственности.** Ладон только наполняет ipset'ы. iptables / ip rule / fwmark routing зависят от твоей WG-топологии
-
 ---
 
 ## ⚡ Производительность
@@ -54,7 +52,7 @@ curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/ins
 | Накладные расходы пайплайна | **~50 мс** сверх сети |
 | RSS | **~20 МБ** |
 
-Воспроизвести числа: `go test -run TestPipeline ./internal/engine/` — тест бьёт в [TEST-NET-1](https://datatracker.ietf.org/doc/html/rfc5737) (`192.0.2.1`), пакеты туда дропаются на апстрим-роутерах = реалистичный «тихий drop» без сети. Разброс 0.3-1.1 с: нижняя граница — мгновенный TCP RST от DPI, верхняя — silent drop с ожиданием полного 800 мс таймаута.
+Воспроизвести числа: `go test -run TestPipeline ./internal/engine/`
 
 ---
 
@@ -215,7 +213,7 @@ ladon -db <path> [-config <path>] run [-from-start] [-manual-allow <path>] [-man
 
 ### Extensions — преднастроенные allow/deny-списки
 
-С релизом ладона шипаются тематические подборки доменов двух видов:
+С релизом Ladon поставляются подборки доменов двух видов:
 
 - **Allow** — для сервисов, которые **гео-блокируют российский регион со своей стороны** (probe их распознать не может — TLS handshake проходит, но сервис в ответ говорит «not available in your country»).
 - **Deny** — для сервисов, которые НИКОГДА не должны идти через туннель: внутренние LAN, гео-fenced рос-сервисы (Госуслуги, банки) ломающиеся через иностранный exit, шумный мониторинг.
@@ -231,12 +229,6 @@ deny_extensions:
   - ru
 # extensions_path: /opt/ladon/extensions   # default
 ```
-
-**Allow-семантика.** Домены **всегда** идут через туннель, минуя probe-пайплайн. Реализовано через делегирование dnsmasq: при старте ладон пишет `/etc/dnsmasq.d/ladon-manual.conf` со строками `ipset=/openai.com/ladon_manual`, `ipset=/twitch.tv/ladon_manual` и т.д., потом `systemctl reload dnsmasq`. Дальше **dnsmasq сам** при резолве каждого домена walks CNAME-цепочку и кладёт все финальные A-записи в kernel ipset `ladon_manual` — **до того как ответ DNS уйдёт клиенту**. Первый-же TCP SYN клиента уже находит свой destination в kernel set'е → tunnel.
-
-Достаточно указать корневой домен — dnsmasq матчит по суффиксу. `openai.com` покрывает `cdn.openai.com` (Azure-CDN), `chat.openai.com` (CloudFlare), `developers.openai.com` (Vercel) и любые другие поддомены без необходимости их перечислять. CNAME-цепочки уходят в правильный ipset нативно, без нашей ladon-side логики.
-
-**Deny-семантика.** Домены грузятся в `manual_entries` с `list_name='deny'`. Tailer пропускает их (skip-at-ingest, не попадают в `domains`), probe-worker фильтрует через `ListProbeCandidates`, `ladon prune` вычищает уже накопленные denied rows. Фильтр срабатывает по точному совпадению или eTLD+1: `mail.ru` в списке закроет `privacy-cs.mail.ru` автоматически.
 
 Доступные пресеты:
 
@@ -281,8 +273,6 @@ ladon -db /opt/ladon/state/engine.db prune -cache -hot -probes -before 2026-04-1
 
 После `prune` движок автоматически сбрасывает `state` в `new` для доменов, у которых не осталось ни hot, ни cache записи — на следующем DNS-запросе домен пройдёт пайплайн заново.
 
-**Почему нет авто-prune при upgrade:** cache-записи зарабатываются дорого (≥50 fails / 24ч), и тихая чистка при каждом релизе создавала бы UX-провалы. Делать prune — осознанное решение оператора.
-
 ### Exit-compare через внешний пробинг-сервер
 
 Локальная проба видит мир глазами шлюза. Это хорошо ловит DPI-блоки, которые цепляются ровно к тому пути, по которому идёт клиент. Но даёт ложные срабатывания, когда сам домен не отвечает на :443 — `imap.gmail.com` живёт на :993, `bgp.he.net` на 8080, и т.д. Локальный probe в таких случаях видит «TCP fail» и тащит домен в hot, хотя блока нет.
@@ -307,10 +297,6 @@ probe:
 | FAIL | OK | **Hot** — настоящий DPI-блок, снаружи домен живой |
 | FAIL | FAIL | **Ignore** — methodological FP (порт не тот / мёртвый сервер / domain не отвечает ниоткуда) |
 | FAIL | unavailable | **Hot** — твой proб-сервер недоступен (timeout / non-200 / network) → не overrule'им, остаёмся с локальным вердиктом. Reason помечен `remote:unavailable:...` |
-
-Последняя строка важна: outage твоего proб-сервера **не должен** тихо снимать ipset с реально-заблокированных доменов. Поэтому транспортная ошибка интерпретируется как «нет мнения», а не как «remote сказал FAIL».
-
-Inline fast-path всегда использует только локальную пробу — гонять remote round-trip на каждом первом запросе клиента сломало бы 0.5-секундный бюджет. Если inline ошибся — batch-перепроба с exit-compare его поправит и удалит запись из ipset.
 
 HTTP-контракт описан в [`docs/probe-api.md`](docs/probe-api.md), референсная имплементация на Go — в [`examples/probe-server/`](examples/probe-server/).
 
