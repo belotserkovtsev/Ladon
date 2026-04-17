@@ -381,8 +381,14 @@ func (s *Store) LookupIPsByETLD(ctx context.Context, etldPlusOne string, freshSi
 }
 
 // ListProbeCandidates returns domains that are ready for a probe — eligible
-// states, cooldown expired (or null). Ordered by oldest cooldown first, then
-// most-recent observations first.
+// states, cooldown expired (or null), and not matched by the manual deny list.
+// The deny filter mirrors IsInDenyList semantics (exact domain OR eTLD+1 in
+// manual_entries with list_name='deny'). Without this filter, a denied domain
+// that already lives in the domains table (ingested before the deny entry was
+// added, or flipped to 'new' by ResetOrphanedDomains after a prune) would be
+// probed by the batch worker and re-populate hot_entries — bypassing the
+// tailer-level deny check at engine.go:253.
+// Ordered by oldest cooldown first, then most-recent observations first.
 func (s *Store) ListProbeCandidates(ctx context.Context, limit int, now time.Time) ([]Domain, error) {
 	ts := formatTime(now)
 	rows, err := s.db.QueryContext(ctx, `
@@ -392,6 +398,9 @@ func (s *Store) ListProbeCandidates(ctx context.Context, limit int, now time.Tim
 		FROM domains
 		WHERE state IN ('new', 'watch', 'hot')
 		  AND (cooldown_until IS NULL OR cooldown_until <= ?)
+		  AND domain NOT IN (SELECT domain FROM manual_entries WHERE list_name = 'deny')
+		  AND (etld_plus_one IS NULL OR etld_plus_one = ''
+		       OR etld_plus_one NOT IN (SELECT domain FROM manual_entries WHERE list_name = 'deny'))
 		ORDER BY COALESCE(cooldown_until, first_seen_at) ASC, last_seen_at DESC
 		LIMIT ?
 	`, ts, limit)
@@ -501,6 +510,26 @@ func (s *Store) PruneHot(ctx context.Context, before time.Time) (int64, error) {
 // PruneProbes deletes probes rows. See PruneCache for semantics.
 func (s *Store) PruneProbes(ctx context.Context, before time.Time) (int64, error) {
 	return deleteWithOptionalBefore(ctx, s.db, "probes", "created_at", before)
+}
+
+// DeleteDeniedDomains removes rows from the domains table whose domain or
+// eTLD+1 matches an entry in manual_entries with list_name='deny'. These
+// domains should never appear in any engine-tracked table — the tailer skips
+// their dnsmasq events at ingest via IsInDenyList, so any rows that predate
+// a deny-list addition are orphans that shouldn't linger. Called during the
+// prune subcommand so operators get a clean domains table alongside the
+// hot/cache/probes cleanup they already asked for. Returns rows deleted.
+func (s *Store) DeleteDeniedDomains(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `
+		DELETE FROM domains
+		WHERE domain IN (SELECT domain FROM manual_entries WHERE list_name = 'deny')
+		   OR (etld_plus_one IS NOT NULL AND etld_plus_one != ''
+		       AND etld_plus_one IN (SELECT domain FROM manual_entries WHERE list_name = 'deny'))
+	`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // ResetOrphanedDomains flips `state` back to 'new' and clears cooldown_until

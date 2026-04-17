@@ -282,6 +282,15 @@ func pruneCmd(ctx context.Context, store *storage.Store, rest []string) {
 		}
 		fmt.Printf("deleted %d row(s) from probes\n", n)
 	}
+	// Scrub domains rows whose exact domain or eTLD+1 matches a deny entry.
+	// These shouldn't be tracked at all (tailer skips future events for them
+	// via IsInDenyList), and leaving them in place would let the batch probe
+	// worker resurrect them after ResetOrphanedDomains flips them to 'new'.
+	if n, err := store.DeleteDeniedDomains(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "warn: delete denied domains: %v\n", err)
+	} else if n > 0 {
+		fmt.Printf("deleted %d denied domain row(s) from domains\n", n)
+	}
 	// After prune, domains stuck in hot/cache/ignore without a backing row are
 	// orphaned — flip them to 'new' so the engine re-probes from scratch on
 	// next traffic instead of leaving them in a stale terminal state.

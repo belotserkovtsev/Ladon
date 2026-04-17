@@ -163,3 +163,182 @@ func TestCountFailingProbes(t *testing.T) {
 		t.Fatalf("want 3 failing probes in last hour, got %d", n)
 	}
 }
+
+// ListProbeCandidates must exclude domains whose exact name or eTLD+1 matches
+// a manual deny entry. Without this filter the batch probe worker resurrects
+// denied domains into hot_entries after operators prune + ResetOrphanedDomains
+// flips their state to 'new' — bypassing the tailer-level deny check.
+func TestListProbeCandidatesExcludesDenied(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Seed domains table with several rows in probeable states.
+	for _, d := range []string{
+		"exact-deny.test",               // exact match with deny entry
+		"sub.whole-deny.test",           // matches deny via eTLD+1
+		"unrelated.test",                // should remain a candidate
+		"noise.allow-only.test",         // only on allow list
+	} {
+		if err := s.UpsertDomain(ctx, d, "", now); err != nil {
+			t.Fatalf("upsert %s: %v", d, err)
+		}
+	}
+
+	_ = s.UpsertManual(ctx, "exact-deny.test", "deny")
+	_ = s.UpsertManual(ctx, "whole-deny.test", "deny")
+	_ = s.UpsertManual(ctx, "noise.allow-only.test", "allow")
+
+	cands, err := s.ListProbeCandidates(ctx, 100, now)
+	if err != nil {
+		t.Fatalf("ListProbeCandidates: %v", err)
+	}
+
+	seen := map[string]bool{}
+	for _, c := range cands {
+		seen[c.Domain] = true
+	}
+
+	if seen["exact-deny.test"] {
+		t.Error("exact-deny.test must not be a candidate (exact deny match)")
+	}
+	if seen["sub.whole-deny.test"] {
+		t.Error("sub.whole-deny.test must not be a candidate (eTLD+1 deny match)")
+	}
+	if !seen["unrelated.test"] {
+		t.Error("unrelated.test should be a candidate (not on any list)")
+	}
+	if !seen["noise.allow-only.test"] {
+		t.Error("noise.allow-only.test should be a candidate (allow list doesn't block probing)")
+	}
+}
+
+// ListProbeCandidates must keep excluding a domain even when only its eTLD+1
+// is in the deny list — this is the operator's way of saying "whole family".
+func TestListProbeCandidatesETLDFamilyDeny(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	_ = s.UpsertDomain(ctx, "a.family.test", "", now)
+	_ = s.UpsertDomain(ctx, "b.family.test", "", now)
+	_ = s.UpsertDomain(ctx, "other.test", "", now)
+	_ = s.UpsertManual(ctx, "family.test", "deny")
+
+	cands, err := s.ListProbeCandidates(ctx, 100, now)
+	if err != nil {
+		t.Fatalf("ListProbeCandidates: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, c := range cands {
+		seen[c.Domain] = true
+	}
+	if seen["a.family.test"] || seen["b.family.test"] {
+		t.Errorf("family subdomains must be excluded when family.test is in deny, got %v", seen)
+	}
+	if !seen["other.test"] {
+		t.Errorf("other.test must remain a candidate")
+	}
+}
+
+// DeleteDeniedDomains removes any domains row whose exact name or eTLD+1 is in
+// the deny list. Covers the cleanup path invoked during `ladon prune`.
+func TestDeleteDeniedDomains(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	_ = s.UpsertDomain(ctx, "exact.deny", "", now)
+	_ = s.UpsertDomain(ctx, "sub.fam.deny", "", now) // etld+1 = fam.deny
+	_ = s.UpsertDomain(ctx, "keeper.test", "", now)
+
+	_ = s.UpsertManual(ctx, "exact.deny", "deny")
+	_ = s.UpsertManual(ctx, "fam.deny", "deny")
+	_ = s.UpsertManual(ctx, "keeper.test", "allow") // allow must not trigger deletion
+
+	n, err := s.DeleteDeniedDomains(ctx)
+	if err != nil {
+		t.Fatalf("DeleteDeniedDomains: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("deleted = %d, want 2 (exact.deny + sub.fam.deny)", n)
+	}
+
+	// Verify only keeper.test remains.
+	var surviving int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM domains`).Scan(&surviving); err != nil {
+		t.Fatal(err)
+	}
+	if surviving != 1 {
+		t.Errorf("surviving rows = %d, want 1 (keeper.test)", surviving)
+	}
+
+	// Idempotent: second call deletes nothing.
+	if n2, err := s.DeleteDeniedDomains(ctx); err != nil {
+		t.Fatal(err)
+	} else if n2 != 0 {
+		t.Errorf("second call deleted %d, want 0", n2)
+	}
+}
+
+// Regression test for the bug that motivated v0.4.1: operator adds a domain to
+// deny, runs prune, and expects no re-hydration. Before the fix,
+// ResetOrphanedDomains flipped denied rows to 'new' and ListProbeCandidates
+// returned them, so the batch probe worker would resurrect them on the next
+// tick.
+func TestPruneDoesNotResurrectDenied(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Seed: denied.test is in hot and cache (as if previously probed), plain.test
+	// is the control row that should behave as before.
+	_ = s.UpsertDomain(ctx, "denied.test", "", now)
+	_ = s.UpsertDomain(ctx, "plain.test", "", now)
+	_ = s.UpsertHotEntry(ctx, "denied.test", "old verdict", now.Add(24*time.Hour))
+	_ = s.PromoteCache(ctx, "denied.test", "repeated_fail", now)
+	_ = s.UpsertHotEntry(ctx, "plain.test", "old verdict", now.Add(24*time.Hour))
+
+	// Operator adds the deny entry after the fact.
+	_ = s.UpsertManual(ctx, "denied.test", "deny")
+
+	// Simulate `ladon prune -hot -cache`: clear hot/cache, scrub denied, reset orphans.
+	if _, err := s.PruneHot(ctx, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PruneCache(ctx, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.DeleteDeniedDomains(ctx); err != nil {
+		t.Fatal(err)
+	} else if n != 1 {
+		t.Errorf("expected 1 denied row deleted, got %d", n)
+	}
+	if _, err := s.ResetOrphanedDomains(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// denied.test must not be in the probe candidate list — row is gone AND
+	// filter catches it even if the row survives.
+	cands, err := s.ListProbeCandidates(ctx, 100, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range cands {
+		if c.Domain == "denied.test" {
+			t.Fatal("denied.test must not be a probe candidate after prune")
+		}
+	}
+	// plain.test should still be a candidate (it was reset to 'new' by ResetOrphanedDomains).
+	found := false
+	for _, c := range cands {
+		if c.Domain == "plain.test" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("plain.test should still be a candidate (reset to 'new' after prune)")
+	}
+}
