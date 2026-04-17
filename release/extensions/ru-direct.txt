@@ -1,0 +1,32 @@
+# ladon deny extension: RU-сервисы, которым туннель не нужен
+#
+# Подключается через config.yaml:
+#   deny_extensions: [ru-direct]
+#
+# Домены из этого списка engine пропускает в tailer (ingest-time skip),
+# probe-worker их не трогает, в hot/cache не попадают. Ровно как
+# /etc/ladon/manual-deny.txt — просто bundled preset с общей наводкой.
+#
+# eTLD+1 фильтрация применяется автоматически: запись `mail.ru` покрывает
+# privacy-cs.mail.ru / top-fwz1.mail.ru / clientapi.mail.ru и прочие
+# поддомены без их явного упоминания.
+#
+# Включайте если из РФ — большинство этих доменов либо хостятся внутри
+# (foreign VPN их не ускорит), либо имеют geo-политику на РФ, либо
+# вообще ломаются через offshore exit.
+
+# Госсервисы
+gosuslugi.ru
+
+# Крупные RU-порталы и их трекеры
+mail.ru
+vk.com
+vk-analytics.ru
+
+# Яндекс-инфраструктура (если что-то из сервисов нужно, раскомментировать
+# специфично — например, yandex.ru ломает geo-сервисы, but metrica нужна для
+# сайта)
+# yandex.ru
+# yandex.net
+# yandex.com
+# mc.yandex.ru

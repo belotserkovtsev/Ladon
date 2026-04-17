@@ -40,6 +40,13 @@ type File struct {
 	// parser as ManualAllow.
 	Extensions     []string `yaml:"extensions"`
 	ExtensionsPath string   `yaml:"extensions_path"`
+
+	// DenyExtensions are bundled deny-list presets. Shares ExtensionsPath
+	// with Extensions — the same file pool, just a different intent.
+	// Each preset resolves to <ExtensionsPath>/<name>.txt and is loaded
+	// with the same parser as ManualDeny (into manual_entries with
+	// list_name='deny').
+	DenyExtensions []string `yaml:"deny_extensions"`
 }
 
 // ProbeSection covers both the shared probe tuning and the backend selector.
@@ -116,6 +123,15 @@ func (f *File) Validate() error {
 	}
 	if f.Probe.Mode == "exit-compare" && f.Probe.Remote.URL == "" {
 		return prober.ErrEmptyURL
+	}
+	// A preset listed on both sides would load the same file into both
+	// manual_entries tiers — operator confusion, not a useful intent.
+	for _, a := range f.Extensions {
+		for _, d := range f.DenyExtensions {
+			if a == d {
+				return fmt.Errorf("extension %q listed in both extensions and deny_extensions", a)
+			}
+		}
 	}
 	return nil
 }

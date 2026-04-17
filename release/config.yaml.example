@@ -14,10 +14,13 @@
 
 # --- probe backend ---
 
-# Extensions — преднастроенные allow-списки. См. /opt/ladon/extensions/README.md
+# Extensions — преднастроенные allow/deny-списки. См. /opt/ladon/extensions/README.md
 # extensions:
 #   - ai
 #   - twitch
+#   - tiktok
+# deny_extensions:
+#   - ru-direct
 # extensions_path: /opt/ladon/extensions   # default
 
 probe:

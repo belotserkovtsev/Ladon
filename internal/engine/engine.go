@@ -26,6 +26,30 @@ import (
 	"github.com/belotserkovtsev/ladon/internal/watcher"
 )
 
+// loadDenyExtensions walks cfg.DenyExtensions, reads each preset from
+// ExtensionsPath/<name>.txt, and upserts its domains into manual_entries
+// with list_name='deny'. Missing files log a warning and skip — same
+// forgiving behavior as allow-extensions.
+//
+// Unlike allow-extensions (which are delegated to dnsmasq via ipset=),
+// deny-extensions go through the DB because the engine's ingest-time
+// skip and probe-worker filter both query manual_entries directly.
+func loadDenyExtensions(ctx context.Context, store *storage.Store, cfg Config) {
+	for _, name := range cfg.DenyExtensions {
+		path := filepath.Join(cfg.ExtensionsPath, name+".txt")
+		if _, err := os.Stat(path); err != nil {
+			log.Printf("deny extension %q: file not found at %s — check extensions_path", name, path)
+			continue
+		}
+		n, err := manual.Load(ctx, store, path, "deny")
+		if err != nil {
+			log.Printf("deny extension %q load: %v", name, err)
+			continue
+		}
+		log.Printf("deny extension %s: %d domains from %s", name, n, path)
+	}
+}
+
 // collectManualDomains reads the operator's manual-allow file plus every
 // enabled extension, returns a single deduplicated domain list. dnsmasq
 // then turns each into an `ipset=/domain/<set>` directive.
@@ -95,6 +119,12 @@ type Config struct {
 	Extensions     []string
 	ExtensionsPath string // default "extensions" (relative to WorkingDirectory)
 
+	// DenyExtensions are bundled deny-list presets loaded from the same
+	// ExtensionsPath pool. Each name resolves to ExtensionsPath/<name>.txt
+	// and is upserted into manual_entries with list_name='deny' — same tier
+	// as ManualDenyPath, so tailer skip and probe-worker filter both honor it.
+	DenyExtensions []string
+
 	// LocalProber is the always-on baseline. Used by the inline fast-path from
 	// the tailer (where remote round-trips would blow the sub-second latency
 	// budget) and as the first stage of the batch worker. Defaults to NewLocal.
@@ -151,6 +181,7 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	} else if n > 0 {
 		log.Printf("manual deny: loaded %d entries from %s", n, cfg.ManualDenyPath)
 	}
+	loadDenyExtensions(ctx, store, cfg)
 
 	// Manual-allow + extensions are delegated to dnsmasq's native ipset=
 	// directive. Reasons for the architectural split:

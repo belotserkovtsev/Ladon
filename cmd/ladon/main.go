@@ -405,6 +405,9 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 	if len(f.Extensions) > 0 {
 		cfg.Extensions = f.Extensions
 	}
+	if len(f.DenyExtensions) > 0 {
+		cfg.DenyExtensions = f.DenyExtensions
+	}
 	if f.ExtensionsPath != "" {
 		cfg.ExtensionsPath = f.ExtensionsPath
 	}
