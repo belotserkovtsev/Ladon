@@ -73,13 +73,10 @@ ladon отклонит при старте: домен, который и в all
 
 1. Отредактируйте `/etc/ladon/config.yaml`, добавьте имя пресета в
    нужный список.
-2. Перезапустите ladon: `systemctl restart ladon`.
-3. **Для allow-extensions дополнительно:** `systemctl restart dnsmasq`.
-   `systemctl reload dnsmasq` (SIGHUP) **не** перечитывает `ipset=`
-   директивы — только полный restart. Ladon пишет
-   `/etc/dnsmasq.d/ladon-manual.conf` при каждом старте, но сам dnsmasq
-   не теребит.
-4. Убедитесь в журнале:
+2. Перезапустите ladon: `systemctl restart ladon`. Ladon перепишет
+   `/etc/dnsmasq.d/ladon-manual.conf` и сам рестартанёт dnsmasq —
+   руками трогать не надо.
+3. Убедитесь в журнале:
 
    ```
    journalctl -u ladon -n 20 | grep extension
@@ -88,7 +85,7 @@ ladon отклонит при старте: домен, который и в all
    #   deny extension ru: 4 domains from /opt/ladon/extensions/ru.txt
    ```
 
-5. Для allow — проверьте, что ipset наполнился после резолва:
+4. Для allow — проверьте, что ipset наполнился после резолва:
 
    ```
    nslookup <домен-из-пресета> <ladon-host>

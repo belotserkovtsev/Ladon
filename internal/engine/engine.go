@@ -201,8 +201,8 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 			log.Printf("dnsmasq config write: %v", err)
 		} else {
 			log.Printf("manual: wrote %d domains → %s (ipset=%s)", len(manualDomains), dnsmasqcfg.Path, cfg.ManualIpsetName)
-			if err := dnsmasqcfg.Reload(ctx); err != nil {
-				log.Printf("dnsmasq reload: %v — manual list will activate on next dnsmasq restart", err)
+			if err := dnsmasqcfg.Restart(ctx); err != nil {
+				log.Printf("dnsmasq restart: %v — manual list will activate on next dnsmasq restart", err)
 			}
 		}
 	}

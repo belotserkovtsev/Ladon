@@ -79,14 +79,22 @@ func Write(ipsetName string, domains []string) error {
 	return nil
 }
 
-// Reload tells dnsmasq to re-read its config files. Hardcoded to the standard
-// systemd service name — ladon assumes a systemd-managed dnsmasq, that's the
-// only deployment shape we support.
-func Reload(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, "systemctl", "reload", "dnsmasq")
+// Restart bounces dnsmasq so it re-reads /etc/dnsmasq.d/*.conf. Required
+// because SIGHUP (systemctl reload) only re-reads /etc/resolv.conf and
+// /etc/hosts — the `ipset=` directives ladon writes here are parsed at
+// startup and ignored on reload. Hardcoded to the systemd service name;
+// ladon only supports systemd-managed dnsmasq.
+//
+// Cost: ~100ms of DNS unavailability per ladon startup. Acceptable
+// because (a) dnsmasq is stateless and comes back instantly, (b) this
+// only runs at ladon start, not per-query, (c) eliminating the manual
+// `systemctl restart dnsmasq` step after editing manual-allow / extensions
+// is worth the blip.
+func Restart(ctx context.Context) error {
+	cmd := exec.CommandContext(ctx, "systemctl", "restart", "dnsmasq")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("systemctl reload dnsmasq: %w (output: %s)", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("systemctl restart dnsmasq: %w (output: %s)", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
