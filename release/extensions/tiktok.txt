@@ -1,0 +1,33 @@
+# ladon extension: TikTok / ByteDance
+#
+# Подключается через config.yaml:
+#   extensions: [tiktok]
+#
+# Покрывает TikTok web + mobile, CDN-домены (tiktokcdn.*), ByteDance
+# инфраструктуру (byted*/bytedance) и legacy musical.ly. Полезно если
+# провайдер роняет конкретные edge-IP или при geo-ограничениях сервиса.
+
+# Основные домены
+tiktok.com
+tiktokv.com
+tiktok.net
+v.tiktok.com
+tiktokv.us
+tiktokw.us
+
+# CDN
+tiktokcdn.com
+tiktokcdn-us.com
+tiktokcdn-eu.com
+tiktokcdn.liveplay.myqcloud.com
+p16-tiktokcdn-com.akamaized.net
+
+# Legacy
+musical.ly
+muscdn.com
+
+# ByteDance backbone
+bytecdn.cn
+byteoversea.com
+byted.org
+ibytedtos.com
