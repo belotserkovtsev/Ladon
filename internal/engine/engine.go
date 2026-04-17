@@ -480,6 +480,20 @@ func probeDomainQUIC(ctx context.Context, store *storage.Store, cfg Config, doma
 		return
 	}
 
+	// Only timeout-class failures correlate with DPI. Server-side rejects
+	// (CRYPTO_ERROR 0x128 = TLS handshake_failure, 0x150 = internal_error,
+	// other 0x1XX alerts) are the server saying "I don't do QUIC" and
+	// produce identical error codes from any vantage point — they're not
+	// network-level DPI signals. Exit-compare against offshore probe node
+	// validated this: CRYPTO_ERROR is identical on RU and offshore paths;
+	// timeout is specific to the RU path for h3-supported domains.
+	// Without this filter, the classifier false-positives on every
+	// Cloudflare-API / Akamai-edge domain that refuses QUIC handshakes.
+	quicErr := strings.ToLower(res.FailureReason)
+	if !strings.Contains(quicErr, "timeout") && !strings.Contains(quicErr, "deadline exceeded") {
+		return
+	}
+
 	// Is the latest TCP+TLS verdict "ok"? If it failed already, the TCP
 	// pipeline has (or will) mark HOT on its own cooldown — QUIC adds
 	// nothing. Only the "TCP says OK, QUIC says fail" split needs action.
@@ -594,6 +608,24 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 		default:
 		}
 	case decision.Ignore:
+		// v1.0: if the existing hot_entries row was put there by the QUIC
+		// classifier based on multi-protocol evidence (TCP+TLS ok but QUIC
+		// blocked + UDP observed), a plain TCP+TLS OK verdict alone must NOT
+		// reverse it — the TCP probe can't see the UDP-path block and
+		// reverting would make the QUIC-promote ineffective (domain would
+		// cycle hot → ignore → hot → ignore every 5 min on the cooldown).
+		// Reason string carries the "udp-observed" marker written by
+		// probeDomainQUIC; presence = sticky.
+		existingReason, err := store.GetHotReason(ctx, domain)
+		if err != nil {
+			log.Printf("get hot reason %q: %v", domain, err)
+		}
+		if strings.Contains(existingReason, "udp-observed") {
+			// Keep HOT and its cooldown; TCP verdict is just a re-probe
+			// confirmation that the TCP path hasn't changed.
+			log.Printf("probe %s → TCP ok but keeping HOT (QUIC-promoted, %s)", domain, existingReason)
+			return
+		}
 		if err := store.SetDomainState(ctx, domain, "ignore", cooldown); err != nil {
 			log.Printf("set state ignore %q: %v", domain, err)
 		}

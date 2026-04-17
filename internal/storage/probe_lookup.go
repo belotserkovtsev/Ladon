@@ -6,6 +6,25 @@ import (
 	"errors"
 )
 
+// GetHotReason returns the reason string from hot_entries for the given
+// domain, or "" if no row exists. Multi-protocol classifier uses this to
+// mark HOT entries as "sticky against TCP-Ignore override" — if reason
+// contains a protocol-specific marker (e.g. "udp-observed"), a later
+// TCP+TLS OK verdict should NOT demote the domain, because the HOT was
+// driven by evidence the TCP probe can't see.
+func (s *Store) GetHotReason(ctx context.Context, domain string) (string, error) {
+	var reason sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		`SELECT reason FROM hot_entries WHERE domain = ?`, domain).Scan(&reason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return reason.String, nil
+}
+
 // LatestProbeOK reports whether the most recent probe row for (domain, proto)
 // was successful — both TCPOK and TLSOK (or their protocol-specific
 // "transport reachable" / "crypto handshake completed" equivalents) true.

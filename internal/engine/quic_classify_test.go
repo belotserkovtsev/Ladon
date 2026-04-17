@@ -24,6 +24,24 @@ func (f *fakeQUICProber) Probe(ctx context.Context, req prober.ProbeRequest) pro
 	return r
 }
 
+// fakeLocalProber returns a canned Result for the TCP+TLS path — lets the
+// sticky-HOT test exercise probeDomain without a live TCP dial.
+type fakeLocalProber struct {
+	result prober.Result
+}
+
+func (f *fakeLocalProber) Name() string { return "fake-local" }
+func (f *fakeLocalProber) Probe(ctx context.Context, req prober.ProbeRequest) prober.Result {
+	r := f.result
+	if r.Domain == "" {
+		r.Domain = req.Domain
+	}
+	if r.Proto == "" {
+		r.Proto = "tcp+tls"
+	}
+	return r
+}
+
 // TestQUICClassify_PromotesWhenTCPOKAndQUICFailAndUDPObserved is the happy
 // path for step 6's promote rule. Seeds: domain in `ignore` state, tcp+tls
 // probe on record as OK, observed_flows shows LAN client used UDP:443.
@@ -119,6 +137,81 @@ func TestQUICClassify_SkipsWhenTCPAlsoFailed(t *testing.T) {
 	case <-trigger:
 		t.Errorf("classify should defer to TCP pipeline when TCP also failed")
 	default:
+	}
+}
+
+// TestQUICClassify_SkipsOnCRYPTOError validates the v1.0 post-deploy
+// tightening: CRYPTO_ERROR / TLS handshake rejects from the server are NOT
+// DPI evidence (confirmed via exit-compare — same codes from offshore
+// vantage points). Only timeout-class failures should trigger promote.
+func TestQUICClassify_SkipsOnCRYPTOError(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	now := time.Now().UTC()
+	tt := true
+	seedDomain(t, s, "server-rejects-h3.test", "1.2.3.4", now, &tt, &tt)
+	must(t, s.InsertObservedFlow(ctx, "1.2.3.4", "udp", 443, "192.168.0.50", now))
+
+	cfg := Defaults("/dev/null")
+	cfg.QUICProber = &fakeQUICProber{
+		result: prober.Result{FailureReason: "quic:CRYPTO_ERROR 0x128 (remote): tls: handshake failure"},
+	}
+	trigger := make(chan struct{}, 1)
+	probeDomainQUIC(ctx, s, cfg, "server-rejects-h3.test", trigger)
+
+	hots, _ := s.ListHotEntries(ctx, time.Now().UTC())
+	for _, h := range hots {
+		if h == "server-rejects-h3.test" {
+			t.Errorf("CRYPTO_ERROR must not promote — server-side reject, not DPI")
+		}
+	}
+	select {
+	case <-trigger:
+		t.Errorf("trigger signalled on CRYPTO_ERROR")
+	default:
+	}
+}
+
+// TestQUICClassify_StickyHotOnTCPOK — the inverse half of the classifier:
+// once QUIC has promoted a domain to HOT with reason "(udp-observed)",
+// the next TCP+TLS probe returning OK should NOT demote it. Pre-v1.0 the
+// Ignore case unconditionally deleted hot_entries; that would un-do every
+// QUIC promote on the 5-minute ProbeCooldown tick.
+func TestQUICClassify_StickyHotOnTCPOK(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	now := time.Now().UTC()
+
+	// Seed: domain with TCP+TLS OK history, currently in HOT via a prior
+	// QUIC-promote (reason contains "udp-observed" marker).
+	tt := true
+	seedDomain(t, s, "udp-blocked.test", "9.9.9.9", now, &tt, &tt)
+	must(t, s.UpsertHotEntry(ctx, "udp-blocked.test",
+		"tcp+tls:ok|quic:quic:timeout (udp-observed)",
+		now.Add(24*time.Hour)))
+
+	// Now simulate what runProbeWorker does when the domain's cooldown
+	// expires: run probeDomain which does a TCP+TLS probe (we'll fake an
+	// OK Result via the LocalProber stub).
+	cfg := Defaults("/dev/null")
+	cfg.LocalProber = &fakeLocalProber{result: prober.Result{
+		Domain: "udp-blocked.test", Proto: "tcp+tls",
+		DNSOK: true, TCPOK: true, TLSOK: true,
+	}}
+	trigger := make(chan struct{}, 1)
+	probeDomain(ctx, s, cfg, "udp-blocked.test", trigger, false)
+
+	// Hot entry must still be present — QUIC-promoted records are sticky
+	// against TCP-OK verdicts.
+	hots, _ := s.ListHotEntries(ctx, time.Now().UTC())
+	found := false
+	for _, h := range hots {
+		if h == "udp-blocked.test" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("QUIC-promoted HOT was demoted by TCP+TLS OK — sticky logic broken")
 	}
 }
 
