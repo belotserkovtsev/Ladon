@@ -59,7 +59,7 @@ func TestExitCompare_RemoteOKConfirmsHot(t *testing.T) {
 	cfg.RemoteProber = prober.NewRemote(srv.URL, "", "", time.Second)
 
 	trigger := make(chan struct{}, 1)
-	probeDomain(ctx, s, cfg, "blocked.test", trigger, true)
+	probeDomain(ctx, s, cfg, "blocked.test", []chan<- struct{}{trigger}, true)
 
 	hots, _ := s.ListHotEntries(ctx, time.Now().UTC())
 	if len(hots) != 1 || hots[0] != "blocked.test" {
@@ -111,7 +111,7 @@ func TestExitCompare_RemoteFailOverrulesLocalHot(t *testing.T) {
 	cfg.RemoteProber = prober.NewRemote(srv.URL, "", "", time.Second)
 
 	trigger := make(chan struct{}, 1)
-	probeDomain(ctx, s, cfg, "blocked.test", trigger, true)
+	probeDomain(ctx, s, cfg, "blocked.test", []chan<- struct{}{trigger}, true)
 
 	hots, _ := s.ListHotEntries(ctx, time.Now().UTC())
 	if len(hots) != 0 {
@@ -154,7 +154,7 @@ func TestExitCompare_RemoteTransportFailureKeepsHot(t *testing.T) {
 	cfg.RemoteProber = prober.NewRemote("http://127.0.0.1:1", "", "", 200*time.Millisecond)
 
 	trigger := make(chan struct{}, 1)
-	probeDomain(ctx, s, cfg, "blocked.test", trigger, true)
+	probeDomain(ctx, s, cfg, "blocked.test", []chan<- struct{}{trigger}, true)
 
 	hots, _ := s.ListHotEntries(ctx, time.Now().UTC())
 	if len(hots) != 1 || hots[0] != "blocked.test" {
@@ -201,7 +201,7 @@ func TestExitCompare_InlinePathSkipsRemote(t *testing.T) {
 	cfg.RemoteProber = prober.NewRemote(srv.URL, "", "", time.Second)
 
 	trigger := make(chan struct{}, 1)
-	probeDomain(ctx, s, cfg, "blocked.test", trigger, false) // inline path
+	probeDomain(ctx, s, cfg, "blocked.test", []chan<- struct{}{trigger}, false) // inline path
 
 	if called {
 		t.Errorf("inline path must not call remote prober even when configured")

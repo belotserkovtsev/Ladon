@@ -111,6 +111,7 @@ type Config struct {
 	ManualAllowPath        string        // optional path to manual allow list file
 	ManualDenyPath         string        // optional path to manual deny list file
 	IgnorePeer             string        // peer IP to skip (gateway self, etc.)
+	SnapshotPath           string        // where to write the JSON snapshot (hot+cache+manual-deny with IPs); empty disables
 
 	// AllowExtensions are bundled allow-list presets (e.g. "ai", "twitch")
 	// that ship with ladon and are opt-in by name. Each name resolves to
@@ -163,8 +164,35 @@ func Defaults(logPath string) Config {
 	}
 }
 
-// Run starts all pipeline stages and blocks until ctx is cancelled.
-func Run(ctx context.Context, store *storage.Store, cfg Config) error {
+// Runtime holds the shared state of a running engine: the store, the resolved
+// config, and the channels that wire pipeline stages together. Returned by
+// Start so callers can inject DNS events from non-tailer sources (e.g. the iOS
+// gomobile binding) via OnDNSEvent.
+type Runtime struct {
+	store      *storage.Store
+	cfg        Config
+	sem        chan struct{}
+	hotChanged []chan<- struct{} // fan-out on probe-result state changes (ipset syncer, publisher)
+	errCh      chan error
+}
+
+// Store returns the underlying store. Useful for callers that need to run
+// ad-hoc queries alongside the engine (e.g. the mobile binding exporting
+// stats).
+func (rt *Runtime) Store() *storage.Store { return rt.store }
+
+// Start initializes the engine, loads manual lists, and spawns background
+// goroutines. Goroutines are conditional on config:
+//
+//   - runTailer       — only if cfg.LogPath != "" (Linux dnsmasq mode)
+//   - runPublisher    — only if cfg.PublishPath or cfg.SnapshotPath is set
+//   - runIpsetSyncer  — only if cfg.IpsetName != "" (Linux netfilter mode)
+//
+// Probe worker, expiry sweeper, and scorer always run. The returned Runtime
+// stays alive until ctx is cancelled. Callers typically use Run, which wraps
+// Start and blocks; use Start directly only when you need the OnDNSEvent
+// entry point (iOS SDK).
+func Start(ctx context.Context, store *storage.Store, cfg Config) (*Runtime, error) {
 	if cfg.LocalProber == nil {
 		cfg.LocalProber = prober.NewLocal(cfg.ProbeTimeout)
 	}
@@ -213,20 +241,91 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 
 	// Buffered 1 so hot-probe senders never block. Drain-and-sync is idempotent;
 	// a single buffered slot coalesces storms of hot events into one sync pass.
+	// We keep ipsetTrigger and publishTrigger as separate channels so either
+	// consumer can be absent (e.g. on iOS there's no ipset syncer at all);
+	// probeDomain fans out to whichever triggers are wired.
 	ipsetTrigger := make(chan struct{}, 1)
+	publishTrigger := make(chan struct{}, 1)
+	hotChanged := make([]chan<- struct{}, 0, 2)
+	if cfg.IpsetName != "" {
+		hotChanged = append(hotChanged, ipsetTrigger)
+	}
+	if cfg.PublishPath != "" || cfg.SnapshotPath != "" {
+		hotChanged = append(hotChanged, publishTrigger)
+	}
 
 	errCh := make(chan error, 6)
 
-	go func() { errCh <- runTailer(ctx, store, cfg, sem, ipsetTrigger) }()
-	go func() { errCh <- runProbeWorker(ctx, store, cfg, ipsetTrigger) }()
+	if cfg.LogPath != "" {
+		go func() { errCh <- runTailer(ctx, store, cfg, sem, hotChanged) }()
+	}
+	go func() { errCh <- runProbeWorker(ctx, store, cfg, hotChanged) }()
 	go func() { errCh <- runExpirySweeper(ctx, store, cfg) }()
-	go func() { errCh <- runPublisher(ctx, store, cfg) }()
-	go func() { errCh <- runIpsetSyncer(ctx, store, cfg, ipsetTrigger) }()
+	if cfg.PublishPath != "" || cfg.SnapshotPath != "" {
+		go func() { errCh <- runPublisher(ctx, store, cfg, publishTrigger) }()
+	}
+	if cfg.IpsetName != "" {
+		go func() { errCh <- runIpsetSyncer(ctx, store, cfg, ipsetTrigger) }()
+	}
 	go func() { errCh <- scorer.Run(ctx, store, cfg.Scorer) }()
+
+	return &Runtime{
+		store:      store,
+		cfg:        cfg,
+		sem:        sem,
+		hotChanged: hotChanged,
+		errCh:      errCh,
+	}, nil
+}
+
+// OnDNSEvent handles a resolved DNS event for a single domain. Used by
+// non-tailer event sources (the iOS gomobile binding); the dnsmasq tailer
+// does the equivalent work inline because it sees Query and Reply events
+// separately and tracks CNAME chains across them.
+//
+// The call returns as soon as the event is persisted; probing runs in the
+// background via the inline fast-path (semaphore-capped). Safe to call
+// concurrently.
+func (rt *Runtime) OnDNSEvent(ctx context.Context, domain, peer string, ips []string) error {
+	if domain == "" {
+		return nil
+	}
+	if peer != "" && peer == rt.cfg.IgnorePeer {
+		return nil
+	}
+	if deny, _ := rt.store.IsInDenyList(ctx, domain, etld.Compute(domain)); deny {
+		return nil
+	}
+	if _, err := watcher.Ingest(ctx, rt.store, watcher.Event{Domain: domain, Peer: peer}); err != nil {
+		return fmt.Errorf("ingest %q: %w", domain, err)
+	}
+	for _, ip := range ips {
+		parsed := net.ParseIP(ip)
+		// v4-only: mirrors the tailer's Reply handling. v6 answers create
+		// probe-time "cannot assign" failures and pollute dns_cache.
+		if parsed == nil || parsed.To4() == nil {
+			continue
+		}
+		if err := rt.store.UpsertDNSObservation(ctx, domain, ip, time.Time{}); err != nil {
+			log.Printf("dns_cache %q→%s: %v", domain, ip, err)
+		}
+	}
+	tryInlineProbe(ctx, rt.store, rt.cfg, domain, rt.sem, rt.hotChanged)
+	return nil
+}
+
+// Run starts the engine and blocks until ctx is cancelled. Preserved for
+// cmd/ladon (server CLI) and any other caller that doesn't need the
+// Runtime-level event injection API.
+func Run(ctx context.Context, store *storage.Store, cfg Config) error {
+	rt, err := Start(ctx, store, cfg)
+	if err != nil {
+		return err
+	}
 
 	<-ctx.Done()
 	select {
-	case err := <-errCh:
+	case err := <-rt.errCh:
 		if err != nil && ctx.Err() == nil {
 			return err
 		}
@@ -235,7 +334,7 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	return ctx.Err()
 }
 
-func runTailer(ctx context.Context, store *storage.Store, cfg Config, sem chan struct{}, ipsetTrigger chan<- struct{}) error {
+func runTailer(ctx context.Context, store *storage.Store, cfg Config, sem chan struct{}, hotChanged []chan<- struct{}) error {
 	lines, errs := tail.Follow(ctx, cfg.LogPath, tail.Options{StartAtEnd: !cfg.FromStart})
 	ingested, skipped := 0, 0
 	report := time.NewTicker(30 * time.Second)
@@ -296,7 +395,7 @@ func runTailer(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 				// Inline probe fast-path: kick off right after ingest so a
 				// freshly-observed blocked domain lands in the ipset within
 				// sub-second, not after the next probe-worker tick.
-				tryInlineProbe(ctx, store, cfg, ev.Domain, sem, ipsetTrigger)
+				tryInlineProbe(ctx, store, cfg, ev.Domain, sem, hotChanged)
 			case dnsmasq.Reply:
 				parsed := net.ParseIP(ev.Target)
 				// We operate on v4 only — stun0, WG subnet, iptables rules
@@ -331,7 +430,7 @@ func runTailer(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 // has room. If the semaphore is full we simply drop the fast-path attempt —
 // the regular probe-worker ticks will pick the domain up shortly after, so
 // nothing is lost, we just don't beat the worker to it under heavy load.
-func tryInlineProbe(ctx context.Context, store *storage.Store, cfg Config, domain string, sem chan struct{}, ipsetTrigger chan<- struct{}) {
+func tryInlineProbe(ctx context.Context, store *storage.Store, cfg Config, domain string, sem chan struct{}, hotChanged []chan<- struct{}) {
 	if cap(sem) == 0 || cfg.InlineProbeConcurrency == 0 {
 		return
 	}
@@ -349,11 +448,11 @@ func tryInlineProbe(ctx context.Context, store *storage.Store, cfg Config, domai
 		// Inline path: local-only. The exit-compare validator (if configured)
 		// runs on the batch worker's cooldown re-probe — it would blow the
 		// inline latency budget here.
-		probeDomain(ctx, store, cfg, domain, ipsetTrigger, false)
+		probeDomain(ctx, store, cfg, domain, hotChanged, false)
 	}()
 }
 
-func runProbeWorker(ctx context.Context, store *storage.Store, cfg Config, ipsetTrigger chan<- struct{}) error {
+func runProbeWorker(ctx context.Context, store *storage.Store, cfg Config, hotChanged []chan<- struct{}) error {
 	ticker := time.NewTicker(cfg.ProbeInterval)
 	defer ticker.Stop()
 
@@ -362,14 +461,14 @@ func runProbeWorker(ctx context.Context, store *storage.Store, cfg Config, ipset
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if err := probeOnce(ctx, store, cfg, ipsetTrigger); err != nil {
+			if err := probeOnce(ctx, store, cfg, hotChanged); err != nil {
 				log.Printf("probe tick: %v", err)
 			}
 		}
 	}
 }
 
-func probeOnce(ctx context.Context, store *storage.Store, cfg Config, ipsetTrigger chan<- struct{}) error {
+func probeOnce(ctx context.Context, store *storage.Store, cfg Config, hotChanged []chan<- struct{}) error {
 	now := time.Now().UTC()
 	candidates, err := store.ListProbeCandidates(ctx, cfg.ProbeBatch, now)
 	if err != nil {
@@ -381,7 +480,7 @@ func probeOnce(ctx context.Context, store *storage.Store, cfg Config, ipsetTrigg
 		}
 		// Batch worker uses exit-compare when RemoteProber is configured —
 		// gives the operator's vantage point a vote on borderline calls.
-		probeDomain(ctx, store, cfg, d.Domain, ipsetTrigger, true)
+		probeDomain(ctx, store, cfg, d.Domain, hotChanged, true)
 	}
 	return nil
 }
@@ -389,8 +488,10 @@ func probeOnce(ctx context.Context, store *storage.Store, cfg Config, ipsetTrigg
 // probeDomain runs one full probe→decision→persist cycle for a single domain.
 // Shared by the batch worker and the inline fast-path from the tailer; the
 // useExitCompare flag turns on the optional remote validator stage that only
-// the batch path opts into.
-func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain string, ipsetTrigger chan<- struct{}, useExitCompare bool) {
+// the batch path opts into. On state changes, signalHotChanged fans out to
+// all configured trigger channels (ipset syncer on Linux, publisher on any
+// platform).
+func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain string, hotChanged []chan<- struct{}, useExitCompare bool) {
 	if err := prober.Validate(domain); err != nil {
 		_ = store.SetDomainState(ctx, domain, "ignore", time.Time{})
 		return
@@ -447,11 +548,9 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 			log.Printf("upsert hot %q: %v", domain, err)
 		}
 		log.Printf("probe %s → HOT (%s, %dms)", domain, hotReason, res.LatencyMS)
-		// Nudge the ipset syncer — a new IP may now need to be tunneled.
-		select {
-		case ipsetTrigger <- struct{}{}:
-		default:
-		}
+		// Nudge downstream consumers — a new IP may now need to be tunneled,
+		// and the published snapshot must reflect the new entry.
+		signalHotChanged(hotChanged)
 	case decision.Ignore:
 		if err := store.SetDomainState(ctx, domain, "ignore", cooldown); err != nil {
 			log.Printf("set state ignore %q: %v", domain, err)
@@ -463,10 +562,7 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 			log.Printf("delete hot %q: %v", domain, err)
 		} else if removed {
 			log.Printf("probe %s → IGNORE (overruled prior hot, %s)", domain, hotReason)
-			select {
-			case ipsetTrigger <- struct{}{}:
-			default:
-			}
+			signalHotChanged(hotChanged)
 		}
 	default:
 		if err := store.SetDomainState(ctx, domain, "watch", cooldown); err != nil {
@@ -495,6 +591,19 @@ func persistProbe(ctx context.Context, store *storage.Store, res prober.Result) 
 	}
 }
 
+// signalHotChanged is a non-blocking fan-out: each target channel has cap 1
+// with a default drop, so a storm of hot-events collapses into a single
+// pending signal per consumer. If a slot is full, the consumer already has
+// pending work and will see the latest state when it wakes.
+func signalHotChanged(targets []chan<- struct{}) {
+	for _, ch := range targets {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
 func reasonFromProbe(r prober.Result) string {
 	if r.FailureReason != "" {
 		return r.FailureReason
@@ -510,20 +619,28 @@ func isRemoteTransportFailure(r prober.Result) bool {
 	return strings.HasPrefix(r.FailureReason, "remote:")
 }
 
-func runPublisher(ctx context.Context, store *storage.Store, cfg Config) error {
-	if cfg.PublishPath == "" {
+func runPublisher(ctx context.Context, store *storage.Store, cfg Config, trigger <-chan struct{}) error {
+	if cfg.PublishPath == "" && cfg.SnapshotPath == "" {
 		return nil
 	}
 	ticker := time.NewTicker(cfg.PublishInterval)
 	defer ticker.Stop()
 
 	publishNow := func() {
-		n, err := publisher.PublishDomains(ctx, store, cfg.PublishPath)
-		if err != nil {
-			log.Printf("publish: %v", err)
-			return
+		if cfg.PublishPath != "" {
+			n, err := publisher.PublishDomains(ctx, store, cfg.PublishPath)
+			if err != nil {
+				log.Printf("publish domains: %v", err)
+			} else {
+				log.Printf("published %d domains → %s", n, cfg.PublishPath)
+			}
 		}
-		log.Printf("published %d domains → %s", n, cfg.PublishPath)
+		if cfg.SnapshotPath != "" {
+			freshSince := time.Now().UTC().Add(-cfg.DNSFreshness)
+			if err := publisher.PublishSnapshotJSON(ctx, store, cfg.SnapshotPath, freshSince); err != nil {
+				log.Printf("publish snapshot: %v", err)
+			}
+		}
 	}
 	publishNow()
 
@@ -532,6 +649,8 @@ func runPublisher(ctx context.Context, store *storage.Store, cfg Config) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			publishNow()
+		case <-trigger:
 			publishNow()
 		}
 	}
