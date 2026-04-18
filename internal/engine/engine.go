@@ -4,6 +4,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -630,7 +631,9 @@ func runPublisher(ctx context.Context, store *storage.Store, cfg Config, trigger
 		if cfg.PublishPath != "" {
 			n, err := publisher.PublishDomains(ctx, store, cfg.PublishPath)
 			if err != nil {
-				log.Printf("publish domains: %v", err)
+				if !errors.Is(err, context.Canceled) {
+					log.Printf("publish domains: %v", err)
+				}
 			} else {
 				log.Printf("published %d domains → %s", n, cfg.PublishPath)
 			}
@@ -638,7 +641,9 @@ func runPublisher(ctx context.Context, store *storage.Store, cfg Config, trigger
 		if cfg.SnapshotPath != "" {
 			freshSince := time.Now().UTC().Add(-cfg.DNSFreshness)
 			if err := publisher.PublishSnapshotJSON(ctx, store, cfg.SnapshotPath, freshSince); err != nil {
-				log.Printf("publish snapshot: %v", err)
+				if !errors.Is(err, context.Canceled) {
+					log.Printf("publish snapshot: %v", err)
+				}
 			}
 		}
 	}

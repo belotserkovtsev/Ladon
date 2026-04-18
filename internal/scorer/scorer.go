@@ -6,6 +6,7 @@ package scorer
 
 import (
 	"context"
+	"errors"
 	"log"
 	"time"
 
@@ -54,21 +55,27 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 
 		hots, err := store.ListHotEntries(ctx, now)
 		if err != nil {
-			log.Printf("scorer: list hot: %v", err)
+			if !errors.Is(err, context.Canceled) {
+				log.Printf("scorer: list hot: %v", err)
+			}
 			return
 		}
 		promoted := 0
 		for _, d := range hots {
 			fails, err := store.CountFailingProbes(ctx, d, since)
 			if err != nil {
-				log.Printf("scorer: count probes %q: %v", d, err)
+				if !errors.Is(err, context.Canceled) {
+					log.Printf("scorer: count probes %q: %v", d, err)
+				}
 				continue
 			}
 			if fails < cfg.FailThreshold {
 				continue
 			}
 			if err := store.PromoteCache(ctx, d, "repeated_fail", now); err != nil {
-				log.Printf("scorer: promote %q: %v", d, err)
+				if !errors.Is(err, context.Canceled) {
+					log.Printf("scorer: promote %q: %v", d, err)
+				}
 				continue
 			}
 			promoted++
