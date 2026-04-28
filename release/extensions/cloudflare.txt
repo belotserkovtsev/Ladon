@@ -1,0 +1,47 @@
+# ladon extension: Cloudflare и Cloudflare-fronted сервисы
+#
+# Подключается через config.yaml:
+#   allow_extensions: [cloudflare]
+#
+# Смешанный пресет двух категорий:
+#
+#  1. Cloudflare-инфраструктура операторского уровня
+#     (cloudflareaccess, cloudflarestream, cloudflarestatus и т.д.) —
+#     попадают под общий SNI-фильтр RKN на Cloudflare-домены.
+#
+#  2. Сторонние сервисы, фронтящиеся через Cloudflare и зацепляющиеся
+#     DPI заодно (7tv, BetterTTV, FrankerFaceZ — Twitch-расширения).
+#
+# encryptedsni.com — публичный probe-домен ECH/ESNI.
+#
+# NOTE: пресет НЕ включает корень cloudflare.com — слишком широко
+# (захватит весь Cloudflare-fronted трафик). Если нужно — оператор
+# добавляет в свой manual-allow.txt.
+
+# Twitch-overlay сервисы (CF-fronted)
+7tv.app
+7tv.io
+betterttv.net
+ffzap.com
+frankerfacez.com
+
+# Cloudflare-инфраструктура
+cloudflareaccess.com
+cloudflareapps.com
+cloudflarebolt.com
+cloudflareclient.com
+cloudflare-ech.com
+cloudflareinsights.com
+cloudflareok.com
+cloudflarepartners.com
+cloudflareportal.com
+cloudflarepreview.com
+cloudflareresolve.com
+cloudflaressl.com
+cloudflarestatus.com
+cloudflarestorage.com
+cloudflarestream.com
+cloudflaretest.com
+
+# ECH/ESNI probe
+encryptedsni.com

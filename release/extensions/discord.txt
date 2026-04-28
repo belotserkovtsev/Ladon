@@ -1,0 +1,49 @@
+# ladon extension: Discord
+#
+# Подключается через config.yaml:
+#   allow_extensions: [discord]
+#
+# Discord ecosystem: приложение, gateway, CDN, голос/видео (media),
+# party-games, активити, мерч, статус. eTLD+1 раскрытие в dnsmasq
+# покрывает поддомены автоматически (gateway.discord.gg,
+# cdn.discordapp.com, edge.discord.gg и т.д.).
+
+# Core
+discord.com
+discordapp.com
+discordapp.net
+discord.app
+discord.co
+discord.dev
+dis.gd
+
+# Vanity / link domains
+discord.gg
+discord.gift
+discord.gifts
+discord.new
+discord.media
+discord.design
+discord.store
+
+# CDN
+discordcdn.com
+
+# Status
+discord.status
+discordstatus.com
+
+# Activities / party games / SDK
+discord-activities.com
+discordactivities.com
+discordpartygames.com
+discordsays.com
+discordsez.com
+localizeapi.com
+
+# Merch
+discordmerch.com
+
+# Discord-managed asset bucket (full FQDN — не eTLD+1, чтобы не зацепить
+# весь googleapis.com)
+discord-attachments-uploads-prd.storage.googleapis.com

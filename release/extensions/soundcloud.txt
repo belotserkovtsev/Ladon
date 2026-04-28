@@ -1,0 +1,22 @@
+# ladon extension: SoundCloud
+#
+# Подключается через config.yaml:
+#   allow_extensions: [soundcloud]
+#
+# SoundCloud + сторонние зависимости (analytics, support widget, CDN).
+#
+# WARNING: пресет включает cloudfront.net, zendesk.com и onetrust.com —
+# это broad-домены, используемые тысячами сайтов. Туннелирование
+# Cloudfront-fronted трафика особенно ёмкое (значительный кусок
+# западного интернета). Включай осознанно.
+
+# Core
+soundcloud.com
+soundcloud.cloud
+soundcloud.app.goo.gl
+sndcdn.com
+
+# Сторонние зависимости (broad — см. WARNING)
+cloudfront.net
+zendesk.com
+onetrust.com
