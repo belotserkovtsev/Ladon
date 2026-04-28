@@ -1,0 +1,42 @@
+# ladon extension: Telegram (HTTP-уровень)
+#
+# Подключается через config.yaml:
+#   allow_extensions: [telegram]
+#
+# Покрывает HTTP/HTTPS-уровень Telegram-инфраструктуры:
+#  - web-клиент (web.telegram.org)
+#  - короткие ссылки (t.me)
+#  - Telegraph (статьи)
+#  - сайты сервисов (telegram.org, my.telegram.org, fragment.com)
+#  - desktop-загрузки (desktop.telegram.org, tdesktop.com)
+#
+# WARNING: НЕ покрывает MTProto data-plane (фактические чаты в мобильном/
+# desktop-клиенте). Telegram-приложения после первоначального DC discovery
+# подключаются к data-center'ам по голому IP — 91.108.4.0/22,
+# 91.108.8.0/21, 91.108.16.0/21, 91.108.56.0/22, 95.161.64.0/20,
+# 149.154.160.0/20, 185.76.151.0/24 — минуя DNS. ladon (и любая
+# DNS-based маршрутизация) такие коннекты не видит.
+#
+# Если нужно туннелировать мобильные чаты — оператор поднимает
+# отдельный ipset с CIDR-блоками Telegram DC и хук в iptables mangle.
+# Это вне зоны ladon-presets; см. README раздел "Где живут файлы".
+
+# Web-клиент / основные сайты
+telegram.org
+core.telegram.org
+my.telegram.org
+web.telegram.org
+desktop.telegram.org
+
+# Короткие ссылки и legacy
+t.me
+telesco.pe
+
+# Desktop-клиент (downloads + сайт)
+tdesktop.com
+
+# Telegraph (платформа статей)
+telegra.ph
+
+# Fragment (маркетплейс username/numbers, Telegram-owned)
+fragment.com

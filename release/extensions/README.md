@@ -26,6 +26,7 @@ allow_extensions: [ai, twitch, tiktok]
 | `discord` | allow | Discord (приложение, gateway, CDN, медиа, активити, мерч) |
 | `kinopub` | allow | KinoPub (зеркала, CDN, метаданные) |
 | `soundcloud` | allow | SoundCloud (core domains) |
+| `telegram` | allow | Telegram HTTP-уровень (web, t.me, Telegraph, fragment, downloads). НЕ покрывает MTProto чаты в мобиле/desktop — см. файл |
 | `tiktok` | allow | TikTok / ByteDance overseas (core, regional CDN, backbone, SDK) |
 | `twitch` | allow | Twitch (core + CDN + community-расширения 7tv/BetterTTV/FrankerFaceZ) |
 | `youtube` | allow | YouTube (web, видео-CDN, embed-плеер, kids, YT-Google APIs) |
