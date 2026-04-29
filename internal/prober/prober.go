@@ -1,14 +1,24 @@
-// Package prober runs staged network probes (DNS / TCP:443 / TLS-SNI) against a domain.
+// Package prober runs staged network probes (DNS / TCP:443 / TLS-SNI / HTTP) against a domain.
 package prober
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"time"
 )
+
+// httpReadLimit caps how many response bytes the HTTP cutoff probe will
+// consume. Picked to comfortably exceed the ~14-34KB window where some
+// RU-DPI deployments terminate CDN/hosting connections (the dpi-detector
+// project documents this signature). If we successfully read this much,
+// the path is "deep enough" to consider not-cut.
+const httpReadLimit = 32 * 1024
 
 // Result holds the outcome of a staged probe.
 //
@@ -159,7 +169,11 @@ func probeTCPTLS(ctx context.Context, r Result, started time.Time, timeout time.
 	}
 	r.TCPOK = true
 
-	probeTLSStaged(&r, reachable, "443", timeout)
+	conn := probeTLSStaged(&r, reachable, "443", timeout)
+	if conn != nil {
+		probeHTTPStaged(&r, conn, timeout)
+		conn.Close()
+	}
 	r.LatencyMS = int(time.Since(started) / time.Millisecond)
 	return r
 }
@@ -178,12 +192,15 @@ func probeTCPTLS(ctx context.Context, r Result, started time.Time, timeout time.
 // fallback succeeded, the connection is reachable. The tls13_block verdict
 // is layered on top in a later phase, where it can interact with the HTTP
 // probe and decision rules.
-func probeTLSStaged(r *Result, ip, port string, timeout time.Duration) {
-	ok, code, reason, version := tlsHandshake(ip, port, r.Domain, timeout, 0)
-	if ok {
+// probeTLSStaged returns a live *tls.Conn on success so the caller can
+// keep probing on the same connection (HTTP cutoff detection). Caller must
+// close the conn. Returns nil when both 1.3 and 1.2 attempts fail.
+func probeTLSStaged(r *Result, ip, port string, timeout time.Duration) *tls.Conn {
+	conn, code, reason, version := tlsHandshake(ip, port, r.Domain, timeout, 0)
+	if conn != nil {
 		r.TLSOK = true
 		recordTLSVersion(r, version)
-		return
+		return conn
 	}
 	// 1.3 (or whatever the unrestricted attempt picked) failed. Stash the
 	// error so it survives if the 1.2 retry also fails.
@@ -196,7 +213,8 @@ func probeTLSStaged(r *Result, ip, port string, timeout time.Duration) {
 	// underlying socket too. We already paid for one failed handshake so
 	// this can stretch latency, but it's the price of distinguishing
 	// "real block" from "1.3-only block".
-	if ok2, _, _, _ := tlsHandshake(ip, port, r.Domain, timeout, tls.VersionTLS12); ok2 {
+	conn2, _, _, _ := tlsHandshake(ip, port, r.Domain, timeout, tls.VersionTLS12)
+	if conn2 != nil {
 		t := true
 		r.TLS12OK = &t
 		r.TLSOK = true
@@ -205,15 +223,16 @@ func probeTLSStaged(r *Result, ip, port string, timeout time.Duration) {
 		// to the next phase (which will lift it to a tls13_block verdict).
 		r.FailureCode = CodeOK
 		r.FailureReason = ""
-		return
+		return conn2
 	}
 	r.TLS12OK = &f
+	return nil
 }
 
 // tlsHandshake runs one TLS dial. maxVersion=0 means "unrestricted" (Go
-// negotiates whatever it can). Returns the negotiated protocol version on
-// success so the caller can record TLS12OK vs TLS13OK accurately.
-func tlsHandshake(ip, port, sni string, timeout time.Duration, maxVersion uint16) (ok bool, code FailureCode, reason string, version uint16) {
+// negotiates whatever it can). Returns the live conn on success so the
+// caller can run further stages (HTTP probe) without a fresh dial.
+func tlsHandshake(ip, port, sni string, timeout time.Duration, maxVersion uint16) (conn *tls.Conn, code FailureCode, reason string, version uint16) {
 	cfg := &tls.Config{
 		ServerName:         sni,
 		InsecureSkipVerify: true, // #nosec G402 — we're probing reachability, not verifying identity
@@ -221,15 +240,14 @@ func tlsHandshake(ip, port, sni string, timeout time.Duration, maxVersion uint16
 	if maxVersion != 0 {
 		cfg.MaxVersion = maxVersion
 	}
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: timeout},
+	c, err := tls.DialWithDialer(&net.Dialer{Timeout: timeout},
 		"tcp", net.JoinHostPort(ip, port), cfg)
 	if err != nil {
-		c := categorize(stageTLS, err)
-		return false, c, formatReason(c, err), 0
+		code := categorize(stageTLS, err)
+		return nil, code, formatReason(code, err), 0
 	}
-	state := conn.ConnectionState()
-	conn.Close()
-	return true, CodeOK, "", state.Version
+	state := c.ConnectionState()
+	return c, CodeOK, "", state.Version
 }
 
 // recordTLSVersion sets TLS12OK or TLS13OK based on the negotiated version.
@@ -244,6 +262,64 @@ func recordTLSVersion(r *Result, version uint16) {
 	case tls.VersionTLS12:
 		r.TLS12OK = &t
 	}
+}
+
+// probeHTTPStaged sends a minimal GET on a live TLS conn and tries to
+// consume up to httpReadLimit bytes of the response. It catches the
+// "TLS handshake fine, but DPI cuts the actual stream after N KB" pattern
+// that classifies linkedin.com / instagram.com / rutracker.org under
+// existing TCP+TLS-only probing — the L7-blindspot we want to close.
+//
+// HTTPOK is a tri-state: nil if we didn't run the stage (caller skipped),
+// ptr(true) if a complete response (any status) was parsed, ptr(false)
+// otherwise. A 4xx/5xx with a tiny body still counts as ptr(true) — the
+// path is reachable; the server made a deliberate response. We're
+// detecting middlebox cutoffs, not server semantics.
+func probeHTTPStaged(r *Result, conn *tls.Conn, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	if err := conn.SetDeadline(deadline); err != nil {
+		setHTTPFail(r, stageHTTP, err)
+		return
+	}
+
+	req := fmt.Sprintf(
+		"GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (compatible; ladon-probe)\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+		r.Domain,
+	)
+	if _, err := io.WriteString(conn, req); err != nil {
+		setHTTPFail(r, stageHTTP, err)
+		return
+	}
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		// Headers never completed — DPI most often cuts here, before the
+		// server even gets a chance to respond. Categorize as cutoff.
+		setHTTPFail(r, stageHTTP, err)
+		return
+	}
+
+	// Drain up to the limit. Many small responses finish well below it
+	// (e.g. an empty 204 or a 301 redirect) — that's fine, EOF after a
+	// clean response is success. We only fail on read errors that
+	// indicate the stream was severed mid-flight.
+	_, copyErr := io.Copy(io.Discard, io.LimitReader(resp.Body, httpReadLimit))
+	resp.Body.Close()
+	if copyErr != nil && !errors.Is(copyErr, io.EOF) {
+		setHTTPFail(r, stageHTTP, copyErr)
+		return
+	}
+
+	t := true
+	r.HTTPOK = &t
+}
+
+func setHTTPFail(r *Result, stage string, err error) {
+	f := false
+	r.HTTPOK = &f
+	r.FailureCode = categorize(stage, err)
+	r.FailureReason = formatReason(r.FailureCode, err)
 }
 
 // ErrNoDomain signals an empty input.

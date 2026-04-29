@@ -1,13 +1,17 @@
 // Package decision classifies probe outcomes into engine states.
 //
-// Current policy (Phase 2, intentionally crude):
+// Current policy:
 //
 //	DNS failed              → Ignore  (domain doesn't resolve — not ours)
 //	TCP:443 failed          → Hot     (reachable name, unreachable host → likely blocked)
 //	TLS handshake failed    → Hot     (TLS interception / blackhole → likely blocked)
+//	HTTP cutoff             → Hot     (TLS up but stream severed mid-response — L7 DPI signature)
 //	Everything OK           → Ignore  (direct path works — no need to tunnel)
 //
-// We'll refine these rules in Phase 4 (scorer) once we have repeated evidence.
+// HTTPOK is tri-state: nil means the probe didn't run the HTTP stage (older
+// remote prober, manual call site that skipped) — fall back to TCP+TLS
+// verdict only. ptr(false) means we tried and got severed; ptr(true) means
+// we read a real response.
 package decision
 
 import "github.com/belotserkovtsev/ladon/internal/prober"
@@ -26,6 +30,9 @@ func Classify(r prober.Result) Verdict {
 		return Ignore
 	}
 	if !r.TCPOK || !r.TLSOK {
+		return Hot
+	}
+	if r.HTTPOK != nil && !*r.HTTPOK {
 		return Hot
 	}
 	return Ignore

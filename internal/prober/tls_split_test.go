@@ -18,7 +18,9 @@ func TestTLSSplit_Default(t *testing.T) {
 
 	host, port := splitHostPort(t, srv.Listener.Addr().String())
 	r := Result{Domain: "example.com", ResolvedIPs: []string{host}}
-	probeTLSStaged(&r, host, port, 2*time.Second)
+	if conn := probeTLSStaged(&r, host, port, 2*time.Second); conn != nil {
+		conn.Close()
+	}
 
 	if !r.TLSOK {
 		t.Fatalf("TLSOK=false reason=%q code=%q", r.FailureReason, r.FailureCode)
@@ -41,7 +43,9 @@ func TestTLSSplit_Server12Only(t *testing.T) {
 
 	host, port := splitHostPort(t, srv.Listener.Addr().String())
 	r := Result{Domain: "example.com", ResolvedIPs: []string{host}}
-	probeTLSStaged(&r, host, port, 2*time.Second)
+	if conn := probeTLSStaged(&r, host, port, 2*time.Second); conn != nil {
+		conn.Close()
+	}
 
 	if !r.TLSOK {
 		t.Fatalf("TLSOK=false reason=%q code=%q", r.FailureReason, r.FailureCode)
@@ -74,7 +78,10 @@ func TestTLSSplit_BothFail(t *testing.T) {
 
 	host, port := splitHostPort(t, ln.Addr().String())
 	r := Result{Domain: "example.com", ResolvedIPs: []string{host}}
-	probeTLSStaged(&r, host, port, 1*time.Second)
+	if conn := probeTLSStaged(&r, host, port, 1*time.Second); conn != nil {
+		conn.Close()
+		t.Fatal("probeTLSStaged returned a live conn on a closed-on-accept listener")
+	}
 
 	if r.TLSOK {
 		t.Fatal("TLSOK=true on closed-on-accept listener — should fail")
