@@ -159,22 +159,91 @@ func probeTCPTLS(ctx context.Context, r Result, started time.Time, timeout time.
 	}
 	r.TCPOK = true
 
-	// TLS handshake with SNI. We don't verify the cert — see comment in callers.
-	tlsConn, err := tls.DialWithDialer(&net.Dialer{Timeout: timeout},
-		"tcp", net.JoinHostPort(reachable, "443"), &tls.Config{
-			ServerName:         r.Domain,
-			InsecureSkipVerify: true, // #nosec G402 — intentional
-		})
-	if err != nil {
-		r.FailureCode = categorize(stageTLS, err)
-		r.FailureReason = formatReason(r.FailureCode, err)
-	} else {
-		tlsConn.Close()
-		r.TLSOK = true
-	}
-
+	probeTLSStaged(&r, reachable, "443", timeout)
 	r.LatencyMS = int(time.Since(started) / time.Millisecond)
 	return r
+}
+
+// probeTLSStaged runs the TLS-SNI handshake first unrestricted (Go picks the
+// highest mutually-supported version, which is 1.3 against any modern
+// server) and, if that fails, retries pinned to TLS 1.2. The split is the
+// primary signal we use to detect ClientHello-targeted DPI: when 1.3 fails
+// but 1.2 succeeds, the middlebox is almost certainly inspecting the
+// ClientHello (ECH/ESNI / cipher-suite fingerprinting).
+//
+// The retry only fires on TLS-stage failures — a clean 1.3 handshake leaves
+// TLS12OK nil (we don't burn an extra dial just to populate the field).
+//
+// We do NOT mark TLSOK=false when 1.3 fails / 1.2 ok in this function — the
+// fallback succeeded, the connection is reachable. The tls13_block verdict
+// is layered on top in a later phase, where it can interact with the HTTP
+// probe and decision rules.
+func probeTLSStaged(r *Result, ip, port string, timeout time.Duration) {
+	ok, code, reason, version := tlsHandshake(ip, port, r.Domain, timeout, 0)
+	if ok {
+		r.TLSOK = true
+		recordTLSVersion(r, version)
+		return
+	}
+	// 1.3 (or whatever the unrestricted attempt picked) failed. Stash the
+	// error so it survives if the 1.2 retry also fails.
+	r.FailureCode = code
+	r.FailureReason = reason
+	f := false
+	r.TLS13OK = &f
+
+	// 1.2-only retry. New TCP connection — TLS failure usually drops the
+	// underlying socket too. We already paid for one failed handshake so
+	// this can stretch latency, but it's the price of distinguishing
+	// "real block" from "1.3-only block".
+	if ok2, _, _, _ := tlsHandshake(ip, port, r.Domain, timeout, tls.VersionTLS12); ok2 {
+		t := true
+		r.TLS12OK = &t
+		r.TLSOK = true
+		// Clear the failure carried over from the 1.3 attempt — TLS as a
+		// whole succeeded. TLS13OK=false stays so the asymmetry is visible
+		// to the next phase (which will lift it to a tls13_block verdict).
+		r.FailureCode = CodeOK
+		r.FailureReason = ""
+		return
+	}
+	r.TLS12OK = &f
+}
+
+// tlsHandshake runs one TLS dial. maxVersion=0 means "unrestricted" (Go
+// negotiates whatever it can). Returns the negotiated protocol version on
+// success so the caller can record TLS12OK vs TLS13OK accurately.
+func tlsHandshake(ip, port, sni string, timeout time.Duration, maxVersion uint16) (ok bool, code FailureCode, reason string, version uint16) {
+	cfg := &tls.Config{
+		ServerName:         sni,
+		InsecureSkipVerify: true, // #nosec G402 — we're probing reachability, not verifying identity
+	}
+	if maxVersion != 0 {
+		cfg.MaxVersion = maxVersion
+	}
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: timeout},
+		"tcp", net.JoinHostPort(ip, port), cfg)
+	if err != nil {
+		c := categorize(stageTLS, err)
+		return false, c, formatReason(c, err), 0
+	}
+	state := conn.ConnectionState()
+	conn.Close()
+	return true, CodeOK, "", state.Version
+}
+
+// recordTLSVersion sets TLS12OK or TLS13OK based on the negotiated version.
+// Called only on a successful handshake. Servers that only support 1.2
+// will end up with TLS12OK=ptr(true), TLS13OK=nil (we never tried 1.3
+// directly because the unrestricted dial already settled at 1.2).
+func recordTLSVersion(r *Result, version uint16) {
+	t := true
+	switch version {
+	case tls.VersionTLS13:
+		r.TLS13OK = &t
+	case tls.VersionTLS12:
+		r.TLS12OK = &t
+	}
 }
 
 // ErrNoDomain signals an empty input.
