@@ -11,19 +11,34 @@ import (
 )
 
 // Result holds the outcome of a staged probe.
+//
+// FailureCode is a stable enum suitable for engine branching and grep; it
+// also forms the prefix of FailureReason ("<code>: <raw err>"). Old call
+// sites that only read FailureReason keep working unchanged.
 type Result struct {
 	Domain        string
 	DNSOK         bool
 	TCPOK         bool
 	TLSOK         bool
-	HTTPOK        *bool // reserved for future HTTP probe
+	TLS12OK       *bool // populated when the 1.2-restricted retry runs
+	TLS13OK       *bool // populated by the unrestricted attempt
+	HTTPOK        *bool
 	ResolvedIPs   []string
+	FailureCode   FailureCode
 	FailureReason string
 	LatencyMS     int
 }
 
+// IsRemoteTransportFailure reports whether this result represents the
+// remote prober itself being unreachable rather than a verdict about the
+// target. Engine treats those as Hot (safe default) but suppresses
+// noise-floor signals the caller would otherwise count as real DPI.
+func (r Result) IsRemoteTransportFailure() bool {
+	return r.FailureCode == CodeRemote
+}
+
 const (
-	DefaultTimeout = 800 * time.Millisecond
+	DefaultTimeout = 1500 * time.Millisecond
 	MaxIPsToTry    = 3
 )
 
@@ -41,7 +56,8 @@ func Probe(ctx context.Context, domain string, timeout time.Duration) Result {
 	resolver := &net.Resolver{}
 	addrs, err := resolver.LookupIPAddr(ctx, domain)
 	if err != nil {
-		r.FailureReason = "dns:" + err.Error()
+		r.FailureCode = categorize(stageDNS, err)
+		r.FailureReason = formatReason(r.FailureCode, err)
 		r.LatencyMS = int(time.Since(started) / time.Millisecond)
 		return r
 	}
@@ -71,7 +87,8 @@ func ProbeIPs(ctx context.Context, domain string, ips []string, timeout time.Dur
 	started := time.Now()
 	r := Result{Domain: domain, ResolvedIPs: ips}
 	if len(ips) == 0 {
-		r.FailureReason = "no_ips"
+		r.FailureCode = CodeNoIPs
+		r.FailureReason = string(CodeNoIPs)
 		r.LatencyMS = int(time.Since(started) / time.Millisecond)
 		return r
 	}
@@ -85,7 +102,8 @@ func ProbeIPs(ctx context.Context, domain string, ips []string, timeout time.Dur
 func probeTCPTLS(ctx context.Context, r Result, started time.Time, timeout time.Duration) Result {
 	r.DNSOK = len(r.ResolvedIPs) > 0
 	if !r.DNSOK {
-		r.FailureReason = "no_ips"
+		r.FailureCode = CodeNoIPs
+		r.FailureReason = string(CodeNoIPs)
 		r.LatencyMS = int(time.Since(started) / time.Millisecond)
 		return r
 	}
@@ -129,9 +147,12 @@ func probeTCPTLS(ctx context.Context, r Result, started time.Time, timeout time.
 		}
 	}
 	if reachable == "" {
-		r.FailureReason = "tcp_connect_failed"
 		if lastErr != nil {
-			r.FailureReason = "tcp:" + lastErr.Error()
+			r.FailureCode = categorize(stageTCP, lastErr)
+			r.FailureReason = formatReason(r.FailureCode, lastErr)
+		} else {
+			r.FailureCode = CodeTCPError
+			r.FailureReason = "tcp_connect_failed"
 		}
 		r.LatencyMS = int(time.Since(started) / time.Millisecond)
 		return r
@@ -145,7 +166,8 @@ func probeTCPTLS(ctx context.Context, r Result, started time.Time, timeout time.
 			InsecureSkipVerify: true, // #nosec G402 — intentional
 		})
 	if err != nil {
-		r.FailureReason = "tls:" + err.Error()
+		r.FailureCode = categorize(stageTLS, err)
+		r.FailureReason = formatReason(r.FailureCode, err)
 	} else {
 		tlsConn.Close()
 		r.TLSOK = true

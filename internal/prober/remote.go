@@ -39,12 +39,16 @@ type RemoteRequest struct {
 // RemoteResponse is what the remote server returns. Missing fields are
 // treated as false / unset — the remote is free to skip stages it can't
 // perform (e.g. a cellular prober with no TLS stack can leave tls_ok empty).
+//
+// FailureCode is optional: older remotes that don't set it are handled by
+// parsing the prefix of FailureReason (back-compat — see RemoteProber.Probe).
 type RemoteResponse struct {
 	DNSOK         bool     `json:"dns_ok"`
 	TCPOK         bool     `json:"tcp_ok"`
 	TLSOK         bool     `json:"tls_ok"`
 	ResolvedIPs   []string `json:"resolved_ips,omitempty"`
 	FailureReason string   `json:"reason,omitempty"`
+	FailureCode   string   `json:"code,omitempty"`
 	LatencyMS     int      `json:"latency_ms,omitempty"`
 }
 
@@ -121,12 +125,19 @@ func (p *RemoteProber) Probe(ctx context.Context, domain string, ips []string) R
 	if latency == 0 {
 		latency = int(time.Since(started) / time.Millisecond)
 	}
+	// Back-compat: older remotes don't send `code`; recover it from the
+	// reason prefix so engine code can branch on FailureCode uniformly.
+	code := FailureCode(rr.FailureCode)
+	if code == "" {
+		code = parseCode(rr.FailureReason)
+	}
 	return Result{
 		Domain:        domain,
 		DNSOK:         rr.DNSOK,
 		TCPOK:         rr.TCPOK,
 		TLSOK:         rr.TLSOK,
 		ResolvedIPs:   resolved,
+		FailureCode:   code,
 		FailureReason: rr.FailureReason,
 		LatencyMS:     latency,
 	}
@@ -136,6 +147,7 @@ func failedRemote(domain string, ips []string, reason string, started time.Time)
 	return Result{
 		Domain:        domain,
 		ResolvedIPs:   ips,
+		FailureCode:   CodeRemote,
 		FailureReason: reason,
 		LatencyMS:     int(time.Since(started) / time.Millisecond),
 	}
