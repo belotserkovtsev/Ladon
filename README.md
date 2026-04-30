@@ -41,145 +41,183 @@ curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/ins
 
 ## 🔬 Методология
 
-Ladon — реактивный split-tunneling роутер, в котором классификация домена как
-DPI-блокированного — это не один TCP-пинг, а пайплайн arbitration'ов, где
-каждый уровень отсекает свой класс false-positive'ов. Сильная сторона
-методологии — именно в композиции уровней, а не в одной "умной" пробе.
+Полный pipeline от DNS-запроса клиента до правила в kernel ipset.
 
-### Реактивное наблюдение, а не synthetic probing
+### 1. Source — dnsmasq.log
 
-Ladon не ходит синтетически по лидерборду блокированных доменов. Вместо
-этого fsnotify-tailer читает живой `dnsmasq.log` шлюза и пробивает только
-те домены, к которым клиенты **уже** пошли. Каждый probe-кандидат — это
-имя, которое реально нужно конкретному юзеру в конкретный момент. Никаких
-синтетических списков "что в РФ блокируется в этом году" — список строится
-из вашего настоящего трафика.
+`dnsmasq` запускается с `log-queries=extra` и пишет в файл строки вида
+`query[A] domain from peer` и `reply domain is IP`. Это единственный
+источник probe-кандидатов: ladon реагирует на трафик клиентов, не
+пробивает синтетический список.
 
-Inline fast-path запускает probe сразу при первом DNS-запросе нового
-домена и обычно успевает положить результат в kernel ipset за ~500 мс.
-Параллельно batch-worker в фоне переоценивает накопленные кандидаты раз в
-2 секунды.
+### 2. Tail + parse + ingest
 
-### Stage-by-stage probe с осмысленными failure-кодами
+`internal/tail` через fsnotify читает append'ы. `internal/dnsmasq`
+парсит строки в события `Query{Domain, Peer}` и `Reply{Domain, IP}`.
+`internal/watcher` нормализует домен через `internal/etld` (eTLD+1) и
+делает upsert:
 
-Probe идёт DNS → TCP:443 → TLS-handshake → HTTP-read (до 32KB), и каждая
-стадия даёт своё семейство кодов. HTTP-стадия читает достаточно байт,
-чтобы поймать классическую RU-DPI сигнатуру "обрыв CDN/хостинга на
-14-34KB передачи" — без неё handshake выглядит чистым, и блок ускользает.
+- `Query` → `domains` (state=`new` если первый раз) + увеличивает peer_count
+- `Reply` → `dns_cache(domain, ip, last_seen_at)`
 
-Коды специально гранулярные: `tcp_timeout`, `tcp_reset`, `tcp_refused`,
-`tls_handshake_timeout`, `tls_reset`, `tls_eof`, `tls_alert`,
-`mtls_required`, `http_cutoff`, `http_reset`, `http_timeout`,
-`http_error`. Это не косметика для логов — каждый код несёт **другую
-семантику** и движок ветвится по ним.
+### 3. Probe trigger
 
-### Server-active vs path-active — главное различение
+Два независимых driver'а probe:
 
-Самая ценная классификация в пайплайне: failures делятся на две группы.
+- **Inline fast-path** — каждый новый домен пробивается синхронно с
+  ingest'ом, ограниченный семафором `probe.concurrency` (default 8).
+  Только local-probe, без remote. Цель — ~500ms reaction time.
+- **Batch worker** — раз в `probe.interval` (2s) выбирает до
+  `probe.batch` (4) кандидатов из `domains` с
+  `last_probed_at < now − probe.cooldown` (5min). Здесь подключается
+  remote-probe в exit-compare режиме.
 
-**Server-active rejection** означает, что сервер **активно ответил**
-"нет": `tcp_refused` — порт явно закрыт, `tls_alert` — TLS alert от
-peer'а, `mtls_required` — alert 116 (mutual-TLS требуется, классика для
-Apple Push, FindMy, iCloud Private Relay). Все три — **доказательство
-доступности** сервера: чтобы прислать alert, peer должен был пройти TCP
-и часть handshake'а. Значит DPI не вмешался — это policy сервера. Такие
-домены идут в `Ignore`, никогда в туннель.
+### 4. Probe stages
 
-**Path-active rejection** — `*_timeout`, `*_reset`, `*_eof`,
-`http_cutoff`, `http_error`. Здесь сервер не подтвердил доступность —
-что-то могло его не пустить, и это "что-то" обычно DPI на пути.
+`internal/prober.LocalProber.Probe(ctx, domain, ips)`. Если `ips`
+переданы (из `dns_cache`) — DNS-стадия пропускается, иначе резолвится
+через `net.Resolver`. v6 IPs отбрасываются (gateway routing v4-only).
 
-Этот раздел отлавливает целый класс false-positive'ов, на котором
-утыкаются простые TCP-checker'ы: Apple Push Service, FindMy, iCloud
-Private Relay, корпоративные API с client-cert auth — все они отдают
-`tls_alert: certificate required`, простой checker считает их
-"unreachable", а Ladon правильно классифицирует как "сервер живой,
-просто требует клиентский сертификат".
+| stage | действие | failure codes |
+|---|---|---|
+| DNS  | `LookupIPAddr` | `dns_nxdomain`, `dns_timeout`, `dns_error` |
+| TCP  | parallel dial до `MaxIPsToTry`=3 IPs:443, первый success wins, остальные cancel'ятся через shared context | `tcp_timeout`, `tcp_reset`, `tcp_refused`, `tcp_unreachable` |
+| TLS  | `tls.DialWithDialer` с `ServerName=domain`, `InsecureSkipVerify=true` (probe — про reachability, не authenticity) | `tls_handshake_timeout`, `tls_eof`, `tls_reset`, `tls_alert`, `mtls_required` |
+| HTTP | на live tls.Conn пишется минимальный GET, читается до 32KB через `bufio` + `http.ReadResponse` | `http_cutoff`, `http_reset`, `http_timeout`, `http_error` |
 
-`tls_alert` детектится двумя путями: `errors.As(err, &tls.AlertError{})`
-для QUIC-транспортов плюс string-fallback на `"remote error: tls: ..."`
-для классических TCP-конекций (Go stdlib для не-QUIC оборачивает alert'ы
-в неэкспортированный `tls.alert`, и `errors.As` на них не срабатывает).
+HTTP-окно 32KB подобрано чтобы покрыть RU-DPI сигнатуру обрыва на
+14-34KB передачи — без HTTP-стадии handshake выглядит чистым и блок
+ускользает.
 
-### Arbitration через exit-compare
+### 5. categorize
 
-Path-active failure пока ещё не приговор. Может, конкретно этот сервер
-лежит. Может, у него странная конфигурация на 443. Может, geoblock на
-обе стороны.
+`internal/prober/failures.go::categorize(stage, err)` маппит low-level
+ошибку на `FailureCode` через `errors.Is`/`errors.As` chain.
+Дополнительно — string-fallback на `"remote error: tls: ..."` для
+non-QUIC TLS alert'ов (Go stdlib оборачивает их в неэкспортированный
+`tls.alert`, и typed `errors.As` на них не срабатывает; `mtls_required`
+выделяется по подстроке `"certificate required"` в alert text).
 
-Решает второе мнение: тот же probe запускается из второго vantage'а —
-HTTP-сервиса в другом регионе (out-of-RU VPS, например). Получаем
-матрицу:
+`FailureCode` делятся на две группы:
 
-| local | remote | вердикт | смысл |
-|---|---|---|---|
-| OK | — | Ignore | direct path работает |
-| FAIL | OK | **Hot** | реальный DPI: снаружи живой, изнутри нет |
-| FAIL | FAIL | Ignore | проблема в сервере, не в пути |
-| FAIL | unavailable | Hot (sticky) | нет мнения, остаёмся с локальным |
+- **server-active** — `tcp_refused`, `tls_alert`, `mtls_required`. Сервер
+  активно ответил "нет", значит он достижим и DPI не вмешался. Decision
+  → `Ignore`, никогда в туннель.
+- **path-active** — все timeout/reset/eof/cutoff/error. Сервер не
+  подтвердил доступность; кандидат на Hot.
 
-Ключевая строка — `FAIL/FAIL → Ignore`. Без неё любой mTLS-сервис, любой
-geoblock'нутый сервис, любой просто медленный сервер попадал бы в Hot.
-С ней remaining false-positive rate в production падает до единиц
-процентов. На стек из ~150 живых hot-доменов в день обычно ноль
-заведомо ложных срабатываний.
+### 6. Remote probe (опционально, только batch)
 
-### Temporal arbitration — hot/cache
+Если `probe.mode=exit-compare`, batch-worker дополнительно вызывает
+`internal/prober.RemoteProber`: HTTP POST на `probe.remote.url` с JSON
+`{domain, ips, port, sni}`, Bearer auth, ответ — `RemoteResponse` с
+теми же полями (`dns_ok`, `tcp_ok`, `tls_ok`, `tls12_ok`, `tls13_ok`,
+`http_ok`, `code`, `reason`). Транспортный fail → `code=remote_unreachable`,
+не overrule'ит local. Inline fast-path remote НЕ дёргает.
 
-Один fail ≠ приговор. Probe может попасть в момент перегрузки сервера,
-DPI может моргнуть, провайдер может временно ребутнуть промежуточное
-оборудование. Поэтому верхний слой памяти — двухуровневый:
+### 7. Decision
 
-`hot_entries` принимают новые блоки на 24 часа. Это активный список —
-домен в туннеле, но движок продолжает регулярно его перепробовать. Если
-за 24 часа набирается ≥50 подтверждённых fails (при 5-минутном cooldown
-это означает минимум ~4 часа устойчивого failure'а), scorer переводит
-домен в `cache_entries` — постоянный список без TTL.
+`internal/decision.Classify(local, remote)`:
 
-Если же блок был временным, домен молча выпадет из hot через 24 часа и
-вернётся в нормальный probe-цикл. Никаких списков "был блокирован на
-прошлой неделе, теперь зависает в кэше навсегда" — каждое решение
-живёт ровно столько, сколько подтверждается.
+```
+if local.DNSOK == false                      → Ignore
+if local.FailureCode is server-active        → Ignore
+if local.AllStagesOK                         → Ignore
+if remote == nil                             → Hot
+if remote.IsTransportFailure                 → Hot (sticky local)
+if remote.AllStagesOK                        → Hot (real DPI)
+if remote.HasFailure                         → Ignore (methodological FP)
+```
 
-### Что покрывается без участия оператора
+Строка `local FAIL + remote FAIL → Ignore` — основная защита от
+false-positive: если обе vantage точки видят failure, проблема в самом
+сервере или общем пути за обоими, а не в DPI на пути конкретно local-клиента.
 
-В сумме комбинация уровней автоматически и корректно классифицирует:
+### 8. Persistence
 
-- **TCP-уровневые блоки** (SYN drop, RST на handshake) — Meta IPs, любые
-  geo-targeted блокировки на L4
-- **TLS-handshake блоки** на SNI/cipher-фингерпринте — Telegram DC,
-  Discord voice, многие RU-blocked сервисы
-- **L7-cutoff блоки** — обрыв TLS-стрима после 14-34KB CDN-трафика,
-  любимый трюк некоторых RU-DPI deployments
-- **HTTP-injection блоки** — DPI инжектит garbage в HTTP/2 stream
-  (наблюдается на Google FCM `mtalk.google.com` и подобных gRPC-сервисах)
-- **Сервисы с mTLS / client-cert требованиями** — корректно как доступные
-  (не попадают в туннель ложно)
-- **Geoblock'нутые сервисы** — корректно как недоступные глобально
-  (не попадают в туннель)
-- **Случайные блипы провайдера** — отсекаются temporal arbitration'ом,
-  не доходят до постоянного кэша
+`internal/storage` upsert'ит:
 
-### Что вне scope
+- `probes(domain, dns_ok, tcp_ok, tls_ok, http_ok, resolved_ips_json,
+  failure_reason, latency_ms, created_at)` — каждая проба, append-only
+- `domains.state` ← verdict из шага 7
+- если Hot: `hot_entries(domain, expires_at = now + hot_ttl, reason)`,
+  `expires_at` обновляется при повторных fail'ах
 
-Несколько классов блокировок методология не покрывает:
-**L7-fingerprint blocks** (когда DPI режет конкретный ClientHello браузера —
-у probe другой fingerprint, обходится через `manual-allow`),
-**throttling** (DPI не блокирует, а шейпит — probe видит "медленно но
-работает"), **domainless flows** на hardcoded IP (Telegram mobile,
-Discord voice — нет DNS-запроса, нечего ingest'ить). Под каждый из этих
-классов есть план в roadmap.
+`failure_reason` хранит `"<failure_code>: <raw err>"` — код grep'абелен
+SQL-запросом без отдельной колонки.
+
+### 9. Ipset sync
+
+`internal/ipset` (event-driven при изменении hot/cache + safety reconcile
+раз в `ipset.interval` = 30s):
+
+- читает `hot_entries ∪ cache_entries` → активные домены
+- для каждого активного домена читает `dns_cache` где
+  `last_seen_at > now − dns_freshness` (6h) → активные IPs
+- diff с current `ladon_engine` ipset → `ipset add` / `ipset del`
+
+Параллельно `internal/dnsmasqcfg` генерит `/etc/dnsmasq.d/ladon-manual.conf`
+из `manual_allow` + extensions. dnsmasq на резолве этих доменов сам
+заносит IP в `ladon_manual` ipset через `ipset=` directive (включая CNAME
+chain walking). Это второй ipset, отдельный от probe-driven engine.
+
+### 10. Routing (вне ladon, заводится оператором)
+
+```
+iptables -t mangle:
+  PREROUTING -i <wan> -j LADON_ROUTE_ENGINE   # probe-driven hot/cache
+  PREROUTING -i <wan> -j LADON_ROUTE_MANUAL   # extensions + manual-allow
+
+LADON_ROUTE_ENGINE:
+  -d 192.168.0.0/16,10.0.0.0/8,127.0.0.0/8 -j RETURN  (LAN bypass)
+  -m set --match-set ladon_engine dst -j MARK --set-mark 0x1
+
+ip rule fwmark 0x1 lookup 100
+ip route table 100: default dev <tunnel-iface>
+```
+
+Любой пакет с dst в `ladon_engine` или `ladon_manual` ipset получает
+MARK 0x1 → fwmark routing → table 100 → туннель.
+
+### 11. Background
+
+- **Hot expiry**: запись с `expires_at < now` удаляется автоматически.
+  Domain выпадает из ipset на следующем sync.
+- **Scorer** (раз в `scorer.interval` = 10min): для каждой `hot_entries`
+  считает `probes` где `failure_reason != ""` и `created_at > now − scorer.window` (24h).
+  Если count ≥ `scorer.fail_threshold` (50) → upsert в
+  `cache_entries(domain, promoted_at, reason)`. cache — без TTL, до явного prune.
+
+### Не покрывается
+
+- **L7-fingerprint blocks** — DPI режет конкретный ClientHello (Chrome 120,
+  iOS Safari). Probe использует Go stdlib fingerprint, у него другой
+  паттерн в ClientHello → DPI не блеклистит → probe видит "OK".
+  Workaround — `manual-allow.txt`.
+- **Throttling** — DPI шейпит до сотен кбит/с вместо блока. Probe видит
+  "медленно но работает" → Ignore.
+- **Domainless flows** — Telegram mobile / Discord voice / WhatsApp calls
+  идут на hardcoded IP, dnsmasq не получает DNS-запрос → tailer не
+  пикапит → probe не запускается.
+- **DNS-only blocks** — DPI poison'ит ISP-resolver. Ladon резолвит через
+  свой апстрим (например `1.1.1.1` через VPN) → не видит фальсификацию.
 
 ---
 
 ## 🛠 Конфигурация
 
-Конфигурация задаётся YAML-файлом, путь передаётся флагом `-config`.
-Без файла движок едет на дефолтах из
-[`internal/engine/engine.go`](internal/engine/engine.go) — этого хватает
-для базового запуска.
+### Файлы
 
-Минимальный пример:
+| путь | назначение |
+|---|---|
+| `/etc/ladon/config.yaml` | основной конфиг (опционально, без него — defaults) |
+| `/etc/ladon/manual-allow.txt`, `/etc/ladon/manual-deny.txt` | списки операторских overrides |
+| `/opt/ladon/extensions/<name>.txt` | bundled allow/deny-пресеты |
+| `/var/log/dnsmasq.log` | источник probe-сигнала (читаем) |
+| `/etc/dnsmasq.d/ladon-manual.conf` | генерим для dnsmasq ipset= directives |
+| `/opt/ladon/state/engine.db` | SQLite со всем persistent state |
+
+### YAML
 
 ```yaml
 logfile: /var/log/dnsmasq.log
@@ -187,41 +225,51 @@ manual_allow: /etc/ladon/manual-allow.txt
 manual_deny: /etc/ladon/manual-deny.txt
 
 probe:
-  mode: local         # local | exit-compare
+  mode: local            # local | exit-compare
   timeout: 800ms
+  cooldown: 5m
+  concurrency: 8
+
+scorer:
+  interval: 10m
+  window: 24h
+  fail_threshold: 50
 
 ipset:
   engine_name: ladon_engine
   manual_name: ladon_manual
+  interval: 30s
+
+hot_ttl: 24h
+dns_freshness: 6h
 ```
 
-Полный набор опций (scorer thresholds, hot_ttl, dns_freshness,
-publish_path, ipset.interval) задокументирован в
-[`internal/engine/engine.go`](internal/engine/engine.go) и в комментариях
-эталонного [`config.yaml.example`](release/config.yaml.example).
+Полный набор полей и defaults — в
+[`internal/engine/Defaults()`](internal/engine/engine.go) и
+[`release/config.yaml.example`](release/config.yaml.example).
 
-CLI принимает override `-manual-allow` / `-manual-deny` для случаев когда
-пути нужны разовые. Тонкие knobs — только через YAML.
+### CLI
+
+```
+ladon -db <path> [-config <path>] <subcommand> [args]
+```
+
+Подкоманды: `init-db`, `run`, `probe <domain>`, `observe <domain>`,
+`list [N]`, `hot`, `tail <log>`, `prune`. Флаги `-manual-allow` /
+`-manual-deny` на `run` перебивают одноимённые YAML-поля.
 
 ### Manual lists
 
-`manual-allow.txt` и `manual-deny.txt` — два списка по одному домену на
-строку. eTLD+1 apex покрывает все субдомены, `#` — комментарий.
+По одному домену на строку, `#` — комментарий. eTLD+1 apex покрывает
+все субдомены.
 
-`manual-allow` нужен для случаев, которые методология автоматически не
-ловит (L7-fingerprint blocks, например `rutracker.org` через
-Cloudflare-fronting, или сервисы где TLS handshake проходит, но реальный
-браузерный traffic режется на байтовом уровне). Домены из allow-листа
-**всегда** идут в туннель, минуя probe.
-
-`manual-deny` — обратный, для случаев когда домен в туннеле принципиально
-не должен оказаться: банки, госуслуги (часто ломаются через VPN из-за
-fraud-detection), корпоративные LAN-сервисы, healthcheck endpoints. Эти
-домены **никогда** не пробуются и не тоннелируются.
+- `manual-allow.txt` — домены **всегда** в туннеле, минуют probe. Для
+  L7-fingerprint blocks (`rutracker.org`) и операторских override'ов.
+- `manual-deny.txt` — домены **никогда** не пробуются и не
+  тоннелируются. Для банков, госуслуг, корпоративных LAN-сервисов,
+  healthcheck endpoints.
 
 ### Extensions
-
-Тематические allow-подборки, активируются одной строкой в конфиге:
 
 ```yaml
 allow_extensions:
@@ -230,49 +278,40 @@ allow_extensions:
   - tiktok
 ```
 
-Доступные пресеты:
+Каждый пресет — список доменов в `/opt/ladon/extensions/<name>.txt`,
+dnsmasq заносит IP в `ladon_manual` ipset на резолве. Доступные:
 
 | имя | покрытие |
 |---|---|
-| `ai` | OpenAI / ChatGPT, Anthropic / Claude |
+| `ai` | OpenAI/ChatGPT, Anthropic/Claude |
 | `twitch` | twitch.tv + CDN |
-| `tiktok` | TikTok / ByteDance overseas (core, regional CDN, backbone, SDK) |
+| `tiktok` | TikTok/ByteDance overseas (core, CDN, backbone, SDK) |
 
-Каждый пресет — список доменов в `/opt/ladon/extensions/<name>.txt`,
-который dnsmasq при резолве кладёт в `ladon_manual` ipset. Подробности и
-формат — в [release/extensions/README.md](release/extensions/README.md).
-Свои подборки (allow или deny) кладутся в тот же каталог и подключаются
-по имени.
+Свои allow/deny подборки кладутся в тот же каталог, подключаются по
+имени. Формат — в [release/extensions/README.md](release/extensions/README.md).
 
 ### Exit-compare
-
-Опционально включает arbitration через второй vantage point.
-Поднимается probe-server в любой out-of-RU точке (чужой VPS, residential
-ISP в другой стране, 4G-модем), указывается в конфиге:
 
 ```yaml
 probe:
   mode: exit-compare
   remote:
-    url: https://my-probe-server.example.com/probe
-    auth_value: Bearer mysecrettoken
+    url: https://probe-server.example.com/probe
+    timeout: 2s
+    auth_header: Authorization
+    auth_value: Bearer <token>
 ```
 
-HTTP-контракт probe-server'а описан в
-[`docs/probe-api.md`](docs/probe-api.md). Референсная Go-реализация —
-[`probe-server/ladon/`](probe-server/ladon/), переиспользует тот же
-probe-pipeline что engine, чтобы local и remote стадии были семантически
-идентичны.
+HTTP-контракт — в [`docs/probe-api.md`](docs/probe-api.md). Референсная
+Go-реализация probe-server'а — [`probe-server/ladon/`](probe-server/ladon/),
+переиспользует тот же `internal/prober.LocalProber`, чтобы local и remote
+стадии были семантически идентичны (любое расхождение — про сетевой
+путь, не про probe-логику).
 
-### Очистка состояния
+### Prune
 
-`ladon prune` сбрасывает накопленные таблицы: `cache_entries`,
-`hot_entries`, `probes`. Используется обычно после изменения логики probe
-(включили exit-compare и хочется отсеять старые вердикты, набранные
-старым алгоритмом) или для подрезания истории. Поддерживается
-`-dry-run`, временные фильтры через `-before <RFC3339>`, и комбинации
-флагов. Полная справка — `ladon prune -h`.
-
-После prune движок сам сбрасывает `state` в `new` для доменов, у которых
-не осталось активных записей — они пройдут пайплайн заново на следующем
-DNS-запросе.
+`ladon prune` чистит `hot_entries` / `cache_entries` / `probes` —
+обычно после смены probe-логики или для подрезания истории.
+Поддерживает `-dry-run`, `-before <RFC3339>`, комбинации флагов.
+Полная справка — `ladon prune -h`. После prune `state` сбрасывается в
+`new` для доменов без активных записей.
