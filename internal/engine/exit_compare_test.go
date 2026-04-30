@@ -55,7 +55,7 @@ func TestExitCompare_RemoteOKConfirmsHot(t *testing.T) {
 
 	cfg := Defaults("/dev/null")
 	cfg.ProbeTimeout = 200 * time.Millisecond
-	cfg.LocalProber = prober.NewLocal(cfg.ProbeTimeout)
+	cfg.LocalProber = prober.NewLocal(cfg.ProbeTimeout, prober.DefaultFingerprint)
 	cfg.RemoteProber = prober.NewRemote(srv.URL, "", "", time.Second)
 
 	trigger := make(chan struct{}, 1)
@@ -107,7 +107,7 @@ func TestExitCompare_RemoteFailOverrulesLocalHot(t *testing.T) {
 
 	cfg := Defaults("/dev/null")
 	cfg.ProbeTimeout = 200 * time.Millisecond
-	cfg.LocalProber = prober.NewLocal(cfg.ProbeTimeout)
+	cfg.LocalProber = prober.NewLocal(cfg.ProbeTimeout, prober.DefaultFingerprint)
 	cfg.RemoteProber = prober.NewRemote(srv.URL, "", "", time.Second)
 
 	trigger := make(chan struct{}, 1)
@@ -148,7 +148,7 @@ func TestExitCompare_RemoteTransportFailureKeepsHot(t *testing.T) {
 
 	cfg := Defaults("/dev/null")
 	cfg.ProbeTimeout = 200 * time.Millisecond
-	cfg.LocalProber = prober.NewLocal(cfg.ProbeTimeout)
+	cfg.LocalProber = prober.NewLocal(cfg.ProbeTimeout, prober.DefaultFingerprint)
 	// Point at a port no one listens on — RemoteProber returns
 	// FailureReason="remote:dial tcp 127.0.0.1:1: connect: connection refused"
 	cfg.RemoteProber = prober.NewRemote("http://127.0.0.1:1", "", "", 200*time.Millisecond)
@@ -197,7 +197,7 @@ func TestExitCompare_InlinePathSkipsRemote(t *testing.T) {
 
 	cfg := Defaults("/dev/null")
 	cfg.ProbeTimeout = 200 * time.Millisecond
-	cfg.LocalProber = prober.NewLocal(cfg.ProbeTimeout)
+	cfg.LocalProber = prober.NewLocal(cfg.ProbeTimeout, prober.DefaultFingerprint)
 	cfg.RemoteProber = prober.NewRemote(srv.URL, "", "", time.Second)
 
 	trigger := make(chan struct{}, 1)

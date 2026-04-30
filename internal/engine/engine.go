@@ -166,7 +166,7 @@ func Defaults(logPath string) Config {
 // Run starts all pipeline stages and blocks until ctx is cancelled.
 func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	if cfg.LocalProber == nil {
-		cfg.LocalProber = prober.NewLocal(cfg.ProbeTimeout)
+		cfg.LocalProber = prober.NewLocal(cfg.ProbeTimeout, prober.DefaultFingerprint)
 	}
 	if cfg.RemoteProber != nil {
 		log.Printf("probe backends: %s (baseline) + %s (exit-compare)",
@@ -504,10 +504,11 @@ func reasonFromProbe(r prober.Result) string {
 
 // isRemoteTransportFailure reports whether a remote prober result represents
 // the prober itself being unreachable (network error, timeout, non-200) rather
-// than a real verdict from a working remote. RemoteProber.Probe prefixes those
-// reasons with "remote:" — see internal/prober/remote.go failedRemote.
+// than a real verdict from a working remote. Modern remotes set
+// FailureCode=remote_unreachable; older ones only set the legacy
+// "remote:..." reason prefix, which the prober still recognises.
 func isRemoteTransportFailure(r prober.Result) bool {
-	return strings.HasPrefix(r.FailureReason, "remote:")
+	return r.IsRemoteTransportFailure() || strings.HasPrefix(r.FailureReason, "remote:")
 }
 
 func runPublisher(ctx context.Context, store *storage.Store, cfg Config) error {

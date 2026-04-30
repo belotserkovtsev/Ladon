@@ -32,6 +32,21 @@ func TestClassify(t *testing.T) {
 			in:   prober.Result{DNSOK: true, TCPOK: true, TLSOK: true},
 			want: Ignore,
 		},
+		{
+			name: "tls ok, http cutoff → hot (L7 DPI severs stream)",
+			in:   prober.Result{DNSOK: true, TCPOK: true, TLSOK: true, HTTPOK: ptrBool(false)},
+			want: Hot,
+		},
+		{
+			name: "tls ok, http ok → ignore (real end-to-end response)",
+			in:   prober.Result{DNSOK: true, TCPOK: true, TLSOK: true, HTTPOK: ptrBool(true)},
+			want: Ignore,
+		},
+		{
+			name: "tls ok, http nil (older remote) → ignore (back-compat)",
+			in:   prober.Result{DNSOK: true, TCPOK: true, TLSOK: true},
+			want: Ignore,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -41,3 +56,5 @@ func TestClassify(t *testing.T) {
 		})
 	}
 }
+
+func ptrBool(b bool) *bool { return &b }

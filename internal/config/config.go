@@ -66,6 +66,11 @@ type ProbeSection struct {
 	Interval    time.Duration `yaml:"interval"`
 	Batch       int           `yaml:"batch"`
 
+	// TLSFingerprint selects which browser ClientHello uTLS will mimic at
+	// the TLS stage. Empty falls back to prober.DefaultFingerprint
+	// (chrome_120). Operators usually leave this unset.
+	TLSFingerprint prober.Fingerprint `yaml:"tls_fingerprint"`
+
 	Remote RemoteSection `yaml:"remote"`
 }
 
@@ -124,6 +129,9 @@ func (f *File) Validate() error {
 	if f.Probe.Mode == "exit-compare" && f.Probe.Remote.URL == "" {
 		return prober.ErrEmptyURL
 	}
+	if f.Probe.TLSFingerprint != "" && !prober.IsKnownFingerprint(f.Probe.TLSFingerprint) {
+		return fmt.Errorf("probe.tls_fingerprint: unknown %q (want chrome_120|firefox_120|ios_14|go_default)", f.Probe.TLSFingerprint)
+	}
 	// A preset listed on both sides would load the same file into both
 	// manual_entries tiers — operator confusion, not a useful intent.
 	for _, a := range f.AllowExtensions {
@@ -139,7 +147,11 @@ func (f *File) Validate() error {
 // BuildLocalProber returns the always-on local backend used by the inline
 // fast-path and as the batch worker baseline. Safe to call on a nil receiver.
 func (f *File) BuildLocalProber(probeTimeout time.Duration) prober.Prober {
-	return prober.NewLocal(probeTimeout)
+	var fp prober.Fingerprint
+	if f != nil {
+		fp = f.Probe.TLSFingerprint
+	}
+	return prober.NewLocal(probeTimeout, fp)
 }
 
 // BuildRemoteProber returns the optional exit-compare validator, or nil when
