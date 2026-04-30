@@ -4,7 +4,7 @@
 
 # 🩸 Ladon
 
-**Автоматический split-tunneling для VPN-шлюзов в сетях с DPI**
+**Реактивный Anti-DPI движок**
 
 [![CI](https://github.com/belotserkovtsev/ladon/actions/workflows/ci.yml/badge.svg)](https://github.com/belotserkovtsev/ladon/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/belotserkovtsev/ladon?include_prereleases&sort=semver)](https://github.com/belotserkovtsev/ladon/releases)
@@ -13,20 +13,7 @@
 
 </div>
 
-Ladon наблюдает трафик клиентов шлюза, проверяет домены на достижимость и строит список из ip-адресов, подверженных DPI-блокировкам. **За доли секунды**
-
-Задуман для WireGuard-шлюзов с `dnsmasq` и апстрим-туннелем наружу,
-но легко адаптируется под любой стек с fwmark-routing и ipset.
-
----
-
-## 🩸 Ключевые возможности
-
-- **Auto-discovery** — probe-driven обнаружение DPI-заблокированных доменов из живого трафика, без ручных списков
-- **Sub-second routing** — от первого DNS-запроса клиента до правила в kernel ipset в среднем 0.5с
-- **Долговременная память** — нестабильные блоки исчезают сами через 24ч, стабильные оседают в постоянный cache (≥50 fails / 24ч)
-- **Exit-compare валидатор** (опционально) — отдельный probe-сервер на residential ISP / 4G / офшоре отсеивает методологические False Positive
--  **Curated extensions** — готовые allow-подборки (`ai`, `twitch`, `tiktok`, ...) подключаются одной строкой в YAML; deny-списки оператор ведёт сам или пишет свой deny-preset
+Ladon реактивно наблюдает DNS-трафик клиентов шлюза, четырёхстадийной пробой (DNS → TCP:443 → TLS handshake → HTTP read до 32KB) идентифицирует реальные DPI-блокировки и собирает IP в kernel ipset для tunnel-routing. **За доли секунды**
 
 ---
 
@@ -40,15 +27,6 @@ curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/ins
 ---
 
 ## 🔬 Методология
-
-### Постановка задачи
-
-Дано: домен `X`, к которому клиент обратился. Классифицировать: **DPI
-режет связь к `X`** или нет. Классификация бинарная — `Hot`
-(тоннелировать) или `Ignore` (направлять напрямую). Минимизируем оба
-типа ошибок: false-positive (не тоннелировать что не нужно — лишний шум,
-оверюзат туннеля) и false-negative (не пропустить реальный блок — иначе
-клиент видит "не открывается").
 
 ### Источник наблюдений — реактивная подписка
 
