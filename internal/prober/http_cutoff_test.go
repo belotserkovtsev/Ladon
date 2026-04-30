@@ -28,7 +28,7 @@ func TestHTTPCutoff_FullResponse(t *testing.T) {
 
 	host, port := splitHostPort(t, srv.Listener.Addr().String())
 	r := Result{Domain: "example.com", ResolvedIPs: []string{host}}
-	conn := probeTLSStaged(&r, host, port, 2*time.Second)
+	conn := probeTLSStaged(&r, host, port, 2*time.Second, DefaultFingerprint)
 	if conn == nil {
 		t.Fatalf("TLS handshake failed: %s / %s", r.FailureCode, r.FailureReason)
 	}
@@ -50,7 +50,7 @@ func TestHTTPCutoff_404(t *testing.T) {
 
 	host, port := splitHostPort(t, srv.Listener.Addr().String())
 	r := Result{Domain: "example.com", ResolvedIPs: []string{host}}
-	conn := probeTLSStaged(&r, host, port, 2*time.Second)
+	conn := probeTLSStaged(&r, host, port, 2*time.Second, DefaultFingerprint)
 	if conn == nil {
 		t.Fatalf("TLS handshake failed")
 	}
@@ -150,7 +150,7 @@ func TestHTTPCutoff_StreamSevered(t *testing.T) {
 
 	host, port := splitHostPort(t, ln.Addr().String())
 	r := Result{Domain: "example.com", ResolvedIPs: []string{host}}
-	conn := probeTLSStaged(&r, host, port, 2*time.Second)
+	conn := probeTLSStaged(&r, host, port, 2*time.Second, DefaultFingerprint)
 	if conn == nil {
 		t.Fatalf("TLS handshake failed: %s / %s", r.FailureCode, r.FailureReason)
 	}

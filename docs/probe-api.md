@@ -30,6 +30,19 @@ Authorization: <header-value>     ; только если настроено
 `https://` — обе допустимы; для продакшена настоятельно рекомендуется
 TLS либо размещение проб-сервера в доверенной сети.
 
+### TLS-fingerprint sync (probe-v2.5+)
+
+Начиная с v1.0.0-rc5 ладон делает TLS-handshake через `uTLS` с мимикрией
+ClientHello браузера (`probe.tls_fingerprint`, default `chrome_120`). Это
+закрывает класс L7-blindspot'ов где DPI блочит `Chrome`/`Safari` ClientHello,
+но пропускает Go-default fingerprint — без мимикрии local probe говорит
+"OK" а реальный браузер не открывается.
+
+При `probe.mode: exit-compare` оба vantage (engine-side и probe-server)
+**обязаны** использовать тот же fingerprint, иначе local FAIL + remote OK
+становится false-positive (различие — не DPI, а fingerprint mismatch).
+Reference probe-server принимает `-fingerprint` flag для синхронизации.
+
 ## Запрос
 
 ```json

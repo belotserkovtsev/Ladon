@@ -166,7 +166,7 @@ func Defaults(logPath string) Config {
 // Run starts all pipeline stages and blocks until ctx is cancelled.
 func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	if cfg.LocalProber == nil {
-		cfg.LocalProber = prober.NewLocal(cfg.ProbeTimeout)
+		cfg.LocalProber = prober.NewLocal(cfg.ProbeTimeout, prober.DefaultFingerprint)
 	}
 	if cfg.RemoteProber != nil {
 		log.Printf("probe backends: %s (baseline) + %s (exit-compare)",
