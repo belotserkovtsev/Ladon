@@ -48,6 +48,7 @@ type RemoteResponse struct {
 	TLSOK         bool     `json:"tls_ok"`
 	TLS12OK       *bool    `json:"tls12_ok,omitempty"` // optional; populated by probe-v2 remotes
 	TLS13OK       *bool    `json:"tls13_ok,omitempty"` // optional; populated by probe-v2 remotes
+	HTTPOK        *bool    `json:"http_ok,omitempty"`  // optional; populated by probe-v2 remotes
 	ResolvedIPs   []string `json:"resolved_ips,omitempty"`
 	FailureReason string   `json:"reason,omitempty"`
 	FailureCode   string   `json:"code,omitempty"`
@@ -140,6 +141,7 @@ func (p *RemoteProber) Probe(ctx context.Context, domain string, ips []string) R
 		TLSOK:         rr.TLSOK,
 		TLS12OK:       rr.TLS12OK,
 		TLS13OK:       rr.TLS13OK,
+		HTTPOK:        rr.HTTPOK,
 		ResolvedIPs:   resolved,
 		FailureCode:   code,
 		FailureReason: rr.FailureReason,

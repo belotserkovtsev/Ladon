@@ -6,7 +6,7 @@
 заход через мобильный SIM-модем, headless-браузер и т.д.), главное —
 соблюдать формат запроса и ответа.
 
-Референсная имплементация на Go — в [`examples/probe-server/`](../examples/probe-server/).
+Референсная имплементация на Go — в [`probe-server/ladon/`](../probe-server/ladon/).
 
 ## Когда ладон вызывает remote
 
@@ -130,7 +130,7 @@ while true; do
 done
 ```
 
-На Go — см. `examples/probe-server/main.go`.
+На Go — см. `probe-server/ladon/main.go`. Эта референсная имплементация теперь напрямую переиспользует `internal/prober.LocalProber` — то есть remote-вантаж проходит **те же самые стадии** что и local (DNS → TCP → TLS-split → HTTP-cutoff). exit-compare становится семантически чистым: расхождение между local/remote означает разницу сетевого пути, а не разницу в probe-логике.
 
 ## Безопасность
 

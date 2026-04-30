@@ -62,6 +62,67 @@ func TestHTTPCutoff_404(t *testing.T) {
 	}
 }
 
+// TestSetHTTPFail_MTLSWhitelist — feeds setHTTPFail an error string in the
+// exact format Go produces on Linux when a peer alert is received during
+// HTTP read (this is what jupiter saw for Apple Push / FindMy: "remote
+// error: tls: certificate required"). Exercises the production code path
+// without depending on Go's TLS handshake alert-timing, which differs by
+// platform and Go version.
+func TestSetHTTPFail_MTLSWhitelist(t *testing.T) {
+	cases := []struct {
+		name     string
+		errMsg   string
+		wantCode FailureCode
+		wantOK   bool
+	}{
+		{
+			name:     "alert 116 cert required → mtls_required, reachable",
+			errMsg:   "remote error: tls: certificate required",
+			wantCode: CodeMTLSRequired,
+			wantOK:   true,
+		},
+		{
+			name:     "alert 47 illegal parameter → tls_alert, reachable",
+			errMsg:   "remote error: tls: illegal parameter",
+			wantCode: CodeTLSAlert,
+			wantOK:   true,
+		},
+		{
+			name:     "alert 40 handshake failure → tls_alert, reachable",
+			errMsg:   "remote error: tls: handshake failure",
+			wantCode: CodeTLSAlert,
+			wantOK:   true,
+		},
+		{
+			name:     "plain RST → http_reset, NOT reachable",
+			errMsg:   "read tcp: connection reset by peer",
+			wantCode: CodeHTTPError, // string doesn't match ECONNRESET errors.Is wrapping; categorize falls through to stage error
+			wantOK:   false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := Result{}
+			setHTTPFail(&r, stageHTTP, &stringErr{tc.errMsg})
+			if r.FailureCode != tc.wantCode {
+				t.Errorf("FailureCode=%q want %q", r.FailureCode, tc.wantCode)
+			}
+			if r.HTTPOK == nil {
+				t.Fatal("HTTPOK=nil; setHTTPFail must always set HTTPOK")
+			}
+			if *r.HTTPOK != tc.wantOK {
+				t.Errorf("HTTPOK=%v want %v", *r.HTTPOK, tc.wantOK)
+			}
+		})
+	}
+}
+
+// stringErr is a minimal error that lets us inject an arbitrary error
+// message without smuggling syscall errno chains.
+type stringErr struct{ msg string }
+
+func (e *stringErr) Error() string { return e.msg }
+
 // TestHTTPCutoff_StreamSevered — TLS server that completes the handshake
 // then immediately closes the underlying conn before sending any HTTP
 // response bytes. Mimics a DPI cutting at the application layer.

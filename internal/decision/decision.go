@@ -11,7 +11,9 @@
 // HTTPOK is tri-state: nil means the probe didn't run the HTTP stage (older
 // remote prober, manual call site that skipped) — fall back to TCP+TLS
 // verdict only. ptr(false) means we tried and got severed; ptr(true) means
-// we read a real response.
+// we read a real response OR the server actively rejected with a typed
+// TLS alert (mTLS challenge etc., handled inside prober — see
+// prober.IsServerReachable). Either way the path is reachable, so Ignore.
 package decision
 
 import "github.com/belotserkovtsev/ladon/internal/prober"

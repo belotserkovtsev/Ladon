@@ -34,6 +34,13 @@ const (
 	CodeTLSAlert            FailureCode = "tls_alert"
 	CodeTLSError            FailureCode = "tls_error"
 
+	// CodeMTLSRequired is TLS alert 116 (certificate_required, RFC 8446 §6).
+	// Server explicitly told us it needs a client certificate — proves the
+	// server is reachable and that the failure is a server-side policy
+	// decision, not a DPI block. Apple Push, FindMy, iCloud Private Relay
+	// all use this. Treated as reachable in decision.Classify.
+	CodeMTLSRequired FailureCode = "mtls_required"
+
 	// CodeTLS13Block is set when TLS 1.3 fails but a 1.2-restricted retry
 	// succeeds — strong hint that ClientHello inspection is targeting 1.3
 	// (ECH/ESNI). Real-world signal for some RU-DPI deployments.
@@ -96,6 +103,40 @@ func categorize(stage string, err error) FailureCode {
 		return CodeTCPUnreachable
 	}
 
+	// TLS alert from the server — a typed signal that the server is alive
+	// and explicitly rejected our connection. Distinct from a silent EOF
+	// or a TCP-level cut. Whitelisted in decision: server is reachable,
+	// not DPI. Must be checked BEFORE io.EOF because some alerts arrive
+	// wrapped through the EOF chain on read errors.
+	//
+	// Detection is via string-match because Go's stdlib uses an internal
+	// unexported `tls.alert` type for received peer alerts (the exported
+	// tls.AlertError is only wrapped for QUIC transports). errors.As on
+	// tls.AlertError is therefore unreliable for non-QUIC; we still try
+	// the typed path first for correctness on QUIC + future Go versions
+	// that may unify the types.
+	var alert tls.AlertError
+	if errors.As(err, &alert) {
+		if uint8(alert) == 116 {
+			return CodeMTLSRequired
+		}
+		return CodeTLSAlert
+	}
+	if rh := (tls.RecordHeaderError{}); errors.As(err, &rh) {
+		return CodeTLSAlert
+	}
+	// String fallback for Go's internal tls.alert wrapping. Covers the
+	// "remote error: tls: <description>" format Conn.in errors take. The
+	// description set is small and stable (alertText in crypto/tls/alert.go).
+	if errStr := err.Error(); strings.Contains(errStr, "remote error: tls:") {
+		// alert 116 has the description "certificate required" — special-case
+		// for mTLS observability before falling back to generic tls_alert.
+		if strings.Contains(errStr, "certificate required") {
+			return CodeMTLSRequired
+		}
+		return CodeTLSAlert
+	}
+
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		switch stage {
 		case stageTLS:
@@ -103,15 +144,6 @@ func categorize(stage string, err error) FailureCode {
 		case stageHTTP:
 			return CodeHTTPCutoff
 		}
-	}
-
-	// TLS alert / record header — handshake actually started but server (or
-	// middlebox) rejected it. Distinct from a silent EOF.
-	if rh := (tls.RecordHeaderError{}); errors.As(err, &rh) {
-		return CodeTLSAlert
-	}
-	if alert := (*tls.AlertError)(nil); errors.As(err, &alert) {
-		return CodeTLSAlert
 	}
 
 	if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
@@ -184,9 +216,23 @@ func parseCode(reason string) FailureCode {
 	case CodeDNSNXDomain, CodeDNSTimeout, CodeDNSError, CodeNoIPs,
 		CodeTCPRefused, CodeTCPReset, CodeTCPTimeout, CodeTCPUnreachable, CodeTCPError,
 		CodeTLSHandshakeTimeout, CodeTLSEOF, CodeTLSReset, CodeTLSAlert, CodeTLSError, CodeTLS13Block,
+		CodeMTLSRequired,
 		CodeHTTPCutoff, CodeHTTPTimeout, CodeHTTPReset, CodeHTTPError,
 		CodeRemote, CodeUnknown:
 		return FailureCode(prefix)
 	}
 	return CodeUnknown
+}
+
+// IsServerReachable reports whether a FailureCode represents a typed
+// signal that the server is alive and reachable — even though the probe
+// "failed" in the strict TCP+TLS+HTTP-success sense. These codes come from
+// the server actively responding (TLS alerts, mTLS challenges) rather than
+// DPI silently dropping or resetting. The engine treats them as Ignore.
+func IsServerReachable(c FailureCode) bool {
+	switch c {
+	case CodeTLSAlert, CodeMTLSRequired:
+		return true
+	}
+	return false
 }

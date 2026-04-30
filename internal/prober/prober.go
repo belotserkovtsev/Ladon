@@ -194,7 +194,11 @@ func probeTCPTLS(ctx context.Context, r Result, started time.Time, timeout time.
 // probe and decision rules.
 // probeTLSStaged returns a live *tls.Conn on success so the caller can
 // keep probing on the same connection (HTTP cutoff detection). Caller must
-// close the conn. Returns nil when both 1.3 and 1.2 attempts fail.
+// close the conn. Returns nil when both 1.3 and 1.2 attempts fail OR when
+// the failure is server-reachable (typed TLS alert) — in the latter case
+// TLSOK and HTTPOK are set to true so decision.Classify treats the result
+// as Ignore. mTLS-required servers (Apple Push, iCloud Private Relay) hit
+// this path.
 func probeTLSStaged(r *Result, ip, port string, timeout time.Duration) *tls.Conn {
 	conn, code, reason, version := tlsHandshake(ip, port, r.Domain, timeout, 0)
 	if conn != nil {
@@ -202,8 +206,24 @@ func probeTLSStaged(r *Result, ip, port string, timeout time.Duration) *tls.Conn
 		recordTLSVersion(r, version)
 		return conn
 	}
-	// 1.3 (or whatever the unrestricted attempt picked) failed. Stash the
-	// error so it survives if the 1.2 retry also fails.
+	// First attempt failed. Two sub-cases:
+	//  1. Server actively rejected with a TLS alert → server is reachable,
+	//     no point retrying with 1.2 (the rejection is typically policy,
+	//     not version). Surface via TLSOK=true + HTTPOK=true so Classify
+	//     gives Ignore, but keep the code/reason for observability.
+	//  2. Real failure (timeout, RST, EOF, etc.) → fall through to the
+	//     1.2 retry path that distinguishes ClientHello-targeted DPI.
+	if IsServerReachable(code) {
+		r.TLSOK = true
+		t := true
+		r.HTTPOK = &t
+		r.FailureCode = code
+		r.FailureReason = reason
+		return nil
+	}
+
+	// Real failure path. Stash the error so it survives if the 1.2 retry
+	// also fails.
 	r.FailureCode = code
 	r.FailureReason = reason
 	f := false
@@ -213,7 +233,7 @@ func probeTLSStaged(r *Result, ip, port string, timeout time.Duration) *tls.Conn
 	// underlying socket too. We already paid for one failed handshake so
 	// this can stretch latency, but it's the price of distinguishing
 	// "real block" from "1.3-only block".
-	conn2, _, _, _ := tlsHandshake(ip, port, r.Domain, timeout, tls.VersionTLS12)
+	conn2, code2, _, _ := tlsHandshake(ip, port, r.Domain, timeout, tls.VersionTLS12)
 	if conn2 != nil {
 		t := true
 		r.TLS12OK = &t
@@ -224,6 +244,16 @@ func probeTLSStaged(r *Result, ip, port string, timeout time.Duration) *tls.Conn
 		r.FailureCode = CodeOK
 		r.FailureReason = ""
 		return conn2
+	}
+	// 1.2 also failed — but if it failed with a server-reachable code,
+	// trust that signal over the 1.3 result.
+	if IsServerReachable(code2) {
+		r.TLSOK = true
+		t := true
+		r.HTTPOK = &t
+		r.FailureCode = code2
+		r.FailureReason = formatReason(code2, nil)
+		return nil
 	}
 	r.TLS12OK = &f
 	return nil
@@ -316,10 +346,21 @@ func probeHTTPStaged(r *Result, conn *tls.Conn, timeout time.Duration) {
 }
 
 func setHTTPFail(r *Result, stage string, err error) {
+	code := categorize(stage, err)
+	r.FailureCode = code
+	r.FailureReason = formatReason(code, err)
+	// If the server is the source of the rejection (typed TLS alert during
+	// HTTP read — typical for post-handshake mTLS challenges like Apple
+	// Push / FindMy / iCloud Private Relay), treat as reachable. The
+	// failure code stays for observability; HTTPOK flips to true so
+	// decision.Classify gives Ignore.
+	if IsServerReachable(code) {
+		t := true
+		r.HTTPOK = &t
+		return
+	}
 	f := false
 	r.HTTPOK = &f
-	r.FailureCode = categorize(stage, err)
-	r.FailureReason = formatReason(r.FailureCode, err)
 }
 
 // ErrNoDomain signals an empty input.

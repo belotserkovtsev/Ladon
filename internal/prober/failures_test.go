@@ -2,6 +2,7 @@ package prober
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"net"
 	"syscall"
@@ -88,14 +89,55 @@ func TestFormatReason(t *testing.T) {
 	}
 }
 
+func TestCategorizeTLSAlert(t *testing.T) {
+	// alert 116 = certificate_required (TLS 1.3 RFC 8446 §6) — Apple Push,
+	// FindMy, iCloud Private Relay. Must surface as a server-reachable signal,
+	// not a generic tls_alert, so deploy logs/SQL can distinguish mTLS-driven
+	// rejections from arbitrary alerts.
+	if got := categorize(stageTLS, tls.AlertError(116)); got != CodeMTLSRequired {
+		t.Errorf("alert 116 → %q want %q", got, CodeMTLSRequired)
+	}
+	// alert 47 = illegal_parameter (mask.icloud.com / mask.apple-dns.net
+	// reject our ClientHello). Server-reachable but not an mTLS challenge.
+	if got := categorize(stageTLS, tls.AlertError(47)); got != CodeTLSAlert {
+		t.Errorf("alert 47 → %q want %q", got, CodeTLSAlert)
+	}
+	// Wrapped through io.EOF chain — common in HTTP-stage post-handshake
+	// alerts. categorize must see the alert through the wrap, not bail at
+	// the EOF check.
+	wrapped := errors.Join(tls.AlertError(116), errors.New("read failure"))
+	if got := categorize(stageHTTP, wrapped); got != CodeMTLSRequired {
+		t.Errorf("wrapped alert 116 in HTTP stage → %q want %q", got, CodeMTLSRequired)
+	}
+}
+
+func TestIsServerReachable(t *testing.T) {
+	want := map[FailureCode]bool{
+		CodeOK:                  false,
+		CodeMTLSRequired:        true,
+		CodeTLSAlert:            true,
+		CodeHTTPCutoff:          false,
+		CodeHTTPReset:           false,
+		CodeTCPTimeout:          false,
+		CodeTLSHandshakeTimeout: false,
+	}
+	for code, expect := range want {
+		if got := IsServerReachable(code); got != expect {
+			t.Errorf("IsServerReachable(%q) = %v want %v", code, got, expect)
+		}
+	}
+}
+
 func TestParseCode(t *testing.T) {
 	tests := map[string]FailureCode{
-		"":                            CodeOK,
-		"no_ips":                      CodeNoIPs,
-		"tcp_timeout: i/o timeout":    CodeTCPTimeout,
-		"tls13_block: handshake fail": CodeTLS13Block,
-		"remote:dial tcp 127.0.0.1":   CodeUnknown, // legacy "remote:..." prefix not in enum
-		"definitely_not_a_code":       CodeUnknown,
+		"":                                  CodeOK,
+		"no_ips":                            CodeNoIPs,
+		"tcp_timeout: i/o timeout":          CodeTCPTimeout,
+		"tls13_block: handshake fail":       CodeTLS13Block,
+		"mtls_required: tls: cert required": CodeMTLSRequired,
+		"tls_alert: alert 47":               CodeTLSAlert,
+		"remote:dial tcp 127.0.0.1":         CodeUnknown, // legacy "remote:..." prefix not in enum
+		"definitely_not_a_code":             CodeUnknown,
 	}
 	for in, want := range tests {
 		if got := parseCode(in); got != want {
