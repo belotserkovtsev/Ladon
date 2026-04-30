@@ -39,142 +39,217 @@ curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/ins
   | sudo bash
 ```
 
----
-
-## ⚡ Производительность
-
-**От первого DNS-запроса до правила в kernel ipset — полсекунды в среднем.** В постоянный список попадает только то, что подтвердилось ≥50 раз за сутки — моргания провайдера не доезжают.
-
-| Метрика | Значение |
-|---|---|
-| Реакция на новый блок | **0.3 – 1.1 с** (≈0.5 с) |
-| Пропускная способность | **~65 доменов/с** на 2 CPU |
-| Накладные расходы пайплайна | **~50 мс** сверх сети |
-| RSS | **~20 МБ** |
-
-Воспроизвести числа: `go test -run TestPipeline ./internal/engine/`
+Установщик кладёт бинарник в `/opt/ladon/`, состояние — в `/opt/ladon/state/engine.db`,
+конфигурацию — в `/etc/ladon/`, поднимает systemd-юнит `ladon.service`.
+Зависимости (`dnsmasq`, `ipset`, `iptables`) ставятся отдельно — это твой шлюз, мы не лезем в его базу.
 
 ---
 
-## 💡 Как это работает
+## 🔬 Методология
 
-```mermaid
-flowchart LR
-    Client([🖥 Клиент]) -->|"DNS-запрос"| DNS[dnsmasq]
-    DNS -->|"наблюдение"| Ladon{Ladon}
-    Ladon -->|"пробит достижимость"| Probe((TCP/TLS))
-    Probe -->|"работает"| Direct[🌐 direct]
-    Probe -->|"не работает"| Ipset[(kernel ipset)]
-    Ipset -->|"трафик к этим IP"| Tunnel[🔒 туннель]
+> **Главный вопрос:** когда клиент не может открыть сервис, как отличить
+> "DPI режет на пути" от "сервер сам не отвечает / геоблок / мёртв"?
 
-    classDef client fill:#e8f4fd,stroke:#1976d2,color:#0d47a1
-    classDef proc fill:#fff3e0,stroke:#ef6c00,color:#3e2723
-    classDef store fill:#fce4ec,stroke:#c2185b,color:#880e4f
-    classDef path fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
-    class Client client
-    class DNS,Ladon,Probe proc
-    class Ipset store
-    class Direct,Tunnel path
+Ответ — **многоуровневая проба** + **arbitration** + **temporal evidence**. Каждый уровень отсекает свой класс false-positive'ов.
+
+### Источник сигнала — пассивное наблюдение
+
+Probe не генерит синтетический трафик. Ladon читает `dnsmasq.log` (`log-queries=extra`) через fsnotify-tailer и реактивно пробивает только те домены, которые **реальные клиенты** запрашивали. Каждый probe-кандидат — это домен, к которому юзер уже пошёл.
+
+### Уровень 1 — stage-by-stage probe
+
 ```
-<details>
-<summary><b>🔌 Глубокая схема пайплайна</b></summary>
-
-```mermaid
-flowchart TB
-    subgraph observe["🔎 Наблюдение"]
-        direction LR
-        DNS[/"dnsmasq log<br/>log-queries=extra"/]
-        TAIL["tailer<br/><i>fsnotify, kernel events</i>"]
-        WATCH["watcher<br/><i>нормализация + ingest</i>"]
-        DOMS[("domains")]
-        CACHE[("dns_cache")]
-        DNS -->|строка лога| TAIL
-        TAIL -->|"query[A] X from peer"| WATCH
-        TAIL -->|"reply X is IP"| CACHE
-        WATCH --> DOMS
-    end
-
-    subgraph decide["🩺 Проверка и вердикт"]
-        direction LR
-        WORKER["probe-worker<br/><i>batch раз в 2с</i>"]
-        PROBE["prober<br/><i>TCP + TLS-SNI<br/>параллельные dials</i>"]
-        DEC{{"decision"}}
-        HOT[("hot_entries<br/>TTL 24ч")]
-        IGN["state = ignore"]
-        WORKER -->|"кандидаты из domains"| PROBE
-        PROBE --> DEC
-        DEC -->|"TCP/TLS fail"| HOT
-        DEC -->|"direct OK"| IGN
-    end
-
-    subgraph promote["🧠 Долгосрочная память"]
-        direction LR
-        SCORE["scorer<br/><i>раз в 10 мин</i>"]
-        CEN[("cache_entries<br/>без TTL")]
-        SCORE -->|"≥50 fails / 24ч"| CEN
-    end
-
-    subgraph apply["⚙️ Применение (kernel)"]
-        direction LR
-        SYNC["ipset-syncer<br/><i>event-driven + 30с safety</i>"]
-        MAN[("manual-allow + extensions")]
-        DNSMASQ["dnsmasq<br/><i>ipset= directives</i>"]
-        ENG[("kernel ipset<br/>ladon_engine")]
-        MNL[("kernel ipset<br/>ladon_manual")]
-        IPT["iptables mangle"]
-        TUN["→ upstream tunnel"]
-        DIR["→ direct egress"]
-        SYNC -->|"ipset add / del"| ENG
-        MAN -->|"writes ipset= dirs"| DNSMASQ
-        DNSMASQ -->|"sync на резолве,<br/>walks CNAME"| MNL
-        ENG --> IPT
-        MNL --> IPT
-        IPT -->|"dst ∈ ladon_*<br/>MARK 0x1"| TUN
-        IPT -->|"иначе"| DIR
-    end
-
-    TAIL -. "inline fast-path<br/>(для нового домена)" .-> PROBE
-    DOMS --> WORKER
-    CACHE -->|"точные IP"| PROBE
-    HOT --> SCORE
-    HOT --> SYNC
-    CEN --> SYNC
-
-    classDef store fill:#e8f4fd,stroke:#1976d2,color:#0d47a1
-    classDef proc fill:#fff3e0,stroke:#ef6c00,color:#3e2723
-    classDef decisionNode fill:#fce4ec,stroke:#c2185b,color:#880e4f
-    classDef kernelNode fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
-    classDef source fill:#f3e5f5,stroke:#6a1b9a,color:#4a148c
-    class DNS source
-    class TAIL,WATCH,WORKER,PROBE,SCORE,SYNC,DNSMASQ proc
-    class DOMS,CACHE,HOT,CEN,MAN store
-    class DEC decisionNode
-    class ENG,MNL,IPT,TUN,DIR,IGN kernelNode
+[DNS] ──► [TCP:443] ──► [TLS handshake] ──► [HTTP read до 32KB]
+   │           │              │                     │
+   ▼           ▼              ▼                     ▼
+ NXDOMAIN    SYN drop      Server alert         поток обрублен,
+ timeout     RST           или ClientHello cut  garbage от DPI,
+                                                read timeout
 ```
 
-</details>
+Каждая стадия — отдельный класс failure'ов. Категории кодов:
 
-<details>
-<summary>🔌 Состояния домена</summary>
+| stage  | failure code              | что значит                                    |
+|--------|---------------------------|-----------------------------------------------|
+| dns    | `dns_nxdomain`            | домен не существует                           |
+| dns    | `dns_timeout`             | резолвер не отвечает                          |
+| tcp    | `tcp_timeout`             | SYN drop — классика RU-DPI на Meta IPs        |
+| tcp    | `tcp_reset`               | RST на SYN — active interception              |
+| tcp    | `tcp_refused`             | порт реально закрыт — **сервер**, не DPI      |
+| tcp    | `tcp_unreachable`         | ICMP unreachable                              |
+| tls    | `tls_handshake_timeout`   | ClientHello уехал, ничего обратно             |
+| tls    | `tls_reset`               | RST посреди handshake                         |
+| tls    | `tls_eof`                 | TCP закрылся "тихо" mid-handshake             |
+| tls    | `tls_alert`               | server активно ответил TLS alert              |
+| tls    | `mtls_required`           | alert 116 — Apple Push, FindMy, iCloud Relay  |
+| http   | `http_cutoff`             | поток обрублен mid-response                   |
+| http   | `http_reset`              | RST во время чтения тела                      |
+| http   | `http_timeout`            | поток stalled                                 |
+| http   | `http_error`              | гарбидж от DPI вместо валидного HTTP          |
 
-Состояние хранится в `domains.state`; «живые» списки для роутинга — в `hot_entries` и `cache_entries`.
+HTTP-стадия читает до 32KB — окно намеренно покрывает RU-DPI signature
+"обрыв CDN/хостинга на 14-34KB передачи".
 
-| Состояние | Что значит | Как попадает | Как уходит |
+### Уровень 2 — server-active vs path-active
+
+Ключевое различение для anti-FP:
+
+```
+┌─ server-active rejection (server сказал "нет") ──────────┐
+│  tcp_refused, tls_alert, mtls_required                   │
+│  → server reachable, отказ — его policy, не DPI          │
+│  → IGNORE (не тоннелируем)                               │
+└──────────────────────────────────────────────────────────┘
+
+┌─ path-active rejection (что-то режет на пути) ───────────┐
+│  *_timeout, *_reset, *_eof, http_cutoff, http_error      │
+│  → server-side не подтверждено, нужно arbitrate          │
+│  → HOT кандидат                                          │
+└──────────────────────────────────────────────────────────┘
+```
+
+`tls_alert` детектится через `errors.As(err, &tls.AlertError{})` плюс
+string-fallback на `"remote error: tls: ..."` (Go stdlib quirk: внутренний
+`tls.alert` ≠ exported `tls.AlertError` для non-QUIC transport).
+`mtls_required` отдельным кодом для observability.
+
+### Уровень 3 — exit-compare arbitration
+
+Path-active failures ещё не достаточно для Hot. Решение: **второе мнение из другого vantage'а**.
+
+```
+                один и тот же домен, та же проба
+                            │
+            ┌───────────────┴───────────────┐
+            ▼                               ▼
+    ┌───────────────┐              ┌────────────────┐
+    │  LOCAL probe  │              │  REMOTE probe  │
+    │  (gateway,    │              │  (out-of-region │
+    │   через ISP   │              │   probe-server) │
+    │   и DPI)      │              │                 │
+    └───────┬───────┘              └────────┬────────┘
+            │                               │
+            └─────────────┬─────────────────┘
+                          ▼
+                ┌─────────────────────────────┐
+                │   exit-compare matrix:      │
+                │                             │
+                │   L=OK              → IGNORE│  direct works
+                │   L=FAIL  R=OK      → HOT   │  real DPI
+                │   L=FAIL  R=FAIL    → IGNORE│  server-side, methodological FP
+                │   L=FAIL  R=dead    → HOT   │  no opinion, sticky local
+                └─────────────────────────────┘
+```
+
+`L=FAIL R=FAIL` — самый ценный кейс. Если **обе** точки видят failure,
+значит проблема **в самом сервере** или в общем пути за обоими vantage'ами,
+а не в DPI на пути конкретно local-клиента. Это отсекает FP типа "сервер
+mTLS-required" / "geoblock с обеих сторон" / "сервер просто медленный".
+
+Без exit-compare любой случайно медленный сервер попадал бы в Hot. С ним
+remaining false-positive rate падает до единиц процентов.
+
+### Уровень 4 — temporal arbitration (hot → cache)
+
+Один failure ≠ окончательный приговор. Сервер мог быть перегружен на
+момент пробы.
+
+```
+domain первый раз fail'ится
+         │
+         ▼
+   hot_entries (TTL 24h)
+         │  probe регулярно re-probes
+         │  если за 24h ≥50 fails → реально устойчиво
+         ▼
+   scorer promotion → cache_entries (no TTL)
+         │
+         ▼
+   считается надёжно заблокированным,
+   тоннелируется до явного re-evaluation
+```
+
+Threshold ≥50 fails / 24h при probe.cooldown=5min даёт минимум ~4 часов
+устойчивого failure'а — отсекает блипы провайдера.
+
+### Что **не** детектируется
+
+| класс блока | почему probe не видит | workaround |
+|---|---|---|
+| **L7-fingerprint** (DPI режет конкретный ClientHello, например Chrome 120) | probe использует Go's stdlib fingerprint — у него другой паттерн в ClientHello (порядок ciphers, отсутствие GREASE, ALPN list). DPI его не блеклистит → probe видит "OK" | `manual-allow.txt` — operator override |
+| **Throttling** (DPI шейпит до сотен кбит/с вместо блока) | probe видит "медленно но работает" → IGNORE | speed-probe (read 32KB с измерением throughput) — отдельная фаза |
+| **Domainless flows** (Telegram mobile / Discord voice / WhatsApp calls на hardcoded IP) | dnsmasq не получает DNS query → tailer ничего не пикапит | CIDR-extensions (bundled list known DC ranges) — отдельная фаза |
+| **DNS-only blocks** (DPI poison'ит ISP-resolver на NXDOMAIN) | ladon резолвит через `1.1.1.1@stun0` (свой VPN-туннель), не через ISP-resolver | использовать апстрим-DNS, который не cooperates с ISP |
+| **Адаптивный DPI** (блокирует первые попытки, пропускает повторные) | probe — статистический, повторяется, обычно выходит на устойчивое поведение | в большинстве случаев handled через temporal arbitration |
+
+### Архитектурно
+
+```
+                           clients (LAN)
+                                │
+                                │ DNS query
+                                ▼
+                   ┌───────────────────────┐
+                   │      dnsmasq.log      │
+                   └────────────┬──────────┘
+                                │ fsnotify tail
+                                ▼
+                   ┌───────────────────────┐
+                   │     tailer/watcher    │ ingest в SQLite
+                   └────────────┬──────────┘
+                                │
+              ┌─────────────────┴─────────────────┐
+              ▼                                   ▼
+     inline fast-path                       batch worker
+     (sub-second, local-only)               (interval 2s, batch 4)
+              │                                   │
+              ▼                                   ▼
+        ┌─────────────────────────────────────────────┐
+        │  prober: LocalProber + (опц.) RemoteProber  │
+        │  DNS → TCP → TLS-stage → HTTP-stage         │
+        └────────────────────┬────────────────────────┘
+                             ▼
+                   ┌──────────────────┐
+                   │ decision.Classify │ exit-compare matrix
+                   └────────┬──────────┘
+                            ▼
+              ┌──────────────────────────┐
+              │  hot_entries (TTL 24h)   │
+              └────────┬─────────────────┘
+                       │
+                       ▼ scorer (≥50 fails / 24h)
+              ┌──────────────────────────┐
+              │  cache_entries (no TTL)  │
+              └────────┬─────────────────┘
+                       │
+                       ▼ ipset-syncer
+                ┌────────────────┐
+                │ kernel ipset:  │
+                │ ladon_engine   │ probe-driven
+                │ ladon_manual   │ extensions + manual-allow
+                └────────┬───────┘
+                         │
+                         ▼ iptables mangle PREROUTING
+                  fwmark 0x1 → table 100 → tunnel
+```
+
+Состояние домена:
+
+| state | значит | как попадает | как уходит |
 |---|---|---|---|
-| `new` | Видели DNS-query, но ещё не пробовали коннектиться | Первая ingest-строка | После первого probe |
-| `ignore` | Прямой путь работает, туннель не нужен | Probe прошёл TCP+TLS | Следующий probe может вернуть в цикл, если начнёт падать |
-| `hot` | Probe обнаружил блок — домен временно в ipset | Probe упал на TCP или TLS | Запись в `hot_entries` снимается через 24 ч после последнего fail; при ≥50 подтверждениях scorer переводит в `cache` |
-| `cache` | Стабильно заблокирован, в ipset навсегда | Scorer: ≥50 fails за 24 ч | Только вручную (cache-demotion на обратном пробе — в бэклоге) |
-
-</details>
+| `new` | видели DNS-query, ещё не пробовали | первая ingest-строка | после первого probe |
+| `ignore` | direct работает, тоннель не нужен | probe прошёл все стадии (или server-active rejection) | следующий probe может вернуть в цикл |
+| `hot` | probe + arbitration сказали "блок" — в ipset на 24h | TLS/TCP/HTTP path-active fail + (если remote) подтверждение | TTL истёк ИЛИ scorer перевёл в cache |
+| `cache` | устойчивый блок — в ipset навсегда | scorer: ≥50 fails / 24h в hot | пока вручную (cache-demotion на обратном пробе — backlog) |
 
 ---
 
 ## 🛠 Конфигурация
 
-Основной способ — YAML-файл, путь которого передаётся флагом `-config`. Без файла движок едет на дефолтах из [`internal/engine/engine.go`](internal/engine/engine.go).
+YAML-файл, путь передаётся флагом `-config`. Без файла — дефолты из
+[`internal/engine/engine.go`](internal/engine/engine.go).
 
-Пример `/etc/ladon/config.yaml`:
+### Базовый конфиг
 
 ```yaml
 logfile: /var/log/dnsmasq.log
@@ -182,84 +257,117 @@ manual_allow: /etc/ladon/manual-allow.txt
 manual_deny: /etc/ladon/manual-deny.txt
 
 probe:
-  mode: local         # local | exit-compare
-  timeout: 800ms
-  cooldown: 5m
-  concurrency: 8
+  mode: local            # local | exit-compare
+  timeout: 800ms         # на стадию (DNS / TCP / TLS / HTTP)
+  cooldown: 5m           # минимальный интервал между probe одного домена
+  concurrency: 8         # семафор для inline fast-path
 
 scorer:
   interval: 10m
   window: 24h
-  fail_threshold: 50
+  fail_threshold: 50     # ≥N fails в window → промоушн hot → cache
 
 ipset:
-  engine_name: ladon_engine # probe-driven hot/cache
-  manual_name: ladon_manual # populates dnsmasq'ом для manual-allow + extensions
-  interval: 30s
+  engine_name: ladon_engine   # probe-driven hot/cache
+  manual_name: ladon_manual   # для manual-allow + extensions
+  interval: 30s               # safety reconcile, hot-events триггерят сразу
 
 hot_ttl: 24h
-dns_freshness: 6h
+dns_freshness: 6h        # после этого IP из dns_cache считается устаревшим
 ```
 
-### CLI-флаги
+### CLI
 
-Дополнение к YAML — для простых случаев и для разовых override'ов:
+Дополнение к YAML — для override на ходу:
 
 ```
-ladon -db <path> [-config <path>] run [-from-start] [-manual-allow <path>] [-manual-deny <path>] <dnsmasq-log-path>
+ladon -db <path> [-config <path>] run [-from-start] \
+  [-manual-allow <path>] [-manual-deny <path>] <dnsmasq-log-path>
 ```
 
-Пути (`-manual-allow`, `-manual-deny`) перебивают одноимённые поля YAML, если заданы оба. Тонкие knobs задаются только через файл.
+`-manual-allow` / `-manual-deny` перебивают одноимённые YAML-поля если оба заданы.
+Тонкие knobs (timeouts, scorer, ipset) — только через файл.
 
-### Extensions — преднастроенные allow/deny-списки
+### Manual lists
 
-Ladon шипает **allow-подборки** доменов — сервисы, которые гео-блокируют российский регион со своей стороны (probe их распознать не может — TLS handshake проходит, но сервис говорит «not available in your country»).
+Два файла, по одному домену на строку, `#` — комментарий, поддерживаются eTLD+1 apex'ы (покрывают все subdomain'ы).
 
-Для deny-списков механизм работает зеркально через `deny_extensions:`, но **bundled deny-пресетов не шипается** — что держать вне тоннеля зависит от среды оператора. Ведите список в `/etc/ladon/manual-deny.txt` или напишите свой deny-preset.
+```
+/etc/ladon/manual-allow.txt   # домены, которые ВСЕГДА в туннеле (минуют probe)
+/etc/ladon/manual-deny.txt    # домены, которые НИКОГДА не пробуются и не тоннелируются
+```
 
-Подключаются опционально по имени:
+Use cases:
+- **manual-allow**: L7-fingerprint blocks (rutracker.org), сервисы где probe не видит блок но реальный браузер видит, операторские override'ы
+- **manual-deny**: внутренние LAN-домены, банки и госуслуги (ломаются через VPN), healthcheck endpoints (не нужны в probe-истории)
+
+### Extensions — bundled пресеты
+
+Тематические подборки доменов одной строкой в YAML. Шипаются с релизом в
+`/opt/ladon/extensions/<name>.txt`.
 
 ```yaml
 allow_extensions:
   - ai
   - twitch
   - tiktok
+
 # deny_extensions:
-#   - my-corp-internal
+#   - my-corp-internal       # bundled deny-пресетов не шипается, оператор пишет свой
 # extensions_path: /opt/ladon/extensions   # default
 ```
 
-Доступные bundled allow-пресеты:
+Доступные allow-пресеты:
 
-| Имя | Покрытие |
+| имя | покрытие |
 |---|---|
 | `ai` | OpenAI / ChatGPT, Anthropic / Claude |
 | `twitch` | twitch.tv + CDN |
 | `tiktok` | TikTok / ByteDance overseas (core, regional CDN, backbone, SDK) |
 
-Полный список — в `/opt/ladon/extensions/<name>.txt`. Свои подборки (allow или deny) можно положить в тот же каталог (или в `extensions_path` куда угодно) и подключить в config так же по имени. Подробности в [release/extensions/README.md](release/extensions/README.md).
+Подробности и формат файлов — в [release/extensions/README.md](release/extensions/README.md).
+Свои подборки кладутся в тот же каталог и подключаются по имени.
 
-Обычные `/etc/ladon/manual-allow.txt` и `/etc/ladon/manual-deny.txt` продолжают работать параллельно — extensions просто удобнее для тематических подборок, которые хочется включать/выключать одной строкой.
+### Exit-compare
 
-### Очистка состояния — `ladon prune`
+Поднимает arbitration probe pipeline до уровня "L+R verdict matrix" вместо одного local. Требует probe-server в out-of-region vantage point (чужой VPS, residential ISP, 4G-модем).
 
-Иногда нужно сбросить накопленные данные руками — например, после смены логики probe (включили exit-compare, и cache мог содержать FP, которые новая логика отсеяла бы), или просто отрезать старую историю проб для размера БД.
-
-```sh
-# Что бы удалилось (без выполнения)
-ladon -db /opt/ladon/state/engine.db prune -cache -dry-run
-
-# Удалить весь cache
-ladon -db /opt/ladon/state/engine.db prune -cache
-
-# Удалить probe-ряды старше конкретной даты (RFC3339)
-ladon -db /opt/ladon/state/engine.db prune -probes -before 2026-04-16T11:14:00Z
-
-# Полная очистка трёх таблиц до какой-то отметки
-ladon -db /opt/ladon/state/engine.db prune -cache -hot -probes -before 2026-04-16T11:14:00Z
+```yaml
+probe:
+  mode: exit-compare
+  timeout: 800ms
+  remote:
+    url: https://my-probe-server.example.com/probe
+    timeout: 2s
+    auth_header: Authorization
+    auth_value: Bearer mysecrettoken
 ```
 
-Флаги:
+HTTP-контракт probe-server'а описан в [`docs/probe-api.md`](docs/probe-api.md).
+Референсная Go-имплементация переиспользует `internal/prober.LocalProber` —
+лежит в [`probe-server/ladon/`](probe-server/ladon/), запускается с тем же
+`-timeout`, что engine использует для local. Inline fast-path всегда только
+local — remote дёргается только batch-worker'ом.
+
+### Очистка состояния — `prune`
+
+Сбросить накопленные данные: после смены логики probe (включили
+exit-compare, и cache мог содержать FP, которые новая логика отсеяла бы),
+или просто отрезать старую историю проб для размера БД.
+
+```sh
+# что бы удалилось (без выполнения)
+ladon -db /opt/ladon/state/engine.db prune -cache -dry-run
+
+# удалить весь cache
+ladon -db /opt/ladon/state/engine.db prune -cache
+
+# удалить probe-ряды старше конкретной даты (RFC3339)
+ladon -db /opt/ladon/state/engine.db prune -probes -before 2026-04-16T11:14:00Z
+
+# полная очистка трёх таблиц до отметки
+ladon -db /opt/ladon/state/engine.db prune -cache -hot -probes -before 2026-04-16T11:14:00Z
+```
 
 | флаг | действие |
 |---|---|
@@ -269,120 +377,6 @@ ladon -db /opt/ladon/state/engine.db prune -cache -hot -probes -before 2026-04-1
 | `-before <RFC3339>` | фильтр по дате; без флага удаляет всё |
 | `-dry-run` | показать счётчики без выполнения |
 
-После `prune` движок автоматически сбрасывает `state` в `new` для доменов, у которых не осталось ни hot, ни cache записи — на следующем DNS-запросе домен пройдёт пайплайн заново.
-
-### Exit-compare через внешний пробинг-сервер
-
-Локальная проба видит мир глазами шлюза. Это хорошо ловит DPI-блоки, которые цепляются ровно к тому пути, по которому идёт клиент. Но даёт ложные срабатывания, когда сам домен не отвечает на :443 — `imap.gmail.com` живёт на :993, `bgp.he.net` на 8080, и т.д. Локальный probe в таких случаях видит «TCP fail» и тащит домен в hot, хотя блока нет.
-
-`mode: exit-compare` решает это, добавляя вторую точку зрения: HTTP-сервер на твоей стороне, который пробит тот же домен из другого vantage point (residential ISP, 4G-модем, офшорная VPS, что угодно).
-
-```yaml
-probe:
-  mode: exit-compare
-  remote:
-    url: https://my-probe-server.example.com/probe
-    timeout: 2s
-    auth_header: Authorization
-    auth_value: Bearer mysecrettoken
-```
-
-Логика вердикта на batch-перепробе:
-
-| local | remote | вердикт |
-|---|---|---|
-| OK | (не запускается) | Ignore — direct работает |
-| FAIL | OK | **Hot** — настоящий DPI-блок, снаружи домен живой |
-| FAIL | FAIL | **Ignore** — methodological FP (порт не тот / мёртвый сервер / domain не отвечает ниоткуда) |
-| FAIL | unavailable | **Hot** — твой proб-сервер недоступен (timeout / non-200 / network) → не overrule'им, остаёмся с локальным вердиктом. Reason помечен `remote:unavailable:...` |
-
-HTTP-контракт описан в [`docs/probe-api.md`](docs/probe-api.md), референсная имплементация на Go — в [`probe-server/ladon/`](probe-server/ladon/).
-
----
-
-## 🔍 Наблюдаемость
-
-Всё состояние живёт в SQLite. Полезные запросы:
-
-```bash
-DB=/opt/ladon/state/engine.db
-
-# Распределение по состояниям
-sqlite3 "$DB" "SELECT state, COUNT(*) FROM domains GROUP BY state"
-
-# Топ-15 «горячих» доменов по количеству визитов
-sqlite3 -column "$DB" \
-  "SELECT domain, hit_count, state FROM domains
-   WHERE state IN ('hot','cache')
-   ORDER BY hit_count DESC LIMIT 15"
-
-# Сколько IP сейчас в kernel ipset'ах
-sudo ipset list ladon_engine -t | grep entries
-sudo ipset list ladon_manual -t | grep entries
-
-# Причины попадания в hot
-sqlite3 -column "$DB" \
-  "SELECT d.domain, p.failure_reason, p.latency_ms
-   FROM domains d JOIN probes p ON p.id = d.last_probe_id
-   WHERE d.state = 'hot' ORDER BY p.created_at DESC LIMIT 20"
-
-# Промоушны в cache за последний час
-sqlite3 -column "$DB" \
-  "SELECT domain, promoted_at, reason FROM cache_entries
-   WHERE promoted_at > datetime('now','-1 hour')"
-```
-
-Live-логи: `journalctl -u ladon -f`.
-
----
-
-## 🏗 Разработка
-
-```sh
-# Unit + race-тесты (быстро, без сети)
-go test -race -short ./...
-
-# End-to-end пайплайн-перфтесты (живые TCP-timeout на RFC 5737 192.0.2.1)
-go test -v -run TestPipeline ./internal/engine/
-
-# Кросс-компиляция под Linux
-GOOS=linux GOARCH=amd64 go build -o dist/ladon ./cmd/ladon
-```
-
-### Структура пакетов
-
-| Путь | Ответственность |
-|---|---|
-| `cmd/ladon/` | CLI: `init-db`, `run`, `probe`, `observe`, `list`, `hot`, `tail` |
-| `internal/tail/` | fsnotify-based follower для файла лога |
-| `internal/dnsmasq/` | Парсер log-строк (query / reply / cached / forwarded) |
-| `internal/watcher/` | Нормализация и ingest DNS-событий |
-| `internal/storage/` | SQLite access layer + embedded schema |
-| `internal/etld/` | Обёртка над `golang.org/x/net/publicsuffix` |
-| `internal/prober/` | Probe: `LocalProber` (TCP + TLS-SNI) и `RemoteProber` (HTTP к внешнему сервису) за общим `Prober`-интерфейсом |
-| `internal/config/` | Загрузка и валидация YAML-конфига |
-| `internal/decision/` | Классификация probe → {Ignore, Hot} |
-| `internal/dnsmasqcfg/` | Генерация `/etc/dnsmasq.d/ladon-manual.conf` для manual-allow + extensions |
-| `internal/scorer/` | Промоушн hot → cache по количеству fails в окне |
-| `internal/manual/` | Загрузчик allow/deny-списков из файлов |
-| `internal/ipset/` | Обёртка над CLI `ipset` (Add / Del / Reconcile / Save) |
-| `internal/publisher/` | Atomic-write текстового файла с hot-доменами |
-| `internal/engine/` | Оркестровка: 6 горутин, каналы, lifecycle |
-
-### CI
-
-[GitHub Actions workflow](.github/workflows/ci.yml) прогоняет на каждый push
-в `main` и на каждый PR:
-
-- `go build ./...`
-- `go vet ./...`
-- `go test -race -short ./...` — unit-тесты с race-детектором.
-- `go test -run TestPipeline ./internal/engine/` — end-to-end перфтесты.
-
----
-
-## 📜 Лицензия
-
-[MIT](LICENSE). Делайте что хотите — форкайте, встраивайте, коммерческое
-использование, всё разрешено. Требуется только сохранить упоминание автора
-в копиях.
+После prune движок сбрасывает `state` в `new` для доменов, у которых не
+осталось ни hot, ни cache записи — на следующем DNS-запросе домен пройдёт
+пайплайн заново.
