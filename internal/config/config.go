@@ -88,6 +88,7 @@ type ScorerSection struct {
 type IpsetSection struct {
 	EngineName string        `yaml:"engine_name"` // engine-managed (default ladon_engine)
 	ManualName string        `yaml:"manual_name"` // dnsmasq-managed (default ladon_manual; "" disables)
+	CIDRName   string        `yaml:"cidr_name"`   // CIDR hash:net set fed by extensions (default ladon_cidr; "" disables)
 	Interval   time.Duration `yaml:"interval"`
 }
 
