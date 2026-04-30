@@ -18,20 +18,16 @@ type Prober interface {
 	Name() string
 }
 
-// LocalProber runs the built-in DNS / TCP:443 / TLS-SNI / HTTP probe
-// pipeline from the current host. The Fingerprint field selects which
-// browser ClientHello uTLS will mimic at the TLS stage — see
-// fingerprints.go for the supported set. Empty Fingerprint falls back to
-// DefaultFingerprint.
+// LocalProber runs the built-in TCP:443 + TLS-SNI probe from the current host.
+// It's what ladon has shipped with since v0.1.0; the type just wraps the
+// existing package-level functions so the engine can accept a Prober interface.
 type LocalProber struct {
-	Timeout     time.Duration
-	Fingerprint Fingerprint
+	Timeout time.Duration
 }
 
-// NewLocal returns a LocalProber. A zero timeout falls back to
-// DefaultTimeout; an empty fingerprint to DefaultFingerprint.
-func NewLocal(timeout time.Duration, fp Fingerprint) *LocalProber {
-	return &LocalProber{Timeout: timeout, Fingerprint: fp}
+// NewLocal returns a LocalProber. A zero timeout falls back to DefaultTimeout.
+func NewLocal(timeout time.Duration) *LocalProber {
+	return &LocalProber{Timeout: timeout}
 }
 
 // Name implements Prober.
@@ -41,12 +37,8 @@ func (p *LocalProber) Name() string { return "local" }
 // directly (keeps the engine's view consistent with what dnsmasq already gave
 // the client); otherwise it falls back to the system resolver.
 func (p *LocalProber) Probe(ctx context.Context, domain string, ips []string) Result {
-	fp := p.Fingerprint
-	if fp == "" {
-		fp = DefaultFingerprint
-	}
 	if len(ips) > 0 {
-		return ProbeIPsWithFingerprint(ctx, domain, ips, fp, p.Timeout)
+		return ProbeIPs(ctx, domain, ips, p.Timeout)
 	}
-	return ProbeWithFingerprint(ctx, domain, fp, p.Timeout)
+	return Probe(ctx, domain, p.Timeout)
 }
