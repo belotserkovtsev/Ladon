@@ -41,166 +41,145 @@ curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/ins
 
 ## 🔬 Методология
 
-Полный pipeline от DNS-запроса клиента до правила в kernel ipset.
+### Постановка задачи
 
-### 1. Source — dnsmasq.log
+Дано: домен `X`, к которому клиент обратился. Классифицировать: **DPI
+режет связь к `X`** или нет. Классификация бинарная — `Hot`
+(тоннелировать) или `Ignore` (направлять напрямую). Минимизируем оба
+типа ошибок: false-positive (не тоннелировать что не нужно — лишний шум,
+оверюзат туннеля) и false-negative (не пропустить реальный блок — иначе
+клиент видит "не открывается").
 
-`dnsmasq` запускается с `log-queries=extra` и пишет в файл строки вида
-`query[A] domain from peer` и `reply domain is IP`. Это единственный
-источник probe-кандидатов: ladon реагирует на трафик клиентов, не
-пробивает синтетический список.
+### Источник наблюдений — реактивная подписка
 
-### 2. Tail + parse + ingest
+Анализ применяется только к доменам, к которым клиенты **уже**
+обратились. Probe-кандидат — это имя из живого DNS-трафика, не из
+синтетического списка известных блокировок. Покрытие = реальный профиль
+использования сети, не публикуемый "топ заблокированных".
 
-`internal/tail` через fsnotify читает append'ы. `internal/dnsmasq`
-парсит строки в события `Query{Domain, Peer}` и `Reply{Domain, IP}`.
-`internal/watcher` нормализует домен через `internal/etld` (eTLD+1) и
-делает upsert:
+### Probe как структурированное измерение
 
-- `Query` → `domains` (state=`new` если первый раз) + увеличивает peer_count
-- `Reply` → `dns_cache(domain, ip, last_seen_at)`
+Один probe = последовательная серия из 4 независимых наблюдений:
 
-### 3. Probe trigger
+1. **DNS** — резолвится ли имя
+2. **TCP:443** — пускают ли SYN, приходит ли SYN/ACK
+3. **TLS handshake** — проходит ли ClientHello/ServerHello, доходит до Finished
+4. **HTTP read** — приходит ли первые ~32KB ответа после успешного handshake
 
-Два независимых driver'а probe:
+Каждое наблюдение даёт `passed`/`failed` + при failure — категорию
+ошибки. Категория несёт информацию о **природе** отказа, не только о
+факте.
 
-- **Inline fast-path** — каждый новый домен пробивается синхронно с
-  ingest'ом, ограниченный семафором `probe.concurrency` (default 8).
-  Только local-probe, без remote. Цель — ~500ms reaction time.
-- **Batch worker** — раз в `probe.interval` (2s) выбирает до
-  `probe.batch` (4) кандидатов из `domains` с
-  `last_probed_at < now − probe.cooldown` (5min). Здесь подключается
-  remote-probe в exit-compare режиме.
+32KB-окно на HTTP-стадии подобрано чтобы покрыть наблюдаемую сигнатуру
+"обрыв CDN/хостинга после 14-34KB передачи" — без HTTP-стадии TLS
+handshake выглядит чистым и блок ускользает в `Ignore`.
 
-### 4. Probe stages
+### Семантика failures: server-active vs path-active
 
-`internal/prober.LocalProber.Probe(ctx, domain, ips)`. Если `ips`
-переданы (из `dns_cache`) — DNS-стадия пропускается, иначе резолвится
-через `net.Resolver`. v6 IPs отбрасываются (gateway routing v4-only).
+Failures разделяются по природе на два класса.
 
-| stage | действие | failure codes |
+**Server-active rejection** — сервер активно ответил "нет":
+- TCP `connection refused` — порт явно закрыт
+- любой TLS alert от peer'а — `certificate required` (mTLS),
+  `illegal parameter`, `handshake failure`, и т. д.
+
+Эти отказы **доказывают**, что сервер достижим — чтобы прислать TLS
+alert или RST на `connect()`, peer должен был получить и обработать наш
+пакет. DPI на пути не подделывает TLS alert'ы (это требовало бы
+поддерживать TLS state machine на L6), поэтому такие сигналы
+интерпретируются как server-side policy, не как блок. Классифицируется
+сразу в `Ignore`.
+
+**Path-active rejection** — сервер не подтвердил доступность:
+- timeout (любой стадии)
+- TCP/TLS reset
+- silent EOF (TCP закрылся без HTTP/TLS-ответа)
+- HTTP cutoff (стрим обрублен mid-response)
+- HTTP-level garbage (вместо валидного HTTP пришёл бинарный мусор —
+  типичная сигнатура DPI, инжектящего фальшивый response в HTTP/2 stream)
+
+Эти сигналы **не доказывают** что DPI режет — сервер мог сам не
+отвечать, может временно лежит. Они означают только "доступность не
+подтверждена", и требуют дополнительного arbitration'а.
+
+### Arbitration через второй observer (exit-compare)
+
+Path-active failure из одной точки — слабое доказательство DPI. Сервер
+может быть просто медленным, geoblock'нутым, mTLS-only, dead. Решение —
+**вторая независимая точка наблюдения**: тот же probe из другой
+географической позиции (out-of-region vantage point — чужая VPS, другой
+ISP, другой регион). Получаем матрицу 2×2:
+
+|  | remote OK | remote FAIL |
 |---|---|---|
-| DNS  | `LookupIPAddr` | `dns_nxdomain`, `dns_timeout`, `dns_error` |
-| TCP  | parallel dial до `MaxIPsToTry`=3 IPs:443, первый success wins, остальные cancel'ятся через shared context | `tcp_timeout`, `tcp_reset`, `tcp_refused`, `tcp_unreachable` |
-| TLS  | `tls.DialWithDialer` с `ServerName=domain`, `InsecureSkipVerify=true` (probe — про reachability, не authenticity) | `tls_handshake_timeout`, `tls_eof`, `tls_reset`, `tls_alert`, `mtls_required` |
-| HTTP | на live tls.Conn пишется минимальный GET, читается до 32KB через `bufio` + `http.ReadResponse` | `http_cutoff`, `http_reset`, `http_timeout`, `http_error` |
+| **local OK** | `Ignore` (direct работает) | (вырожденный, не вызываем remote) |
+| **local FAIL** | **`Hot`** (снаружи живой → блок именно у нас) | **`Ignore`** (отказ из обеих точек → server-side, не путь) |
 
-HTTP-окно 32KB подобрано чтобы покрыть RU-DPI сигнатуру обрыва на
-14-34KB передачи — без HTTP-стадии handshake выглядит чистым и блок
-ускользает.
+Ключевая строка — `local FAIL + remote FAIL → Ignore`. Без неё любой
+geoblock, любой временно недоступный сервер, любой mTLS-сервис попадал
+бы в `Hot`. С ней remaining false-positive rate близок к нулю на классе
+server-side проблем.
 
-### 5. categorize
+Если remote-наблюдатель транспортно недоступен (timeout, network) —
+сохраняется local-вердикт без overrule (sticky local). Это защита от
+ситуации "remote умер → внезапно весь Hot список развалился".
 
-`internal/prober/failures.go::categorize(stage, err)` маппит low-level
-ошибку на `FailureCode` через `errors.Is`/`errors.As` chain.
-Дополнительно — string-fallback на `"remote error: tls: ..."` для
-non-QUIC TLS alert'ов (Go stdlib оборачивает их в неэкспортированный
-`tls.alert`, и typed `errors.As` на них не срабатывает; `mtls_required`
-выделяется по подстроке `"certificate required"` в alert text).
+### Arbitration через накопление (temporal evidence)
 
-`FailureCode` делятся на две группы:
+Одна проба — слабое доказательство. Сервер мог быть перегружен в
+конкретный момент, DPI мог моргнуть, провайдер мог временно
+ребутнуть промежуточное оборудование. Поэтому над probe-вердиктом
+строится статистический слой:
 
-- **server-active** — `tcp_refused`, `tls_alert`, `mtls_required`. Сервер
-  активно ответил "нет", значит он достижим и DPI не вмешался. Decision
-  → `Ignore`, никогда в туннель.
-- **path-active** — все timeout/reset/eof/cutoff/error. Сервер не
-  подтвердил доступность; кандидат на Hot.
+- Первый зафиксированный path-active failure → домен попадает в Hot
+  на 24 часа (активный, перепробуется)
+- Если за 24h собирается ≥N подтверждённых failures (при дефолтных
+  настройках N=50, что при 5-минутном cooldown означает минимум ~4
+  часа устойчивого failure'а) → блок считается стабильным, переходит в
+  постоянный список без TTL
+- Если за 24h не собирается — TTL истекает, домен возвращается в обычный
+  probe-цикл
 
-### 6. Remote probe (опционально, только batch)
+Случайные блипы провайдера и временные DPI-моргания не доходят до
+постоянного списка.
 
-Если `probe.mode=exit-compare`, batch-worker дополнительно вызывает
-`internal/prober.RemoteProber`: HTTP POST на `probe.remote.url` с JSON
-`{domain, ips, port, sni}`, Bearer auth, ответ — `RemoteResponse` с
-теми же полями (`dns_ok`, `tcp_ok`, `tls_ok`, `tls12_ok`, `tls13_ok`,
-`http_ok`, `code`, `reason`). Транспортный fail → `code=remote_unreachable`,
-не overrule'ит local. Inline fast-path remote НЕ дёргает.
+### Сводная декомпозиция
 
-### 7. Decision
+Конечная классификация домена выводится из четырёх независимых сигналов:
 
-`internal/decision.Classify(local, remote)`:
+1. **stage** — где именно проба упала
+2. **природа failure** — server-active или path-active (закрывает один
+   класс false-positive — mTLS / cert-only сервисы)
+3. **второй observer** — exit-compare matrix (закрывает другой класс
+   false-positive — server-side проблемы и geoblock)
+4. **накопление во времени** — статистический threshold на устойчивости
+   (закрывает третий класс — случайные блипы)
 
-```
-if local.DNSOK == false                      → Ignore
-if local.FailureCode is server-active        → Ignore
-if local.AllStagesOK                         → Ignore
-if remote == nil                             → Hot
-if remote.IsTransportFailure                 → Hot (sticky local)
-if remote.AllStagesOK                        → Hot (real DPI)
-if remote.HasFailure                         → Ignore (methodological FP)
-```
+Любой домен в постоянном списке прошёл фильтр на всех четырёх уровнях.
 
-Строка `local FAIL + remote FAIL → Ignore` — основная защита от
-false-positive: если обе vantage точки видят failure, проблема в самом
-сервере или общем пути за обоими, а не в DPI на пути конкретно local-клиента.
+### Чего методология не различает
 
-### 8. Persistence
+1. **L7-fingerprint discrimination** — DPI блокирует только конкретный
+   ClientHello (например, Chrome) и пропускает другие. Probe — отдельный
+   TLS-клиент с собственным fingerprint'ом; если DPI его не блеклистит,
+   probe видит "OK", а реальный браузер юзера — нет. Без mimicry
+   ClientHello не детектируется автоматически.
 
-`internal/storage` upsert'ит:
+2. **Throttling vs blocking** — DPI шейпит bandwidth до низких значений
+   вместо обрыва. Probe видит "медленно, но работает" → `Ignore`. Для
+   детекции нужна отдельная проба на sustained throughput, не
+   покрывается базовой методологией.
 
-- `probes(domain, dns_ok, tcp_ok, tls_ok, http_ok, resolved_ips_json,
-  failure_reason, latency_ms, created_at)` — каждая проба, append-only
-- `domains.state` ← verdict из шага 7
-- если Hot: `hot_entries(domain, expires_at = now + hot_ttl, reason)`,
-  `expires_at` обновляется при повторных fail'ах
+3. **Domain-less flows** — TCP/UDP-соединения на hardcoded IP без
+   предварительного DNS-запроса (Telegram mobile DC, Discord voice,
+   WhatsApp calls, Steam P2P). Реактивная подписка работает только на
+   DNS-наблюдении: нет наблюдения — нет probe-кандидата.
 
-`failure_reason` хранит `"<failure_code>: <raw err>"` — код grep'абелен
-SQL-запросом без отдельной колонки.
-
-### 9. Ipset sync
-
-`internal/ipset` (event-driven при изменении hot/cache + safety reconcile
-раз в `ipset.interval` = 30s):
-
-- читает `hot_entries ∪ cache_entries` → активные домены
-- для каждого активного домена читает `dns_cache` где
-  `last_seen_at > now − dns_freshness` (6h) → активные IPs
-- diff с current `ladon_engine` ipset → `ipset add` / `ipset del`
-
-Параллельно `internal/dnsmasqcfg` генерит `/etc/dnsmasq.d/ladon-manual.conf`
-из `manual_allow` + extensions. dnsmasq на резолве этих доменов сам
-заносит IP в `ladon_manual` ipset через `ipset=` directive (включая CNAME
-chain walking). Это второй ipset, отдельный от probe-driven engine.
-
-### 10. Routing (вне ladon, заводится оператором)
-
-```
-iptables -t mangle:
-  PREROUTING -i <wan> -j LADON_ROUTE_ENGINE   # probe-driven hot/cache
-  PREROUTING -i <wan> -j LADON_ROUTE_MANUAL   # extensions + manual-allow
-
-LADON_ROUTE_ENGINE:
-  -d 192.168.0.0/16,10.0.0.0/8,127.0.0.0/8 -j RETURN  (LAN bypass)
-  -m set --match-set ladon_engine dst -j MARK --set-mark 0x1
-
-ip rule fwmark 0x1 lookup 100
-ip route table 100: default dev <tunnel-iface>
-```
-
-Любой пакет с dst в `ladon_engine` или `ladon_manual` ipset получает
-MARK 0x1 → fwmark routing → table 100 → туннель.
-
-### 11. Background
-
-- **Hot expiry**: запись с `expires_at < now` удаляется автоматически.
-  Domain выпадает из ipset на следующем sync.
-- **Scorer** (раз в `scorer.interval` = 10min): для каждой `hot_entries`
-  считает `probes` где `failure_reason != ""` и `created_at > now − scorer.window` (24h).
-  Если count ≥ `scorer.fail_threshold` (50) → upsert в
-  `cache_entries(domain, promoted_at, reason)`. cache — без TTL, до явного prune.
-
-### Не покрывается
-
-- **L7-fingerprint blocks** — DPI режет конкретный ClientHello (Chrome 120,
-  iOS Safari). Probe использует Go stdlib fingerprint, у него другой
-  паттерн в ClientHello → DPI не блеклистит → probe видит "OK".
-  Workaround — `manual-allow.txt`.
-- **Throttling** — DPI шейпит до сотен кбит/с вместо блока. Probe видит
-  "медленно но работает" → Ignore.
-- **Domainless flows** — Telegram mobile / Discord voice / WhatsApp calls
-  идут на hardcoded IP, dnsmasq не получает DNS-запрос → tailer не
-  пикапит → probe не запускается.
-- **DNS-only blocks** — DPI poison'ит ISP-resolver. Ladon резолвит через
-  свой апстрим (например `1.1.1.1` через VPN) → не видит фальсификацию.
+4. **DNS-only blocks** — DPI poison'ит ISP-resolver, отдавая клиенту
+   неверные IP. Probe резолвит через альтернативный апстрим (off-ISP
+   DNS) → видит правильный IP → не замечает фальсификации, которую
+   видит клиент через ISP-DNS. Для детекции нужна параллельная проба
+   через ISP-resolver и сравнение результата.
 
 ---
 
