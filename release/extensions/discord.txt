@@ -18,10 +18,14 @@
 # голосового пула независимо от DNS.
 #
 # Источники CIDR:
-#   AS13335 (Cloudflare) — Magic Transit egress для Discord voice
-#     (текущая инфраструктура с миграции 2022)
-#   AS49063 (Discord, Inc.) — собственное IP-пространство для
-#     медиа/RTP-инфраструктуры
+#   AS13335 (Cloudflare) — два пула для Discord voice:
+#     - 162.159.128.0/19 (Magic Transit egress, основной с 2022)
+#     - 104.16.0.0/12   (anycast, региональный failover; разные /16
+#                        по регионам — Финляндия зачастую 104.25.x,
+#                        наблюдали 104.29.x в EU. Узкий /16 поломает
+#                        voice пользователям в других регионах.)
+#   AS49063 (Discord, Inc.) — собственное IP-пространство (API,
+#     image CDN, RTP legacy). 14 диапазонов из ASN-аллокации.
 
 # Core
 discord.com
@@ -64,7 +68,32 @@ discordmerch.com
 discord-attachments-uploads-prd.storage.googleapis.com
 
 # Voice/video data-plane CIDRs (Discord client → UDP RTP/STUN, без DNS)
-# Cloudflare-Magic-Discord — основной voice egress
+
+# Cloudflare Magic Transit (Discord voice egress, primary)
 162.159.128.0/19
-# Discord, Inc. AS49063 — медиа/RTP-инфраструктура
+
+# Cloudflare anycast (Discord voice failover/regional, 104.16-31.x.x)
+# Wide /12 на всю anycast — Discord раскидывает голосовые сервера по
+# разным /16 в зависимости от региона (zapret hosts мапит финские
+# voice-хосты на 104.25.x; наблюдали 104.29.x в EU). Узкий /16
+# поломает voice пользователям в других регионах. Цена: некоторый
+# прямой-IP трафик к non-Discord cloudflare-сайтам пойдёт через VPN —
+# домен-резолвимый трафик (через ladon_manual) этого не касается.
+104.16.0.0/12
+
+# Discord, Inc. AS49063 (own IP space — API, image CDN, RTP legacy)
+66.22.176.0/24
+66.22.188.0/22
 66.22.196.0/22
+66.22.200.0/21
+66.22.208.0/21
+66.22.218.0/23
+66.22.220.0/22
+66.22.224.0/21
+66.22.232.0/22
+66.22.236.0/23
+66.22.238.0/24
+66.22.240.0/22
+66.22.244.0/23
+66.22.246.0/24
+66.22.248.0/24
