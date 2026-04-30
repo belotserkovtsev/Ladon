@@ -1,29 +1,54 @@
-// Package prober runs staged network probes (DNS / TCP:443 / TLS-SNI) against a domain.
+// Package prober runs staged network probes (DNS / TCP:443 / TLS-SNI / HTTP) against a domain.
 package prober
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"time"
 )
 
+// httpReadLimit caps how many response bytes the HTTP cutoff probe will
+// consume. Picked to comfortably exceed the ~14-34KB window where some
+// RU-DPI deployments terminate CDN/hosting connections (the dpi-detector
+// project documents this signature). If we successfully read this much,
+// the path is "deep enough" to consider not-cut.
+const httpReadLimit = 32 * 1024
+
 // Result holds the outcome of a staged probe.
+//
+// FailureCode is a stable enum suitable for engine branching and grep; it
+// also forms the prefix of FailureReason ("<code>: <raw err>"). Old call
+// sites that only read FailureReason keep working unchanged.
 type Result struct {
 	Domain        string
 	DNSOK         bool
 	TCPOK         bool
 	TLSOK         bool
-	HTTPOK        *bool // reserved for future HTTP probe
+	TLS12OK       *bool // populated when the 1.2-restricted retry runs
+	TLS13OK       *bool // populated by the unrestricted attempt
+	HTTPOK        *bool
 	ResolvedIPs   []string
+	FailureCode   FailureCode
 	FailureReason string
 	LatencyMS     int
 }
 
+// IsRemoteTransportFailure reports whether this result represents the
+// remote prober itself being unreachable rather than a verdict about the
+// target. Engine treats those as Hot (safe default) but suppresses
+// noise-floor signals the caller would otherwise count as real DPI.
+func (r Result) IsRemoteTransportFailure() bool {
+	return r.FailureCode == CodeRemote
+}
+
 const (
-	DefaultTimeout = 800 * time.Millisecond
+	DefaultTimeout = 1500 * time.Millisecond
 	MaxIPsToTry    = 3
 )
 
@@ -41,7 +66,8 @@ func Probe(ctx context.Context, domain string, timeout time.Duration) Result {
 	resolver := &net.Resolver{}
 	addrs, err := resolver.LookupIPAddr(ctx, domain)
 	if err != nil {
-		r.FailureReason = "dns:" + err.Error()
+		r.FailureCode = categorize(stageDNS, err)
+		r.FailureReason = formatReason(r.FailureCode, err)
 		r.LatencyMS = int(time.Since(started) / time.Millisecond)
 		return r
 	}
@@ -71,7 +97,8 @@ func ProbeIPs(ctx context.Context, domain string, ips []string, timeout time.Dur
 	started := time.Now()
 	r := Result{Domain: domain, ResolvedIPs: ips}
 	if len(ips) == 0 {
-		r.FailureReason = "no_ips"
+		r.FailureCode = CodeNoIPs
+		r.FailureReason = string(CodeNoIPs)
 		r.LatencyMS = int(time.Since(started) / time.Millisecond)
 		return r
 	}
@@ -85,7 +112,8 @@ func ProbeIPs(ctx context.Context, domain string, ips []string, timeout time.Dur
 func probeTCPTLS(ctx context.Context, r Result, started time.Time, timeout time.Duration) Result {
 	r.DNSOK = len(r.ResolvedIPs) > 0
 	if !r.DNSOK {
-		r.FailureReason = "no_ips"
+		r.FailureCode = CodeNoIPs
+		r.FailureReason = string(CodeNoIPs)
 		r.LatencyMS = int(time.Since(started) / time.Millisecond)
 		return r
 	}
@@ -129,30 +157,210 @@ func probeTCPTLS(ctx context.Context, r Result, started time.Time, timeout time.
 		}
 	}
 	if reachable == "" {
-		r.FailureReason = "tcp_connect_failed"
 		if lastErr != nil {
-			r.FailureReason = "tcp:" + lastErr.Error()
+			r.FailureCode = categorize(stageTCP, lastErr)
+			r.FailureReason = formatReason(r.FailureCode, lastErr)
+		} else {
+			r.FailureCode = CodeTCPError
+			r.FailureReason = "tcp_connect_failed"
 		}
 		r.LatencyMS = int(time.Since(started) / time.Millisecond)
 		return r
 	}
 	r.TCPOK = true
 
-	// TLS handshake with SNI. We don't verify the cert — see comment in callers.
-	tlsConn, err := tls.DialWithDialer(&net.Dialer{Timeout: timeout},
-		"tcp", net.JoinHostPort(reachable, "443"), &tls.Config{
-			ServerName:         r.Domain,
-			InsecureSkipVerify: true, // #nosec G402 — intentional
-		})
-	if err != nil {
-		r.FailureReason = "tls:" + err.Error()
-	} else {
-		tlsConn.Close()
-		r.TLSOK = true
+	conn := probeTLSStaged(&r, reachable, "443", timeout)
+	if conn != nil {
+		probeHTTPStaged(&r, conn, timeout)
+		conn.Close()
 	}
-
 	r.LatencyMS = int(time.Since(started) / time.Millisecond)
 	return r
+}
+
+// probeTLSStaged runs the TLS-SNI handshake first unrestricted (Go picks the
+// highest mutually-supported version, which is 1.3 against any modern
+// server) and, if that fails, retries pinned to TLS 1.2. The split is the
+// primary signal we use to detect ClientHello-targeted DPI: when 1.3 fails
+// but 1.2 succeeds, the middlebox is almost certainly inspecting the
+// ClientHello (ECH/ESNI / cipher-suite fingerprinting).
+//
+// The retry only fires on TLS-stage failures — a clean 1.3 handshake leaves
+// TLS12OK nil (we don't burn an extra dial just to populate the field).
+//
+// We do NOT mark TLSOK=false when 1.3 fails / 1.2 ok in this function — the
+// fallback succeeded, the connection is reachable. The tls13_block verdict
+// is layered on top in a later phase, where it can interact with the HTTP
+// probe and decision rules.
+// probeTLSStaged returns a live *tls.Conn on success so the caller can
+// keep probing on the same connection (HTTP cutoff detection). Caller must
+// close the conn. Returns nil when both 1.3 and 1.2 attempts fail OR when
+// the failure is server-reachable (typed TLS alert) — in the latter case
+// TLSOK and HTTPOK are set to true so decision.Classify treats the result
+// as Ignore. mTLS-required servers (Apple Push, iCloud Private Relay) hit
+// this path.
+func probeTLSStaged(r *Result, ip, port string, timeout time.Duration) *tls.Conn {
+	conn, code, reason, version := tlsHandshake(ip, port, r.Domain, timeout, 0)
+	if conn != nil {
+		r.TLSOK = true
+		recordTLSVersion(r, version)
+		return conn
+	}
+	// First attempt failed. Two sub-cases:
+	//  1. Server actively rejected with a TLS alert → server is reachable,
+	//     no point retrying with 1.2 (the rejection is typically policy,
+	//     not version). Surface via TLSOK=true + HTTPOK=true so Classify
+	//     gives Ignore, but keep the code/reason for observability.
+	//  2. Real failure (timeout, RST, EOF, etc.) → fall through to the
+	//     1.2 retry path that distinguishes ClientHello-targeted DPI.
+	if IsServerReachable(code) {
+		r.TLSOK = true
+		t := true
+		r.HTTPOK = &t
+		r.FailureCode = code
+		r.FailureReason = reason
+		return nil
+	}
+
+	// Real failure path. Stash the error so it survives if the 1.2 retry
+	// also fails.
+	r.FailureCode = code
+	r.FailureReason = reason
+	f := false
+	r.TLS13OK = &f
+
+	// 1.2-only retry. New TCP connection — TLS failure usually drops the
+	// underlying socket too. We already paid for one failed handshake so
+	// this can stretch latency, but it's the price of distinguishing
+	// "real block" from "1.3-only block".
+	conn2, code2, _, _ := tlsHandshake(ip, port, r.Domain, timeout, tls.VersionTLS12)
+	if conn2 != nil {
+		t := true
+		r.TLS12OK = &t
+		r.TLSOK = true
+		// Clear the failure carried over from the 1.3 attempt — TLS as a
+		// whole succeeded. TLS13OK=false stays so the asymmetry is visible
+		// to the next phase (which will lift it to a tls13_block verdict).
+		r.FailureCode = CodeOK
+		r.FailureReason = ""
+		return conn2
+	}
+	// 1.2 also failed — but if it failed with a server-reachable code,
+	// trust that signal over the 1.3 result.
+	if IsServerReachable(code2) {
+		r.TLSOK = true
+		t := true
+		r.HTTPOK = &t
+		r.FailureCode = code2
+		r.FailureReason = formatReason(code2, nil)
+		return nil
+	}
+	r.TLS12OK = &f
+	return nil
+}
+
+// tlsHandshake runs one TLS dial. maxVersion=0 means "unrestricted" (Go
+// negotiates whatever it can). Returns the live conn on success so the
+// caller can run further stages (HTTP probe) without a fresh dial.
+func tlsHandshake(ip, port, sni string, timeout time.Duration, maxVersion uint16) (conn *tls.Conn, code FailureCode, reason string, version uint16) {
+	cfg := &tls.Config{
+		ServerName:         sni,
+		InsecureSkipVerify: true, // #nosec G402 — we're probing reachability, not verifying identity
+	}
+	if maxVersion != 0 {
+		cfg.MaxVersion = maxVersion
+	}
+	c, err := tls.DialWithDialer(&net.Dialer{Timeout: timeout},
+		"tcp", net.JoinHostPort(ip, port), cfg)
+	if err != nil {
+		code := categorize(stageTLS, err)
+		return nil, code, formatReason(code, err), 0
+	}
+	state := c.ConnectionState()
+	return c, CodeOK, "", state.Version
+}
+
+// recordTLSVersion sets TLS12OK or TLS13OK based on the negotiated version.
+// Called only on a successful handshake. Servers that only support 1.2
+// will end up with TLS12OK=ptr(true), TLS13OK=nil (we never tried 1.3
+// directly because the unrestricted dial already settled at 1.2).
+func recordTLSVersion(r *Result, version uint16) {
+	t := true
+	switch version {
+	case tls.VersionTLS13:
+		r.TLS13OK = &t
+	case tls.VersionTLS12:
+		r.TLS12OK = &t
+	}
+}
+
+// probeHTTPStaged sends a minimal GET on a live TLS conn and tries to
+// consume up to httpReadLimit bytes of the response. It catches the
+// "TLS handshake fine, but DPI cuts the actual stream after N KB" pattern
+// that classifies linkedin.com / instagram.com / rutracker.org under
+// existing TCP+TLS-only probing — the L7-blindspot we want to close.
+//
+// HTTPOK is a tri-state: nil if we didn't run the stage (caller skipped),
+// ptr(true) if a complete response (any status) was parsed, ptr(false)
+// otherwise. A 4xx/5xx with a tiny body still counts as ptr(true) — the
+// path is reachable; the server made a deliberate response. We're
+// detecting middlebox cutoffs, not server semantics.
+func probeHTTPStaged(r *Result, conn *tls.Conn, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	if err := conn.SetDeadline(deadline); err != nil {
+		setHTTPFail(r, stageHTTP, err)
+		return
+	}
+
+	req := fmt.Sprintf(
+		"GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (compatible; ladon-probe)\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+		r.Domain,
+	)
+	if _, err := io.WriteString(conn, req); err != nil {
+		setHTTPFail(r, stageHTTP, err)
+		return
+	}
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		// Headers never completed — DPI most often cuts here, before the
+		// server even gets a chance to respond. Categorize as cutoff.
+		setHTTPFail(r, stageHTTP, err)
+		return
+	}
+
+	// Drain up to the limit. Many small responses finish well below it
+	// (e.g. an empty 204 or a 301 redirect) — that's fine, EOF after a
+	// clean response is success. We only fail on read errors that
+	// indicate the stream was severed mid-flight.
+	_, copyErr := io.Copy(io.Discard, io.LimitReader(resp.Body, httpReadLimit))
+	resp.Body.Close()
+	if copyErr != nil && !errors.Is(copyErr, io.EOF) {
+		setHTTPFail(r, stageHTTP, copyErr)
+		return
+	}
+
+	t := true
+	r.HTTPOK = &t
+}
+
+func setHTTPFail(r *Result, stage string, err error) {
+	code := categorize(stage, err)
+	r.FailureCode = code
+	r.FailureReason = formatReason(code, err)
+	// If the server is the source of the rejection (typed TLS alert during
+	// HTTP read — typical for post-handshake mTLS challenges like Apple
+	// Push / FindMy / iCloud Private Relay), treat as reachable. The
+	// failure code stays for observability; HTTPOK flips to true so
+	// decision.Classify gives Ignore.
+	if IsServerReachable(code) {
+		t := true
+		r.HTTPOK = &t
+		return
+	}
+	f := false
+	r.HTTPOK = &f
 }
 
 // ErrNoDomain signals an empty input.

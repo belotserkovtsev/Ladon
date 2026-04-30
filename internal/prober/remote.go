@@ -39,12 +39,19 @@ type RemoteRequest struct {
 // RemoteResponse is what the remote server returns. Missing fields are
 // treated as false / unset — the remote is free to skip stages it can't
 // perform (e.g. a cellular prober with no TLS stack can leave tls_ok empty).
+//
+// FailureCode is optional: older remotes that don't set it are handled by
+// parsing the prefix of FailureReason (back-compat — see RemoteProber.Probe).
 type RemoteResponse struct {
 	DNSOK         bool     `json:"dns_ok"`
 	TCPOK         bool     `json:"tcp_ok"`
 	TLSOK         bool     `json:"tls_ok"`
+	TLS12OK       *bool    `json:"tls12_ok,omitempty"` // optional; populated by probe-v2 remotes
+	TLS13OK       *bool    `json:"tls13_ok,omitempty"` // optional; populated by probe-v2 remotes
+	HTTPOK        *bool    `json:"http_ok,omitempty"`  // optional; populated by probe-v2 remotes
 	ResolvedIPs   []string `json:"resolved_ips,omitempty"`
 	FailureReason string   `json:"reason,omitempty"`
+	FailureCode   string   `json:"code,omitempty"`
 	LatencyMS     int      `json:"latency_ms,omitempty"`
 }
 
@@ -121,12 +128,22 @@ func (p *RemoteProber) Probe(ctx context.Context, domain string, ips []string) R
 	if latency == 0 {
 		latency = int(time.Since(started) / time.Millisecond)
 	}
+	// Back-compat: older remotes don't send `code`; recover it from the
+	// reason prefix so engine code can branch on FailureCode uniformly.
+	code := FailureCode(rr.FailureCode)
+	if code == "" {
+		code = parseCode(rr.FailureReason)
+	}
 	return Result{
 		Domain:        domain,
 		DNSOK:         rr.DNSOK,
 		TCPOK:         rr.TCPOK,
 		TLSOK:         rr.TLSOK,
+		TLS12OK:       rr.TLS12OK,
+		TLS13OK:       rr.TLS13OK,
+		HTTPOK:        rr.HTTPOK,
 		ResolvedIPs:   resolved,
+		FailureCode:   code,
 		FailureReason: rr.FailureReason,
 		LatencyMS:     latency,
 	}
@@ -136,6 +153,7 @@ func failedRemote(domain string, ips []string, reason string, started time.Time)
 	return Result{
 		Domain:        domain,
 		ResolvedIPs:   ips,
+		FailureCode:   CodeRemote,
 		FailureReason: reason,
 		LatencyMS:     int(time.Since(started) / time.Millisecond),
 	}
