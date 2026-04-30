@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # ladon installer — Debian/Ubuntu only.
 #
-# Scope: ladon's job is to keep two kernel ipsets populated:
+# Scope: ladon's job is to keep three kernel ipsets populated:
 #   ladon_engine — IPs of probe-discovered blocked domains (hot/cache)
 #   ladon_manual — IPs of domains in manual-allow + extensions (via dnsmasq)
+#   ladon_cidr   — CIDR blocks from manual-allow + extensions (hash:net) for
+#                  services that bypass DNS (Telegram MTProto, BitTorrent, etc.)
 #
 # Wiring those ipsets into actual routing (iptables MARK + ip rule fwmark
 # + custom routing table → tunnel interface) is the OPERATOR'S responsibility:
@@ -26,7 +28,7 @@
 #   TAG=v0.4.0-rc1          install a specific release tag instead of latest
 #                           (useful for testing pre-releases — `releases/latest`
 #                           in the GH API skips prereleases by default)
-#   IPSET_ENGINE=ladon_engine, IPSET_MANUAL=ladon_manual
+#   IPSET_ENGINE=ladon_engine, IPSET_MANUAL=ladon_manual, IPSET_CIDR=ladon_cidr
 #   LADON_PREFIX=/opt/ladon, LADON_CONFIG_DIR=/etc/ladon
 
 set -euo pipefail
@@ -40,6 +42,7 @@ die()  { printf "%b==>%b %s\n" "$RED" "$NC" "$*" >&2; exit 1; }
 # --- env ---
 IPSET_ENGINE="${IPSET_ENGINE:-ladon_engine}"
 IPSET_MANUAL="${IPSET_MANUAL:-ladon_manual}"
+IPSET_CIDR="${IPSET_CIDR:-ladon_cidr}"
 LADON_PREFIX="${LADON_PREFIX:-/opt/ladon}"
 LADON_CONFIG_DIR="${LADON_CONFIG_DIR:-/etc/ladon}"
 GH_REPO="belotserkovtsev/ladon"
@@ -110,11 +113,15 @@ install -m 0644 "$SRC/extensions/"*.txt  "$LADON_PREFIX/extensions/"
 install -m 0644 "$SRC/extensions/README.md" "$LADON_PREFIX/extensions/"
 
 # --- step 4: ipsets (idempotent) ---
-log "creating ipsets ($IPSET_ENGINE, $IPSET_MANUAL)"
+log "creating ipsets ($IPSET_ENGINE, $IPSET_MANUAL, $IPSET_CIDR)"
 ipset list "$IPSET_ENGINE" -t >/dev/null 2>&1 || \
   ipset create "$IPSET_ENGINE" hash:ip family inet maxelem 65536
 ipset list "$IPSET_MANUAL" -t >/dev/null 2>&1 || \
   ipset create "$IPSET_MANUAL" hash:ip family inet maxelem 65536 timeout 86400
+# hash:net for CIDR blocks (Telegram MTProto, BitTorrent peer subnets, etc.).
+# No timeout: these are operator-curated, not probe-discovered.
+ipset list "$IPSET_CIDR" -t >/dev/null 2>&1 || \
+  ipset create "$IPSET_CIDR" hash:net family inet maxelem 65536
 
 # Persist ipsets across reboot. iptables-persistent's `ipsets` file is the
 # Debian/Ubuntu standard location; works whether or not netfilter-persistent
@@ -170,7 +177,8 @@ What's running:
   service:  systemctl status ladon
   logs:     journalctl -u ladon -f
   config:   $LADON_CONFIG_DIR/config.yaml
-  ipsets:   $IPSET_ENGINE (probe-driven), $IPSET_MANUAL (dnsmasq-driven)
+  ipsets:   $IPSET_ENGINE (probe-driven), $IPSET_MANUAL (dnsmasq-driven),
+            $IPSET_CIDR (extension CIDR blocks, hash:net)
 
 ${YELLOW}==> ROUTING IS YOUR JOB${NC}
 
@@ -182,6 +190,8 @@ WireGuard split-tunnel setup looks like (adjust subnet/fwmark/iface):
     -m set --match-set $IPSET_ENGINE dst -j MARK --set-mark 0x1
   iptables -t mangle -A WG_ROUTE -s 10.10.0.0/16 \\
     -m set --match-set $IPSET_MANUAL dst -j MARK --set-mark 0x1
+  iptables -t mangle -A WG_ROUTE -s 10.10.0.0/16 \\
+    -m set --match-set $IPSET_CIDR dst -j MARK --set-mark 0x1
 
   ip rule add fwmark 0x1 table ladon priority 1000
   echo '666 ladon' >> /etc/iproute2/rt_tables
