@@ -21,23 +21,13 @@ func main() {
 	listen := flag.String("listen", ":8080", "address to listen on")
 	token := flag.String("token", "", "require Authorization: Bearer <token> if set")
 	timeout := flag.Duration("timeout", 2*time.Second, "per-stage probe timeout")
-	fingerprint := flag.String("fingerprint", string(prober.DefaultFingerprint),
-		"TLS ClientHello fingerprint (chrome_120|firefox_120|ios_14|go_default). "+
-			"For exit-compare deployments this MUST match the engine-side probe.tls_fingerprint, "+
-			"otherwise local/remote will see different DPI verdicts and exit-compare logic breaks.")
 	flag.Parse()
 
-	fp := prober.Fingerprint(*fingerprint)
-	if !prober.IsKnownFingerprint(fp) {
-		log.Fatalf("unknown fingerprint %q (want chrome_120|firefox_120|ios_14|go_default)", *fingerprint)
-	}
-
 	// Share ladon's probe pipeline so the remote vantage runs identical
-	// stages (TCP / TLS-split / HTTP-cutoff) with the same browser
-	// fingerprint mimic. exit-compare in ladon depends on this —
-	// divergence between local and remote only makes sense if it comes
-	// from the network path, not from probe semantics.
-	probeIt := prober.NewLocal(*timeout, fp)
+	// stages (TCP / TLS-split / HTTP-cutoff). exit-compare in ladon depends
+	// on this — divergence between local and remote only makes sense if it
+	// comes from the network path, not the probe semantics.
+	probeIt := prober.NewLocal(*timeout)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/probe", func(w http.ResponseWriter, r *http.Request) {
@@ -79,7 +69,7 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	log.Printf("probe-server listening on %s (token=%v, timeout=%s, fingerprint=%s)",
-		*listen, *token != "", *timeout, fp)
+	log.Printf("probe-server listening on %s (token=%v, timeout=%s)",
+		*listen, *token != "", *timeout)
 	log.Fatal(http.ListenAndServe(*listen, mux))
 }

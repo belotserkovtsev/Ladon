@@ -345,7 +345,7 @@ func runCmd(ctx context.Context, store *storage.Store, configPath string, rest [
 // the operator only needs to list the knobs they actually want to change.
 func applyConfigFile(cfg *engine.Config, f *config.File) {
 	if f == nil {
-		cfg.LocalProber = prober.NewLocal(cfg.ProbeTimeout, prober.DefaultFingerprint)
+		cfg.LocalProber = prober.NewLocal(cfg.ProbeTimeout)
 		return
 	}
 	if f.ManualAllow != "" && cfg.ManualAllowPath == "" {

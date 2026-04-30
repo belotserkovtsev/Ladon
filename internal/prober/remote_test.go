@@ -120,7 +120,7 @@ func TestRemoteProber_BadJSON(t *testing.T) {
 func TestLocalProber_DelegatesToProbeIPs(t *testing.T) {
 	// Pick an unreachable IP so we exercise the ProbeIPs path without
 	// requiring internet. TEST-NET-1 is reserved and silently dropped.
-	p := NewLocal(200*time.Millisecond, DefaultFingerprint)
+	p := NewLocal(200 * time.Millisecond)
 	res := p.Probe(context.Background(), "example.com", []string{"192.0.2.1"})
 	if res.TCPOK {
 		t.Errorf("expected tcp fail against unreachable IP, got ok")
@@ -131,7 +131,7 @@ func TestLocalProber_DelegatesToProbeIPs(t *testing.T) {
 }
 
 func TestLocalProber_Name(t *testing.T) {
-	if got := NewLocal(0, DefaultFingerprint).Name(); got != "local" {
+	if got := NewLocal(0).Name(); got != "local" {
 		t.Errorf("local name = %q, want local", got)
 	}
 	if got := NewRemote("http://x", "", "", 0).Name(); got != "remote" {

@@ -11,8 +11,6 @@ import (
 	"net"
 	"net/http"
 	"time"
-
-	utls "github.com/refraction-networking/utls"
 )
 
 // httpReadLimit caps how many response bytes the HTTP cutoff probe will
@@ -54,28 +52,11 @@ const (
 	MaxIPsToTry    = 3
 )
 
-// Probe runs DNS → TCP:443 → TLS-SNI → HTTP against domain. Uses the
-// default fingerprint; ad-hoc CLI calls and tests get the same browser
-// mimic as the engine. For non-default fingerprints (engine, probe-server)
-// use the LocalProber wrapper, which threads its configured Fingerprint
-// down through all stages.
+// Probe runs DNS → TCP:443 → TLS-SNI against domain, short-circuiting on failure.
+// Uses the system resolver; subject to whatever /etc/resolv.conf points at.
+// Prefer ProbeIPs when the caller already knows what the client resolved to —
+// keeps the engine's view consistent with the client's.
 func Probe(ctx context.Context, domain string, timeout time.Duration) Result {
-	return probeWithFingerprint(ctx, domain, nil, DefaultFingerprint, timeout)
-}
-
-// ProbeWithFingerprint is Probe but with a caller-chosen browser
-// fingerprint for the TLS stage. Empty fp falls back to DefaultFingerprint.
-func ProbeWithFingerprint(ctx context.Context, domain string, fp Fingerprint, timeout time.Duration) Result {
-	return probeWithFingerprint(ctx, domain, nil, fp, timeout)
-}
-
-func probeWithFingerprint(ctx context.Context, domain string, ips []string, fp Fingerprint, timeout time.Duration) Result {
-	if fp == "" {
-		fp = DefaultFingerprint
-	}
-	if len(ips) > 0 {
-		return probeIPsWithFingerprint(ctx, domain, ips, fp, timeout)
-	}
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
@@ -103,27 +84,13 @@ func probeWithFingerprint(ctx context.Context, domain string, ips []string, fp F
 		seen[s] = struct{}{}
 		r.ResolvedIPs = append(r.ResolvedIPs, s)
 	}
-	return probeTCPTLS(ctx, r, started, timeout, fp)
+	return probeTCPTLS(ctx, r, started, timeout)
 }
 
-// ProbeIPs runs TCP:443 → TLS-SNI → HTTP against a caller-supplied IP
-// list with the default fingerprint. Used when the client's resolver
-// already gave us the answers (via dns_cache) — avoids a redundant DNS
-// lookup that might disagree with the client's view.
+// ProbeIPs runs TCP:443 → TLS-SNI against a caller-supplied IP list.
+// Used when the client's resolver already gave us the answers (via dns_cache) —
+// avoids a redundant DNS lookup that might disagree with the client's view.
 func ProbeIPs(ctx context.Context, domain string, ips []string, timeout time.Duration) Result {
-	return probeIPsWithFingerprint(ctx, domain, ips, DefaultFingerprint, timeout)
-}
-
-// ProbeIPsWithFingerprint is ProbeIPs but with a caller-chosen browser
-// fingerprint. Empty fp falls back to DefaultFingerprint.
-func ProbeIPsWithFingerprint(ctx context.Context, domain string, ips []string, fp Fingerprint, timeout time.Duration) Result {
-	return probeIPsWithFingerprint(ctx, domain, ips, fp, timeout)
-}
-
-func probeIPsWithFingerprint(ctx context.Context, domain string, ips []string, fp Fingerprint, timeout time.Duration) Result {
-	if fp == "" {
-		fp = DefaultFingerprint
-	}
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
@@ -135,14 +102,14 @@ func probeIPsWithFingerprint(ctx context.Context, domain string, ips []string, f
 		r.LatencyMS = int(time.Since(started) / time.Millisecond)
 		return r
 	}
-	return probeTCPTLS(ctx, r, started, timeout, fp)
+	return probeTCPTLS(ctx, r, started, timeout)
 }
 
 // probeTCPTLS races TCP:443 connects across up to MaxIPsToTry IPs in parallel,
-// takes the first success, then runs TLS-SNI + HTTP on that IP using the
-// supplied browser fingerprint for the TLS stage. Losing dials are cancelled
-// via the shared context.
-func probeTCPTLS(ctx context.Context, r Result, started time.Time, timeout time.Duration, fp Fingerprint) Result {
+// takes the first success, then runs TLS-SNI on that IP. Losing dials are
+// cancelled via the shared context. Compared to the sequential loop this
+// collapses worst-case latency from sum(timeouts) to max(timeouts).
+func probeTCPTLS(ctx context.Context, r Result, started time.Time, timeout time.Duration) Result {
 	r.DNSOK = len(r.ResolvedIPs) > 0
 	if !r.DNSOK {
 		r.FailureCode = CodeNoIPs
@@ -202,7 +169,7 @@ func probeTCPTLS(ctx context.Context, r Result, started time.Time, timeout time.
 	}
 	r.TCPOK = true
 
-	conn := probeTLSStaged(&r, reachable, "443", timeout, fp)
+	conn := probeTLSStaged(&r, reachable, "443", timeout)
 	if conn != nil {
 		probeHTTPStaged(&r, conn, timeout)
 		conn.Close()
@@ -211,37 +178,41 @@ func probeTCPTLS(ctx context.Context, r Result, started time.Time, timeout time.
 	return r
 }
 
-// probeTLSStaged runs the TLS handshake first via uTLS with the supplied
-// browser fingerprint (1.3 path), and on failure retries with Go's stdlib
-// tls.Dial pinned to TLS 1.2 — covering legacy 1.2-only servers that the
-// uTLS Chrome preset can't satisfy.
+// probeTLSStaged runs the TLS-SNI handshake first unrestricted (Go picks the
+// highest mutually-supported version, which is 1.3 against any modern
+// server) and, if that fails, retries pinned to TLS 1.2. The split is the
+// primary signal we use to detect ClientHello-targeted DPI: when 1.3 fails
+// but 1.2 succeeds, the middlebox is almost certainly inspecting the
+// ClientHello (ECH/ESNI / cipher-suite fingerprinting).
 //
-// The mimic-first design exists because RU-DPI (and similar) increasingly
-// blacklists ClientHello fingerprints rather than TLS as a whole: probing
-// with Go's stdlib fingerprint passes through DPI that a real Chrome user
-// gets cut by, producing false-Ignore verdicts. uTLS reproduces the
-// browser ClientHello byte-for-byte, so the engine sees what real clients
-// see.
+// The retry only fires on TLS-stage failures — a clean 1.3 handshake leaves
+// TLS12OK nil (we don't burn an extra dial just to populate the field).
 //
-// Returns a live net.Conn on success (uTLS UConn implements net.Conn, so
-// the HTTP stage works through the interface). Returns nil when both
-// attempts fail OR when the failure is server-reachable (typed TLS alert):
-// in the latter case TLSOK and HTTPOK are set to true so decision.Classify
-// gives Ignore, but the code/reason persist for observability.
-func probeTLSStaged(r *Result, ip, port string, timeout time.Duration, fp Fingerprint) net.Conn {
-	conn, code, reason, version := tlsHandshakeMimic(ip, port, r.Domain, fp, timeout)
+// We do NOT mark TLSOK=false when 1.3 fails / 1.2 ok in this function — the
+// fallback succeeded, the connection is reachable. The tls13_block verdict
+// is layered on top in a later phase, where it can interact with the HTTP
+// probe and decision rules.
+// probeTLSStaged returns a live *tls.Conn on success so the caller can
+// keep probing on the same connection (HTTP cutoff detection). Caller must
+// close the conn. Returns nil when both 1.3 and 1.2 attempts fail OR when
+// the failure is server-reachable (typed TLS alert) — in the latter case
+// TLSOK and HTTPOK are set to true so decision.Classify treats the result
+// as Ignore. mTLS-required servers (Apple Push, iCloud Private Relay) hit
+// this path.
+func probeTLSStaged(r *Result, ip, port string, timeout time.Duration) *tls.Conn {
+	conn, code, reason, version := tlsHandshake(ip, port, r.Domain, timeout, 0)
 	if conn != nil {
 		r.TLSOK = true
 		recordTLSVersion(r, version)
 		return conn
 	}
-	// Mimic attempt failed. Two sub-cases:
+	// First attempt failed. Two sub-cases:
 	//  1. Server actively rejected with a TLS alert → server is reachable,
-	//     no point retrying with 1.2 (the rejection is policy, not version).
-	//     Surface via TLSOK=true + HTTPOK=true so Classify gives Ignore,
-	//     but keep the code/reason for observability.
+	//     no point retrying with 1.2 (the rejection is typically policy,
+	//     not version). Surface via TLSOK=true + HTTPOK=true so Classify
+	//     gives Ignore, but keep the code/reason for observability.
 	//  2. Real failure (timeout, RST, EOF, etc.) → fall through to the
-	//     1.2 fallback for legacy 1.2-only servers.
+	//     1.2 retry path that distinguishes ClientHello-targeted DPI.
 	if IsServerReachable(code) {
 		r.TLSOK = true
 		t := true
@@ -251,24 +222,25 @@ func probeTLSStaged(r *Result, ip, port string, timeout time.Duration, fp Finger
 		return nil
 	}
 
-	// Real failure path. Stash the error so it survives if the 1.2 fallback
+	// Real failure path. Stash the error so it survives if the 1.2 retry
 	// also fails.
 	r.FailureCode = code
 	r.FailureReason = reason
 	f := false
 	r.TLS13OK = &f
 
-	// 1.2 fallback uses Go's stdlib tls.Dial — for genuinely 1.2-only
-	// servers the fingerprint mimic isn't the issue (1.2 servers don't
-	// see Chrome 1.3 ClientHello structure anyway). New TCP connection;
-	// the previous handshake usually drops the socket.
-	conn2, code2, _, _ := tlsHandshakeFallback12(ip, port, r.Domain, timeout)
+	// 1.2-only retry. New TCP connection — TLS failure usually drops the
+	// underlying socket too. We already paid for one failed handshake so
+	// this can stretch latency, but it's the price of distinguishing
+	// "real block" from "1.3-only block".
+	conn2, code2, _, _ := tlsHandshake(ip, port, r.Domain, timeout, tls.VersionTLS12)
 	if conn2 != nil {
 		t := true
 		r.TLS12OK = &t
 		r.TLSOK = true
-		// Clear the failure carried from the 1.3 attempt — TLS as a whole
-		// succeeded. TLS13OK=false stays for observability.
+		// Clear the failure carried over from the 1.3 attempt — TLS as a
+		// whole succeeded. TLS13OK=false stays so the asymmetry is visible
+		// to the next phase (which will lift it to a tls13_block verdict).
 		r.FailureCode = CodeOK
 		r.FailureReason = ""
 		return conn2
@@ -287,45 +259,16 @@ func probeTLSStaged(r *Result, ip, port string, timeout time.Duration, fp Finger
 	return nil
 }
 
-// tlsHandshakeMimic runs the primary TLS handshake using uTLS with the
-// supplied browser fingerprint. Returns a live *utls.UConn (which
-// implements net.Conn) on success, or nil + code/reason on failure.
-func tlsHandshakeMimic(ip, port, sni string, fp Fingerprint, timeout time.Duration) (conn net.Conn, code FailureCode, reason string, version uint16) {
-	rawConn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, port), timeout)
-	if err != nil {
-		c := categorize(stageTCP, err)
-		return nil, c, formatReason(c, err), 0
-	}
-
-	cfg := &utls.Config{
-		ServerName:         sni,
-		InsecureSkipVerify: true, // #nosec G402 — probing reachability, not identity
-	}
-	uconn := utls.UClient(rawConn, cfg, lookupHelloID(fp))
-	if err := uconn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		uconn.Close()
-		c := categorize(stageTLS, err)
-		return nil, c, formatReason(c, err), 0
-	}
-	if err := uconn.Handshake(); err != nil {
-		uconn.Close()
-		c := categorize(stageTLS, err)
-		return nil, c, formatReason(c, err), 0
-	}
-	// Clear the deadline so the HTTP stage can apply its own.
-	_ = uconn.SetDeadline(time.Time{})
-	state := uconn.ConnectionState()
-	return uconn, CodeOK, "", state.Version
-}
-
-// tlsHandshakeFallback12 is the legacy 1.2-only path via Go's stdlib
-// tls.Dial. Used only when the uTLS mimic attempt fails — covers servers
-// that genuinely can't speak TLS 1.3.
-func tlsHandshakeFallback12(ip, port, sni string, timeout time.Duration) (conn *tls.Conn, code FailureCode, reason string, version uint16) {
+// tlsHandshake runs one TLS dial. maxVersion=0 means "unrestricted" (Go
+// negotiates whatever it can). Returns the live conn on success so the
+// caller can run further stages (HTTP probe) without a fresh dial.
+func tlsHandshake(ip, port, sni string, timeout time.Duration, maxVersion uint16) (conn *tls.Conn, code FailureCode, reason string, version uint16) {
 	cfg := &tls.Config{
 		ServerName:         sni,
-		InsecureSkipVerify: true, // #nosec G402
-		MaxVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: true, // #nosec G402 — we're probing reachability, not verifying identity
+	}
+	if maxVersion != 0 {
+		cfg.MaxVersion = maxVersion
 	}
 	c, err := tls.DialWithDialer(&net.Dialer{Timeout: timeout},
 		"tcp", net.JoinHostPort(ip, port), cfg)
@@ -362,7 +305,7 @@ func recordTLSVersion(r *Result, version uint16) {
 // otherwise. A 4xx/5xx with a tiny body still counts as ptr(true) — the
 // path is reachable; the server made a deliberate response. We're
 // detecting middlebox cutoffs, not server semantics.
-func probeHTTPStaged(r *Result, conn net.Conn, timeout time.Duration) {
+func probeHTTPStaged(r *Result, conn *tls.Conn, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	if err := conn.SetDeadline(deadline); err != nil {
 		setHTTPFail(r, stageHTTP, err)
