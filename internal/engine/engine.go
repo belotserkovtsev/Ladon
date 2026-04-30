@@ -50,28 +50,37 @@ func loadDenyExtensions(ctx context.Context, store *storage.Store, cfg Config) {
 	}
 }
 
-// collectManualDomains reads the operator's manual-allow file plus every
-// enabled extension, returns a single deduplicated domain list. dnsmasq
-// then turns each into an `ipset=/domain/<set>` directive.
-func collectManualDomains(cfg Config) ([]string, error) {
-	seen := map[string]struct{}{}
-	var out []string
-	add := func(domains []string) {
-		for _, d := range domains {
-			if _, ok := seen[d]; ok {
+// collectManualEntries reads the operator's manual-allow file plus every
+// enabled extension, returns deduplicated domains and CIDRs. Domains go
+// to dnsmasq's `ipset=/domain/<set>` directive; CIDRs go to a separate
+// hash:net ipset (see runCIDRSyncer) since dnsmasq has no path for them.
+func collectManualEntries(cfg Config) (manual.Entries, error) {
+	seenDomain := map[string]struct{}{}
+	seenCIDR := map[string]struct{}{}
+	var out manual.Entries
+	add := func(e manual.Entries) {
+		for _, d := range e.Domains {
+			if _, ok := seenDomain[d]; ok {
 				continue
 			}
-			seen[d] = struct{}{}
-			out = append(out, d)
+			seenDomain[d] = struct{}{}
+			out.Domains = append(out.Domains, d)
+		}
+		for _, c := range e.CIDRs {
+			if _, ok := seenCIDR[c]; ok {
+				continue
+			}
+			seenCIDR[c] = struct{}{}
+			out.CIDRs = append(out.CIDRs, c)
 		}
 	}
 
 	if cfg.ManualAllowPath != "" {
-		ds, err := manual.ReadDomains(cfg.ManualAllowPath)
+		e, err := manual.ReadEntries(cfg.ManualAllowPath)
 		if err != nil {
 			return out, fmt.Errorf("manual-allow %q: %w", cfg.ManualAllowPath, err)
 		}
-		add(ds)
+		add(e)
 	}
 	for _, name := range cfg.AllowExtensions {
 		path := filepath.Join(cfg.ExtensionsPath, name+".txt")
@@ -79,13 +88,13 @@ func collectManualDomains(cfg Config) ([]string, error) {
 			log.Printf("allow extension %q: file not found at %s — check extensions_path", name, path)
 			continue
 		}
-		ds, err := manual.ReadDomains(path)
+		e, err := manual.ReadEntries(path)
 		if err != nil {
 			log.Printf("allow extension %q read: %v", name, err)
 			continue
 		}
-		log.Printf("allow extension %s: %d domains from %s", name, len(ds), path)
-		add(ds)
+		log.Printf("allow extension %s: %d domains + %d CIDRs from %s", name, len(e.Domains), len(e.CIDRs), path)
+		add(e)
 	}
 	return out, nil
 }
@@ -105,6 +114,7 @@ type Config struct {
 	PublishInterval        time.Duration // publisher cadence
 	IpsetName              string        // engine-managed ipset name (default ladon_engine)
 	ManualIpsetName        string        // dnsmasq-managed ipset name (default ladon_manual)
+	CIDRIpsetName          string        // CIDR ipset name for hash:net entries (default ladon_cidr; "" disables)
 	IpsetInterval          time.Duration // ipset reconcile cadence (periodic safety sweep)
 	DNSFreshness           time.Duration // how recent a dns_cache entry must be to ship IPs to ipset
 	Scorer                 scorer.Config // hot → cache promotion settings
@@ -154,6 +164,7 @@ func Defaults(logPath string) Config {
 		PublishInterval:        10 * time.Second,
 		IpsetName:              "ladon_engine",
 		ManualIpsetName:        "ladon_manual",
+		CIDRIpsetName:          "ladon_cidr",
 		IpsetInterval:          30 * time.Second, // fallback safety sweep; Hot events trigger immediate syncs
 		DNSFreshness:           6 * time.Hour,
 		Scorer:                 scorer.Defaults(),
@@ -192,20 +203,24 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	//      query-id tracking or eTLD+1 expansion to compensate.
 	//   3. Manual list = operator's stated intent; doesn't need probe-driven
 	//      verification. Letting dnsmasq own it keeps that mental model clean.
-	manualDomains, err := collectManualDomains(cfg)
+	manualEntries, err := collectManualEntries(cfg)
 	if err != nil {
 		log.Printf("manual: %v", err)
 	}
 	if cfg.ManualIpsetName != "" {
-		if err := dnsmasqcfg.Write(cfg.ManualIpsetName, manualDomains); err != nil {
+		if err := dnsmasqcfg.Write(cfg.ManualIpsetName, manualEntries.Domains); err != nil {
 			log.Printf("dnsmasq config write: %v", err)
 		} else {
-			log.Printf("manual: wrote %d domains → %s (ipset=%s)", len(manualDomains), dnsmasqcfg.Path, cfg.ManualIpsetName)
+			log.Printf("manual: wrote %d domains → %s (ipset=%s)", len(manualEntries.Domains), dnsmasqcfg.Path, cfg.ManualIpsetName)
 			if err := dnsmasqcfg.Restart(ctx); err != nil {
 				log.Printf("dnsmasq restart: %v — manual list will activate on next dnsmasq restart", err)
 			}
 		}
 	}
+	// CIDR entries skip dnsmasq entirely — they aren't DNS-driven. Reconcile
+	// the hash:net ipset directly so any line operator removed from a file
+	// also leaves the kernel set on next ladon start.
+	syncCIDRSet(ctx, cfg, manualEntries.CIDRs)
 
 	// Inline probe semaphore caps concurrent fast-path probes from the tailer.
 	// Regular probe-worker remains for re-probes and semaphore-full fallback.
@@ -536,6 +551,35 @@ func runPublisher(ctx context.Context, store *storage.Store, cfg Config) error {
 			publishNow()
 		}
 	}
+}
+
+// syncCIDRSet reconciles the hash:net ipset (default ladon_cidr) against the
+// CIDR list collected from manual-allow + extensions. One-shot at start, no
+// periodic sweep: extension files are read once at startup, so there's no
+// drift source — a SIGHUP/restart picks up edits the same way the dnsmasq
+// snippet does. Missing set is logged and skipped, same as the engine syncer.
+func syncCIDRSet(ctx context.Context, cfg Config, cidrs []string) {
+	if cfg.CIDRIpsetName == "" {
+		return
+	}
+	mgr := ipset.New(cfg.CIDRIpsetName)
+	ok, err := mgr.Exists(ctx)
+	if err != nil {
+		log.Printf("ipset %q exists check: %v", cfg.CIDRIpsetName, err)
+		return
+	}
+	if !ok {
+		if len(cidrs) > 0 {
+			log.Printf("ipset %q not found — skipping CIDR sync; create it with `ipset create %s hash:net family inet`", cfg.CIDRIpsetName, cfg.CIDRIpsetName)
+		}
+		return
+	}
+	added, removed, err := mgr.Reconcile(ctx, cidrs)
+	if err != nil {
+		log.Printf("ipset %q reconcile: %v", cfg.CIDRIpsetName, err)
+		return
+	}
+	log.Printf("ipset %s: +%d -%d (total %d CIDRs)", cfg.CIDRIpsetName, added, removed, len(cidrs))
 }
 
 // runIpsetSyncer keeps the gateway-side ipset (e.g. "prod") in sync with

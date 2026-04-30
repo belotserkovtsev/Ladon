@@ -1,12 +1,18 @@
-// Package manual loads allow/deny domain lists from plain text files into
-// manual_entries. Each line is one domain; blanks and '#' comments are
-// skipped. Loading is additive — removing a line from the file does NOT
-// remove the row from the DB (operator explicitly clears if needed).
+// Package manual loads allow/deny lists from plain text files. Each non-blank,
+// non-comment line is either a domain (default) or an IPv4 CIDR (detected via
+// net.ParseCIDR — covers single-IP /32 too). Domains feed manual_entries +
+// dnsmasq's ipset= directive; CIDRs go to a separate kernel hash:net set so
+// services with DNS-bypassing data planes (Telegram MTProto, BitTorrent peer
+// swarms, etc.) can still be tunneled. Loading is additive — removing a line
+// from the file does NOT remove the row from the DB (operator explicitly
+// clears if needed).
 package manual
 
 import (
 	"bufio"
 	"context"
+	"log"
+	"net"
 	"os"
 	"strings"
 
@@ -48,36 +54,61 @@ func Load(ctx context.Context, store *storage.Store, path, listName string) (int
 	return n, sc.Err()
 }
 
-// ReadDomains parses the same format as Load (one domain per line, '#'
-// comments, blanks ignored) and returns the lowercased / trimmed domains
-// without touching the database. Used by callers that delegate the list to
-// dnsmasq's native ipset= directive instead of storing in manual_entries.
-// A missing file returns an empty slice and no error.
-func ReadDomains(path string) ([]string, error) {
+// Entries is the parsed contents of a list file split by line shape.
+// Domains feed dnsmasq's ipset= directive (DNS-driven path); CIDRs feed a
+// separate hash:net ipset (DNS-bypassing data planes).
+type Entries struct {
+	Domains []string
+	CIDRs   []string
+}
+
+// ReadEntries parses path's lines and returns domains + CIDRs separated.
+// Lines that net.ParseCIDR accepts as IPv4 (incl. plain /32-implied IPs) go
+// to CIDRs; everything else is treated as a domain. IPv6 CIDRs are dropped
+// with a warning — ladon's routing pipeline is v4-only today (engine ignores
+// AAAA replies, ladon_engine/ladon_manual are family inet sets). A missing
+// file returns empty Entries and no error so callers can call unconditionally.
+func ReadEntries(path string) (Entries, error) {
+	var out Entries
 	if path == "" {
-		return nil, nil
+		return out, nil
 	}
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return out, nil
 		}
-		return nil, err
+		return out, err
 	}
 	defer f.Close()
 
-	var out []string
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+		// CIDR detection. ParseCIDR rejects bare IPs ("91.108.4.1") so we
+		// promote those to /32 first — operators sometimes drop a single
+		// host into the same file as a CIDR block, no reason to make them
+		// type the suffix.
+		probe := line
+		if !strings.Contains(probe, "/") && net.ParseIP(probe) != nil {
+			probe = probe + "/32"
+		}
+		if ip, ipnet, err := net.ParseCIDR(probe); err == nil {
+			if ip.To4() == nil {
+				log.Printf("manual: skipping IPv6 CIDR %q in %s (v6 routing not yet supported)", line, path)
+				continue
+			}
+			out.CIDRs = append(out.CIDRs, ipnet.String())
+			continue
+		}
 		domain := strings.ToLower(strings.TrimRight(line, "."))
 		if domain == "" {
 			continue
 		}
-		out = append(out, domain)
+		out.Domains = append(out.Domains, domain)
 	}
 	return out, sc.Err()
 }

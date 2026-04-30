@@ -1,0 +1,51 @@
+# ladon extension: Telegram (HTTP + MTProto)
+#
+# Подключается через config.yaml:
+#   allow_extensions: [telegram]
+#
+# Покрывает HTTP/HTTPS-уровень + MTProto data-plane (мобильный/desktop клиент):
+#  - web-клиент (web.telegram.org)
+#  - короткие ссылки (t.me)
+#  - Telegraph (статьи)
+#  - сайты сервисов (telegram.org, my.telegram.org, fragment.com)
+#  - desktop-загрузки (desktop.telegram.org, tdesktop.com)
+#  - DC IPs клиентов (CIDR-блоки ниже) — фактические чаты в мобиле/desktop
+#
+# Telegram-приложения после первоначального DC discovery подключаются к
+# data-center'ам по голому IP, минуя DNS. Поэтому одних доменов мало —
+# CIDR-блоки попадают в hash:net ipset (ladon_cidr) при старте ladon
+# и матчатся iptables напрямую.
+#
+# Источники CIDR-блоков:
+#   AS62041 (Telegram Messenger Inc) — RIPE/ARIN whois
+#   https://core.telegram.org/resources/cidr.txt (официальный список)
+# Списки стабильны годами — Telegram редко меняет AS-аллокации.
+
+# Web-клиент / основные сайты
+telegram.org
+core.telegram.org
+my.telegram.org
+web.telegram.org
+desktop.telegram.org
+
+# Короткие ссылки и legacy
+t.me
+telesco.pe
+
+# Desktop-клиент (downloads + сайт)
+tdesktop.com
+
+# Telegraph (платформа статей)
+telegra.ph
+
+# Fragment (маркетплейс username/numbers, Telegram-owned)
+fragment.com
+
+# Telegram DC CIDRs (MTProto data-plane, IPv4)
+91.108.4.0/22
+91.108.8.0/21
+91.108.16.0/21
+91.108.56.0/22
+95.161.64.0/20
+149.154.160.0/20
+185.76.151.0/24

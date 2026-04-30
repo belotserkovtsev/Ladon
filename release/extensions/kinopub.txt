@@ -1,0 +1,35 @@
+# ladon extension: KinoPub
+#
+# Подключается через config.yaml:
+#   allow_extensions: [kinopub]
+#
+# KinoPub — стриминг-сервис фильмов/сериалов. Зеркала (kinopub.* TLDs),
+# приватная CDN-инфраструктура и метаданные.
+#
+# NOTE: ранее в пресете были broad eTLD+1 (duckdns.org, onrender.com,
+# b-cdn.net), которые KinoPub использует для отдельных зеркал, но их
+# eTLD+1 expansion цеплял тысячи unrelated сервисов. Убраны из bundle.
+# Если конкретное зеркало через эти провайдеры перестало работать —
+# положи точечный поддомен в manual-allow.txt.
+
+# Core
+kino.pub
+kinopub.club
+kinopub.fun
+kinopub.life
+kino.pub.lol
+kinopub.media
+kinopub.rocks
+kino-pub.tv
+
+# CDN / video infra (KinoPub-specific)
+cdn2cdn.com
+cdn2site.com
+digital-cdn.net
+kpserver.link
+trackercdn.com
+
+# Метаданные / уведомления
+tmdb.org
+pushbr.com
+teleos.club

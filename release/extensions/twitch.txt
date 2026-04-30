@@ -1,15 +1,25 @@
 # ladon extension: Twitch
 #
 # Подключается через config.yaml:
-#   extensions: [twitch]
+#   allow_extensions: [twitch]
 #
 # Закомменченные домены (amazonaws.com, akamaihd.net) — overly broad,
 # зацепят кучу несвязанного трафика. Включай если знаешь что делаешь.
 
+# Core
 twitch.tv
 ttvnw.net
 live-video.net
 twitchcdn.net
 ext-twitch.tv
+
+# Сообщество — расширения чата (эмоты, бейджи, BTTV/FFZ интеграция).
+# Фронтятся через Cloudflare, попадают под общие SNI-фильтры на CF.
+7tv.app
+7tv.io
+betterttv.net
+frankerfacez.com
+ffzap.com
+
 # amazonaws.com
 # akamaihd.net

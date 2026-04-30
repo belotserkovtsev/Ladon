@@ -17,6 +17,7 @@ die()  { printf "%b==>%b %s\n" "$RED" "$NC" "$*" >&2; exit 1; }
 
 IPSET_ENGINE="${IPSET_ENGINE:-ladon_engine}"
 IPSET_MANUAL="${IPSET_MANUAL:-ladon_manual}"
+IPSET_CIDR="${IPSET_CIDR:-ladon_cidr}"
 LADON_PREFIX="${LADON_PREFIX:-/opt/ladon}"
 LADON_CONFIG_DIR="${LADON_CONFIG_DIR:-/etc/ladon}"
 
@@ -35,6 +36,8 @@ ipset destroy "$IPSET_ENGINE" 2>/dev/null || \
   warn "$IPSET_ENGINE still in use; remove iptables rules referencing it first"
 ipset destroy "$IPSET_MANUAL" 2>/dev/null || \
   warn "$IPSET_MANUAL still in use; remove iptables rules referencing it first"
+ipset destroy "$IPSET_CIDR" 2>/dev/null || \
+  warn "$IPSET_CIDR still in use; remove iptables rules referencing it first"
 
 log "persisting netfilter state (ipset save)"
 mkdir -p /etc/iptables
@@ -55,7 +58,7 @@ cat <<EOF
 ${GREEN}==> ladon uninstalled${NC}
 
 What was NOT removed (do this by hand if needed):
-  - any iptables rules YOU added that reference $IPSET_ENGINE / $IPSET_MANUAL
+  - any iptables rules YOU added that reference $IPSET_ENGINE / $IPSET_MANUAL / $IPSET_CIDR
   - any ip rule fwmark / routing tables you set up for the tunnel
   - dnsmasq + ipset packages (still installed)
 EOF

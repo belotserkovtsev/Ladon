@@ -1,0 +1,18 @@
+# ladon extension: SoundCloud
+#
+# Подключается через config.yaml:
+#   allow_extensions: [soundcloud]
+#
+# Только core SoundCloud-домены. Сторонние зависимости (cloudfront.net
+# для аудио-чанков, zendesk.com для support, onetrust.com для cookie
+# banner) намеренно не включены — слишком broad, тянут кучу несвязанного
+# трафика.
+#
+# NOTE: если playback ломается — аудио SoundCloud действительно идёт
+# через CloudFront. Положи `cloudfront.net` в свой manual-allow.txt
+# осознанно (это включит туннель для большой части западного веба).
+
+soundcloud.com
+soundcloud.cloud
+soundcloud.app.goo.gl
+sndcdn.com

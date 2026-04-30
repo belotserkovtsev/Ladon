@@ -1,0 +1,70 @@
+# ladon extension: Discord
+#
+# Подключается через config.yaml:
+#   allow_extensions: [discord]
+#
+# Discord ecosystem: приложение, gateway, CDN, голос/видео (media),
+# party-games, активити, мерч, статус. eTLD+1 раскрытие в dnsmasq
+# покрывает поддомены автоматически (gateway.discord.gg,
+# cdn.discordapp.com, edge.discord.gg и т.д.).
+#
+# Голос/видео — отдельная история: Discord-клиент после WSS-handshake
+# с gateway.discord.gg получает IP+port voice-сервера и шлёт UDP RTP/STUN
+# напрямую, без DNS-резолва конкретного хоста. Один discord.media в
+# списке доменов накачивает в ladon_manual только те /24, которые
+# успели зарезолвиться где-то ещё (probes, прошлые сессии). Дыры в
+# voice /19 проявляются как «voice connected, но всех не слышно» →
+# 5000ms ping → разрыв. CIDR-блок ниже гарантирует покрытие всего
+# голосового пула независимо от DNS.
+#
+# Источники CIDR:
+#   AS13335 (Cloudflare) — Magic Transit egress для Discord voice
+#     (текущая инфраструктура с миграции 2022)
+#   AS49063 (Discord, Inc.) — собственное IP-пространство для
+#     медиа/RTP-инфраструктуры
+
+# Core
+discord.com
+discordapp.com
+discordapp.net
+discord.app
+discord.co
+discord.dev
+dis.gd
+
+# Vanity / link domains
+discord.gg
+discord.gift
+discord.gifts
+discord.new
+discord.media
+discord.design
+discord.store
+
+# CDN
+discordcdn.com
+
+# Status
+discord.status
+discordstatus.com
+
+# Activities / party games / SDK
+discord-activities.com
+discordactivities.com
+discordpartygames.com
+discordsays.com
+discordsez.com
+localizeapi.com
+
+# Merch
+discordmerch.com
+
+# Discord-managed asset bucket (full FQDN — не eTLD+1, чтобы не зацепить
+# весь googleapis.com)
+discord-attachments-uploads-prd.storage.googleapis.com
+
+# Voice/video data-plane CIDRs (Discord client → UDP RTP/STUN, без DNS)
+# Cloudflare-Magic-Discord — основной voice egress
+162.159.128.0/19
+# Discord, Inc. AS49063 — медиа/RTP-инфраструктура
+66.22.196.0/22

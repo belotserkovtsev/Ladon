@@ -193,8 +193,9 @@ scorer:
   fail_threshold: 50
 
 ipset:
-  engine_name: ladon_engine
-  manual_name: ladon_manual
+  engine_name: ladon_engine # probe-driven hot/cache
+  manual_name: ladon_manual # populates dnsmasq'ом для manual-allow + extensions
+  cidr_name:   ladon_cidr   # hash:net для CIDR-блоков из extensions (Telegram MTProto и т.п.)
   interval: 30s
 
 hot_ttl: 24h

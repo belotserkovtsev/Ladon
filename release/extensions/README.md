@@ -22,8 +22,14 @@ allow_extensions: [ai, twitch, tiktok]
 | Имя | Тип | Что покрывает |
 |---|---|---|
 | `ai` | allow | OpenAI / ChatGPT, Anthropic / Claude |
-| `twitch` | allow | Стриминг (twitch.tv + CDN-домены) |
+| `chess` | allow | Chess.com + статика |
+| `discord` | allow | Discord (приложение, gateway, CDN, медиа, активити, мерч) |
+| `kinopub` | allow | KinoPub (зеркала, CDN, метаданные) |
+| `soundcloud` | allow | SoundCloud (core domains) |
+| `telegram` | allow | Telegram HTTP-уровень (web, t.me, Telegraph, fragment, downloads) + DC CIDRs для MTProto data-plane (мобильный/desktop клиент) |
 | `tiktok` | allow | TikTok / ByteDance overseas (core, regional CDN, backbone, SDK) |
+| `twitch` | allow | Twitch (core + CDN + community-расширения 7tv/BetterTTV/FrankerFaceZ) |
+| `youtube` | allow | YouTube (web, видео-CDN, embed-плеер, kids, YT-Google APIs) |
 
 ## Семантика
 
@@ -124,7 +130,24 @@ deny_extensions:  [corp-internal]
 example.com
 sub.example.com
 # disabled.example.com   ← закомментировано, не загрузится
+
+# CIDR-блоки в том же файле (для сервисов, которые ходят на голые IP мимо DNS):
+91.108.4.0/22
+185.76.151.42        # одиночный IP — auto-промоутится в /32
 ```
 
-Один домен на строку. Без `https://`, без портов, без слэшей.
-Регистронезависимо. Точка в конце (`example.com.`) отрезается.
+Парсер сам разделяет: что распарсилось через `net.ParseCIDR` — попадает
+в `ladon_cidr` (hash:net), остальное — в `ladon_manual` (через dnsmasq).
+IPv6 CIDRs пока пропускаются с warning'ом — routing-пайплайн v4-only.
+
+Один домен/CIDR на строку. Для доменов: без `https://`, без портов, без
+слэшей; регистронезависимо; точка в конце (`example.com.`) отрезается.
+
+### Зачем CIDR
+
+Некоторые сервисы после первоначального bootstrap ходят на data-plane по
+голому IP, минуя DNS. dnsmasq → ipset для них бесполезен. Пример —
+Telegram MTProto: мобильный клиент после DC discovery подключается к
+`91.108.x.x`/`149.154.x.x` напрямую. CIDR-блоки заливаются в `ladon_cidr`
+при старте ladon и матчатся iptables на уровне dst IP — независимо от
+DNS-резолва.
