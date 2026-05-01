@@ -509,7 +509,6 @@ func reasonFromProbe(r prober.Result) string {
 	return "ok"
 }
 
-
 func runPublisher(ctx context.Context, store *storage.Store, cfg Config) error {
 	if cfg.PublishPath == "" {
 		return nil
