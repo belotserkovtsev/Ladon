@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/belotserkovtsev/ladon/internal/decision"
@@ -429,25 +428,18 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 	// that's both the only case where remote can change the verdict (it can
 	// never veto a local OK; if the gateway can reach it, no need to tunnel),
 	// and the bandwidth-cheapest filter for the operator's remote server.
+	//
+	// Combine logic is code-aware: ClassifyRemote distinguishes full-chain OK
+	// from TCP+TLS-only-OK (legacy remote) from HTTP-stage-fail. The latter
+	// matters for HTTP-class ambiguous local codes (http_cutoff/timeout/error)
+	// where server-side severing — not DPI — is the cause; pre-PR combine
+	// looked only at TCP+TLS and false-promoted Yandex-class endpoints to Hot.
 	if useExitCompare && verdict == decision.Hot && cfg.RemoteProber != nil {
 		rres := cfg.RemoteProber.Probe(ctx, domain, ips)
 		persistProbe(ctx, store, rres)
-		switch {
-		case rres.TCPOK && rres.TLSOK:
-			// Real DPI block: direct path dead, exit confirms target is alive.
-			hotReason = "local:" + reasonFromProbe(res) + "|remote:ok"
-		case isRemoteTransportFailure(rres):
-			// Remote prober itself unreachable / timed out / returned non-200.
-			// Treat as "no opinion" — never let an outage of the operator's
-			// probe-server cascade into Ignore-ing real DPI blocks. Stick with
-			// the local Hot verdict.
-			hotReason = "local:" + reasonFromProbe(res) + "|remote:unavailable:" + reasonFromProbe(rres)
-		default:
-			// Both probers reported a real failure: methodological FP (port
-			// wrong, dead server, geofence on both vantage points).
-			verdict = decision.Ignore
-			hotReason = "local:" + reasonFromProbe(res) + "|remote:" + reasonFromProbe(rres)
-		}
+		newVerdict, tag := decision.CombineExitCompare(res.FailureCode, decision.ClassifyRemote(rres))
+		verdict = newVerdict
+		hotReason = "local:" + reasonFromProbe(res) + "|" + tag + ":" + reasonFromProbe(rres)
 	}
 
 	cooldown := time.Now().UTC().Add(cfg.ProbeCooldown)
@@ -515,15 +507,6 @@ func reasonFromProbe(r prober.Result) string {
 		return r.FailureReason
 	}
 	return "ok"
-}
-
-// isRemoteTransportFailure reports whether a remote prober result represents
-// the prober itself being unreachable (network error, timeout, non-200) rather
-// than a real verdict from a working remote. Modern remotes set
-// FailureCode=remote_unreachable; older ones only set the legacy
-// "remote:..." reason prefix, which the prober still recognises.
-func isRemoteTransportFailure(r prober.Result) bool {
-	return r.IsRemoteTransportFailure() || strings.HasPrefix(r.FailureReason, "remote:")
 }
 
 func runPublisher(ctx context.Context, store *storage.Store, cfg Config) error {
