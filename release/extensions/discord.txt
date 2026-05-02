@@ -1,87 +1,19 @@
-# ladon extension: Discord
+# ladon extension: Discord (CIDR-only)
 #
-# Подключается через config.yaml:
-#   allow_extensions: [discord]
-#
-# Discord ecosystem: приложение, gateway, CDN, голос/видео (media),
-# party-games, активити, мерч, статус. eTLD+1 раскрытие в dnsmasq
-# покрывает поддомены автоматически (gateway.discord.gg,
-# cdn.discordapp.com, edge.discord.gg и т.д.).
-#
-# Голос/видео — отдельная история: Discord-клиент после WSS-handshake
-# с gateway.discord.gg получает IP+port voice-сервера и шлёт UDP RTP/STUN
-# напрямую, без DNS-резолва конкретного хоста. Один discord.media в
-# списке доменов накачивает в ladon_manual только те /24, которые
-# успели зарезолвиться где-то ещё (probes, прошлые сессии). Дыры в
-# voice /19 проявляются как «voice connected, но всех не слышно» →
-# 5000ms ping → разрыв. CIDR-блок ниже гарантирует покрытие всего
-# голосового пула независимо от DNS.
-#
-# Источники CIDR:
-#   AS13335 (Cloudflare) — два пула для Discord voice:
-#     - 162.159.128.0/19 (Magic Transit egress, основной с 2022)
-#     - 104.16.0.0/12   (anycast, региональный failover; разные /16
-#                        по регионам — Финляндия зачастую 104.25.x,
-#                        наблюдали 104.29.x в EU. Узкий /16 поломает
-#                        voice пользователям в других регионах.)
-#   AS49063 (Discord, Inc.) — собственное IP-пространство (API,
-#     image CDN, RTP legacy). 14 диапазонов из ASN-аллокации.
+# Domain entries исключены — engine reactive-probe'ит их через dnsmasq tail.
+# CIDR обязательны: voice/RTP/STUN data-plane минует DNS.
 
-# Core
-discord.com
-discordapp.com
-discordapp.net
-discord.app
-discord.co
-discord.dev
-dis.gd
-
-# Vanity / link domains
-discord.gg
-discord.gift
-discord.gifts
-discord.new
-discord.media
-discord.design
-discord.store
-
-# CDN
-discordcdn.com
-
-# Status
-discord.status
-discordstatus.com
-
-# Activities / party games / SDK
-discord-activities.com
-discordactivities.com
-discordpartygames.com
-discordsays.com
-discordsez.com
-localizeapi.com
-
-# Merch
-discordmerch.com
-
-# Discord-managed asset bucket (full FQDN — не eTLD+1, чтобы не зацепить
-# весь googleapis.com)
-discord-attachments-uploads-prd.storage.googleapis.com
-
-# Voice/video data-plane CIDRs (Discord client → UDP RTP/STUN, без DNS)
-
-# Cloudflare Magic Transit (Discord voice egress, primary)
+# Cloudflare (Magic Transit + anycast)
 162.159.128.0/19
-
-# Cloudflare anycast (Discord voice failover/regional, 104.16-31.x.x)
-# Wide /12 на всю anycast — Discord раскидывает голосовые сервера по
-# разным /16 в зависимости от региона (zapret hosts мапит финские
-# voice-хосты на 104.25.x; наблюдали 104.29.x в EU). Узкий /16
-# поломает voice пользователям в других регионах. Цена: некоторый
-# прямой-IP трафик к non-Discord cloudflare-сайтам пойдёт через VPN —
-# домен-резолвимый трафик (через ladon_manual) этого не касается.
+162.158.0.0/16
 104.16.0.0/12
+172.64.0.0/13
 
-# Discord, Inc. AS49063 (own IP space — API, image CDN, RTP legacy)
+# Google Cloud (Discord voice egress, наблюдали 35.217.15.161:50008 — europe-west1)
+35.216.0.0/13
+35.224.0.0/12
+
+# Discord, Inc. AS49063
 66.22.176.0/24
 66.22.188.0/22
 66.22.196.0/22
