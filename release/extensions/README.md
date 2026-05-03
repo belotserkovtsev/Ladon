@@ -22,6 +22,7 @@ allow_extensions: [ai, twitch, tiktok]
 | Имя | Тип | Что покрывает |
 |---|---|---|
 | `ai` | allow | OpenAI / ChatGPT, Anthropic / Claude |
+| `brawlstars` | allow | Brawl Stars (Supercell): game-сервер (TCP/UDP 9339), web/CDN/login/inbox + Supercell-owned CIDR |
 | `chess` | allow | Chess.com + статика |
 | `discord` | allow | Discord (приложение, gateway, CDN, медиа, активити, мерч) |
 | `kinopub` | allow | KinoPub (зеркала, CDN, метаданные) |

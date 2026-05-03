@@ -1,0 +1,27 @@
+# ladon extension: Brawl Stars (Supercell)
+#
+# Game traffic: TCP/UDP 9339 → game.brawlstarsgame.com → AWS us-west-2.
+# Web/CDN/login/inbox: brawlstars.com / supercell.com / supercell.net
+# (CloudFront + Akamai).
+#
+# NOT a CIDR-only candidate. BS game servers live in shared AWS us-west-2
+# space (52.33/16, 44.227/16, 44.241/16). CIDR allow-list would either
+# over-catch the entire AWS prefix or miss IP rotations. Engine
+# reactive-probe also won't classify Brawl Stars as HOT — игра не
+# заблокирована из РФ открыто, TLS-handshake проходит. Domain-based
+# resolution через dnsmasq — единственная стратегия, которая ловит
+# именно BS-трафик без FP.
+#
+# CIDR ниже — Supercell-owned dedicated /22 (Netify), для редких
+# direct-IP коннектов в обход DNS.
+
+# Game server (port 9339)
+brawlstarsgame.com
+
+# Web / CDN / login / inbox / account
+brawlstars.com
+supercell.com
+supercell.net
+
+# Supercell-owned dedicated IP space (Netify)
+5.180.72.0/22
