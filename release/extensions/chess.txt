@@ -1,9 +1,0 @@
-# ladon extension: Chess.com
-#
-# Подключается через config.yaml:
-#   allow_extensions: [chess]
-#
-# Chess.com и его статика. Узкий пресет — два eTLD+1.
-
-chess.com
-chesscomfiles.com
