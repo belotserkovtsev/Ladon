@@ -47,6 +47,15 @@ func TestClassify(t *testing.T) {
 			in:   prober.Result{DNSOK: true, TCPOK: true, TLSOK: true},
 			want: Ignore,
 		},
+		{
+			name: "tls13_block (1.2 fallback ok, 1.3 path-blocked) → hot",
+			in: prober.Result{
+				DNSOK: true, TCPOK: true, TLSOK: true,
+				HTTPOK:      ptrBool(true),
+				FailureCode: prober.CodeTLS13Block,
+			},
+			want: Hot,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

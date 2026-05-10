@@ -37,5 +37,13 @@ func Classify(r prober.Result) Verdict {
 	if r.HTTPOK != nil && !*r.HTTPOK {
 		return Hot
 	}
+	// 1.3 ClientHello-targeted block: TLSOK is true (the 1.2 fallback
+	// succeeded), HTTPOK is true (server responded over 1.2), but the
+	// browser the user actually drives speaks 1.3 by default. Treating
+	// this as Ignore would silently leave the user breaking; treating
+	// it as Hot tunnels via Ladon and keeps Chrome/Firefox 1.3 working.
+	if r.FailureCode == prober.CodeTLS13Block {
+		return Hot
+	}
 	return Ignore
 }
