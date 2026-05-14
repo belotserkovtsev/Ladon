@@ -22,8 +22,7 @@ curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/ins
   | sudo bash
 ```
 
-Скрипт ставит бинарь, конфиги, ipset'ы и dnsmasq drop-in — нужен Debian/Ubuntu
-с WireGuard и dnsmasq. Полный runbook + manual install + troubleshooting —
+Скрипт ставит бинарь, конфиги, ipset'ы и dnsmasq drop-in — нужен Debian/Ubuntu. Полный runbook + manual install + troubleshooting —
 в [docs/install.md](docs/install.md).
 
 ## Как работает
