@@ -63,8 +63,9 @@ jobs:
   build-openwrt:
     # OpenWRT tarballs ship side-by-side with the Debian ones. Same binary
     # (Go static, CGO_ENABLED=0), different bundle: procd init unit instead
-    # of systemd, install-openwrt.sh instead of install.sh, OpenWRT config
-    # example. Arch names here mirror what `opkg print-architecture` yields.
+    # of systemd, OpenWRT config example. The install.sh in both tarballs
+    # is the same unified dispatcher that detects OS at runtime. Arch names
+    # here mirror what `opkg print-architecture` yields.
     name: 🏗 build openwrt ${{ matrix.tarball_arch }}
     runs-on: ubuntu-latest
     strategy:
@@ -117,8 +118,8 @@ jobs:
           cp release/manual-allow.txt.example         "${STAGE}/"
           cp release/manual-deny.txt.example          "${STAGE}/"
           cp release/config.yaml.openwrt.example      "${STAGE}/"
-          cp release/install-openwrt.sh               "${STAGE}/"
-          cp release/uninstall-openwrt.sh             "${STAGE}/"
+          cp release/install.sh                       "${STAGE}/"
+          cp release/uninstall.sh                     "${STAGE}/"
           cp -r release/extensions                    "${STAGE}/"
 
           tar -czf "dist/ladon-openwrt-${TARBALL_ARCH}.tar.gz" -C dist "ladon-openwrt-${TARBALL_ARCH}-${TAG}"
@@ -151,15 +152,14 @@ jobs:
         run: ls -la dist/
 
       - name: stage standalone install scripts
-        # Publish install.sh / uninstall.sh + their OpenWRT counterparts as
-        # separate release assets too, so the recommended one-liner can fetch
-        # them via the predictable /releases/latest/download/<name>.sh URL
-        # without unpacking a tarball.
+        # Publish install.sh / uninstall.sh as separate release assets too,
+        # so the recommended one-liner can fetch them via the predictable
+        # /releases/latest/download/<name>.sh URL without unpacking a tarball.
+        # A single script dispatches Debian vs OpenWRT by sniffing
+        # /etc/openwrt_release vs /etc/os-release.
         run: |
-          cp release/install.sh             dist/install.sh
-          cp release/uninstall.sh           dist/uninstall.sh
-          cp release/install-openwrt.sh     dist/install-openwrt.sh
-          cp release/uninstall-openwrt.sh   dist/uninstall-openwrt.sh
+          cp release/install.sh   dist/install.sh
+          cp release/uninstall.sh dist/uninstall.sh
           chmod +x dist/*.sh
 
       - name: publish GitHub Release
@@ -170,8 +170,6 @@ jobs:
             dist/*.sha256
             dist/install.sh
             dist/uninstall.sh
-            dist/install-openwrt.sh
-            dist/uninstall-openwrt.sh
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}

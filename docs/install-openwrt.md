@@ -25,8 +25,11 @@
 ## TL;DR — установка одной командой
 
 ```sh
-wget -O- https://github.com/belotserkovtsev/ladon/releases/latest/download/install-openwrt.sh | sh
+wget -O- https://github.com/belotserkovtsev/ladon/releases/latest/download/install.sh | sh
 ```
+
+Тот же `install.sh`, что и для Debian — он сниффает `/etc/openwrt_release` и
+переключается в OpenWRT-режим автоматически.
 
 Скрипт:
 
@@ -51,7 +54,7 @@ wget -O- https://github.com/belotserkovtsev/ladon/releases/latest/download/insta
 **Что скрипт НЕ делает:** не трогает firewall4 / nftables / routing.
 Это зона ответственности оператора — см. секцию ниже.
 
-**Обновление:** тот же `install-openwrt.sh` повторно. Скрипт идемпотентен:
+**Обновление:** тот же `install.sh` повторно. Скрипт идемпотентен:
 подтянет latest, перезапишет бинарь / init / extensions, **сохранит**
 `config.yaml` и manual-списки, перезапустит ладон.
 
@@ -175,7 +178,7 @@ edge case — открой issue с `logread -e ladon` и `uname -a`.
 ## Удаление
 
 ```sh
-wget -O- https://github.com/belotserkovtsev/ladon/releases/latest/download/uninstall-openwrt.sh | sh
+wget -O- https://github.com/belotserkovtsev/ladon/releases/latest/download/uninstall.sh | sh
 ```
 
 Скрипт:

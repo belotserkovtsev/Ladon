@@ -4,7 +4,7 @@
 # (dnsmasq.conf_path в /tmp/, restart_cmd через /etc/init.d/, state/extensions
 # под /var/lib и /usr/share). Всё остальное — те же дефолты.
 #
-# install-openwrt.sh кладёт этот файл в /etc/ladon/config.yaml автоматически
+# install.sh кладёт этот файл в /etc/ladon/config.yaml автоматически
 # при первой установке (повторный запуск не перезатирает).
 
 # --- paths ---

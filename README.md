@@ -17,21 +17,16 @@ Ladon реактивно наблюдает DNS-трафик клиентов ш
 
 ## Установка
 
-**Debian/Ubuntu:**
-
-```bash
-curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/install.sh \
-  | sudo bash
-```
-
-**OpenWRT (beta, с v1.4.0):**
+Один скрипт для обеих платформ — сам определит Debian/Ubuntu или OpenWRT:
 
 ```sh
-wget -O- https://github.com/belotserkovtsev/ladon/releases/latest/download/install-openwrt.sh | sh
+curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/install.sh | sudo sh
 ```
 
-Скрипт ставит бинарь, конфиги, ipset'ы и интеграцию с dnsmasq. Полные runbook'и + manual install + troubleshooting:
-[docs/install.md](docs/install.md) (Debian/Ubuntu), [docs/install-openwrt.md](docs/install-openwrt.md) (OpenWRT).
+(на OpenWRT — `wget -O- ... | sh`, sudo не нужен).
+
+Ставит бинарь, конфиги, ipset'ы и интеграцию с dnsmasq. Полные runbook'и + manual install + troubleshooting:
+[docs/install.md](docs/install.md) (Debian/Ubuntu), [docs/install-openwrt.md](docs/install-openwrt.md) (OpenWRT, beta).
 
 ## Как работает
 
