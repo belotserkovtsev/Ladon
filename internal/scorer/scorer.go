@@ -14,9 +14,9 @@ import (
 
 // Config tunes promotion thresholds.
 type Config struct {
-	Interval        time.Duration // how often the scorer wakes up
-	Window          time.Duration // verdicts outside this window are ignored
-	PromoteThreshold int          // minimum blocked verdicts required in window
+	Interval         time.Duration // how often the scorer wakes up
+	Window           time.Duration // verdicts outside this window are ignored
+	PromoteThreshold int           // minimum blocked verdicts required in window
 }
 
 // Defaults returns production-grade values: scan every 10 minutes, look at

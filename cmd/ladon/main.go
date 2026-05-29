@@ -302,6 +302,14 @@ func pruneCmd(ctx context.Context, store *storage.Store, rest []string) {
 }
 
 func runCmd(ctx context.Context, store *storage.Store, configPath string, rest []string) {
+	// Self-migrate before the daemon touches the DB. Init is idempotent (a
+	// no-op on an already-current schema), so this closes the upgrade gap where
+	// swapping the binary and restarting `ladon run` without re-running init-db
+	// would leave the daemon querying a column the migration hadn't added yet.
+	if err := store.Init(ctx); err != nil {
+		fatal("migrate: %v", err)
+	}
+
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	fromStart := fs.Bool("from-start", false, "process whole log from the beginning")
 	allow := fs.String("manual-allow", "", "path to manual allow list (optional)")

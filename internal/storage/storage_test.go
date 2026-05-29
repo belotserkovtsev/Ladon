@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/belotserkovtsev/ladon/internal/migrate"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -178,9 +180,10 @@ func TestInsertProbeAndStampVerdict(t *testing.T) {
 }
 
 // TestMigrateSchemaFromLegacyDB seeds a pre-v1.4 schema (retired columns
-// present, no verdict), runs migrateSchema, and asserts the dead columns are
-// dropped, probes.verdict is added, existing rows survive, and a second pass
-// is a no-op. Also confirms the modernc build supports ALTER TABLE DROP COLUMN.
+// present, no verdict, user_version=0), runs the migration list, and asserts the
+// dead columns are dropped, probes.verdict is added, existing rows survive,
+// user_version is stamped to the baseline, and a second pass is a no-op. Also
+// confirms the modernc build supports ALTER TABLE DROP COLUMN inside a tx.
 func TestMigrateSchemaFromLegacyDB(t *testing.T) {
 	ctx := context.Background()
 	s, err := Open(filepath.Join(t.TempDir(), "legacy.db"))
@@ -210,7 +213,7 @@ func TestMigrateSchemaFromLegacyDB(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.migrateSchema(ctx); err != nil {
+	if err := migrate.Run(ctx, s.wdb, schema); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 
@@ -256,8 +259,17 @@ func TestMigrateSchemaFromLegacyDB(t *testing.T) {
 		t.Errorf("row not preserved: hit_count=%d, want 5", hc)
 	}
 
-	// Idempotent.
-	if err := s.migrateSchema(ctx); err != nil {
+	// Baseline stamped so future runs know where the DB sits.
+	var ver int
+	if err := s.wdb.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&ver); err != nil {
+		t.Fatal(err)
+	}
+	if ver != 1 {
+		t.Errorf("user_version = %d, want 1", ver)
+	}
+
+	// Idempotent: a second pass sees user_version=1 and runs nothing.
+	if err := migrate.Run(ctx, s.wdb, schema); err != nil {
 		t.Fatalf("second migrate pass: %v", err)
 	}
 }

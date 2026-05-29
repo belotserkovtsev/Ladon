@@ -202,12 +202,12 @@ for SET in ladon_engine ladon_manual ladon_cidr; do
   echo -n "$SET: "; ipset list "$SET" -t 2>/dev/null | grep '^Number'
 done
 
-# Последние 10 вердиктов
+# Последние 10 blocked-вердиктов
 sqlite3 -column /opt/ladon/state/engine.db \
-  "SELECT d.domain, d.state, p.latency_ms, p.failure_reason
-   FROM domains d JOIN probes p ON p.id = d.last_probe_id
-   WHERE d.state = 'hot'
-   ORDER BY p.created_at DESC LIMIT 10"
+  "SELECT domain, verdict, failure_reason, created_at
+   FROM probes
+   WHERE verdict = 'blocked'
+   ORDER BY created_at DESC LIMIT 10"
 ```
 
 ## 6. Обновление manual-списков

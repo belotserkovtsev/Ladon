@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/belotserkovtsev/ladon/internal/etld"
+	"github.com/belotserkovtsev/ladon/internal/migrate"
 	"modernc.org/sqlite"
 )
 
@@ -123,71 +124,16 @@ func (s *Store) Close() error {
 	return rerr
 }
 
+// Init brings the database schema up to date and runs lightweight backfills. It
+// is idempotent — safe to call on every startup — so both the init-db subcommand
+// and the run daemon invoke it, and an already-current database is left untouched.
 func (s *Store) Init(ctx context.Context) error {
-	if _, err := s.wdb.ExecContext(ctx, schemaSQL); err != nil {
-		return err
-	}
-	if err := s.migrateSchema(ctx); err != nil {
+	if err := migrate.Run(ctx, s.wdb, schema); err != nil {
 		return err
 	}
 	// Backfill etld_plus_one for any rows that pre-date the column population.
 	_, err := s.BackfillETLDPlusOne(ctx)
 	return err
-}
-
-// migrateSchema reconciles a pre-existing DB with the current schema. New DBs
-// already match schema.sql, so every step is a guarded no-op; existing DBs get
-// probes.verdict added and the retired columns dropped. Idempotent.
-func (s *Store) migrateSchema(ctx context.Context) error {
-	has := func(table, col string) (bool, error) {
-		rows, err := s.wdb.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
-		if err != nil {
-			return false, err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var cid, notnull, pk int
-			var name, ctype string
-			var dflt sql.NullString
-			if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-				return false, err
-			}
-			if name == col {
-				return true, nil
-			}
-		}
-		return false, rows.Err()
-	}
-
-	// Required: scorer counts blocked verdicts off this column.
-	if ok, err := has("probes", "verdict"); err != nil {
-		return err
-	} else if !ok {
-		if _, err := s.wdb.ExecContext(ctx, `ALTER TABLE probes ADD COLUMN verdict TEXT`); err != nil {
-			return fmt.Errorf("add probes.verdict: %w", err)
-		}
-	}
-
-	// Retire columns no longer read by any code path (KISS — minimal data).
-	for _, d := range []struct{ table, col string }{
-		{"domains", "score"},
-		{"domains", "peer_count"},
-		{"domains", "last_probe_id"},
-		{"probes", "resolved_ips_json"},
-		{"probes", "latency_ms"},
-	} {
-		ok, err := has(d.table, d.col)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
-		if _, err := s.wdb.ExecContext(ctx, `ALTER TABLE `+d.table+` DROP COLUMN `+d.col); err != nil {
-			return fmt.Errorf("drop %s.%s: %w", d.table, d.col, err)
-		}
-	}
-	return nil
 }
 
 // BackfillETLDPlusOne fills etld_plus_one for rows where it is NULL or empty.
