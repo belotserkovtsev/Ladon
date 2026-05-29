@@ -18,7 +18,6 @@ import (
 	"github.com/belotserkovtsev/ladon/internal/ipset"
 	"github.com/belotserkovtsev/ladon/internal/manual"
 	"github.com/belotserkovtsev/ladon/internal/prober"
-	"github.com/belotserkovtsev/ladon/internal/publisher"
 	"github.com/belotserkovtsev/ladon/internal/scorer"
 	"github.com/belotserkovtsev/ladon/internal/storage"
 	"github.com/belotserkovtsev/ladon/internal/tail"
@@ -109,8 +108,6 @@ type Config struct {
 	InlineProbeConcurrency int           // max concurrent inline probes (0 disables inline fast-path)
 	HotTTL                 time.Duration // lifetime of a hot_entries row
 	ExpiryInterval         time.Duration // hot_entries sweep cadence
-	PublishPath            string        // where to write the published domain set
-	PublishInterval        time.Duration // publisher cadence
 	IpsetName              string        // engine-managed ipset name (default ladon_engine)
 	ManualIpsetName        string        // dnsmasq-managed ipset name (default ladon_manual)
 	CIDRIpsetName          string        // CIDR ipset name for hash:net entries (default ladon_cidr; "" disables)
@@ -159,8 +156,6 @@ func Defaults(logPath string) Config {
 		InlineProbeConcurrency: 8,
 		HotTTL:                 24 * time.Hour,
 		ExpiryInterval:         30 * time.Second,
-		PublishPath:            "state/published-domains.txt",
-		PublishInterval:        10 * time.Second,
 		IpsetName:              "ladon_engine",
 		ManualIpsetName:        "ladon_manual",
 		CIDRIpsetName:          "ladon_cidr",
@@ -229,12 +224,11 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	// a single buffered slot coalesces storms of hot events into one sync pass.
 	ipsetTrigger := make(chan struct{}, 1)
 
-	errCh := make(chan error, 6)
+	errCh := make(chan error, 5)
 
 	go func() { errCh <- runTailer(ctx, store, cfg, sem, ipsetTrigger) }()
 	go func() { errCh <- runProbeWorker(ctx, store, cfg, ipsetTrigger) }()
 	go func() { errCh <- runExpirySweeper(ctx, store, cfg) }()
-	go func() { errCh <- runPublisher(ctx, store, cfg) }()
 	go func() { errCh <- runIpsetSyncer(ctx, store, cfg, ipsetTrigger) }()
 	go func() { errCh <- scorer.Run(ctx, store, cfg.Scorer) }()
 
@@ -507,33 +501,6 @@ func reasonFromProbe(r prober.Result) string {
 		return r.FailureReason
 	}
 	return "ok"
-}
-
-func runPublisher(ctx context.Context, store *storage.Store, cfg Config) error {
-	if cfg.PublishPath == "" {
-		return nil
-	}
-	ticker := time.NewTicker(cfg.PublishInterval)
-	defer ticker.Stop()
-
-	publishNow := func() {
-		n, err := publisher.PublishDomains(ctx, store, cfg.PublishPath)
-		if err != nil {
-			log.Printf("publish: %v", err)
-			return
-		}
-		log.Printf("published %d domains → %s", n, cfg.PublishPath)
-	}
-	publishNow()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			publishNow()
-		}
-	}
 }
 
 // syncCIDRSet reconciles the hash:net ipset (default ladon_cidr) against the

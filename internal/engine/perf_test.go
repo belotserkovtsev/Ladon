@@ -39,7 +39,6 @@ func newTestEngine(t *testing.T, ctx context.Context, probeTimeout time.Duration
 	cfg.ProbeTimeout = probeTimeout
 	cfg.ProbeCooldown = time.Second // tighten for tests
 	cfg.IpsetName = ""              // no iptables/ipset on dev box
-	cfg.PublishPath = ""            // skip file writes
 	cfg.ExpiryInterval = time.Hour  // keep sweeper idle
 	cfg.Scorer.Interval = time.Hour // keep scorer idle
 	return s, logPath, cfg

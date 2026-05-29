@@ -63,11 +63,6 @@ ipset:
 hot_ttl: 24h           # срок жизни записи в hot_entries
 dns_freshness: 6h      # возраст, после которого IP из dns_cache устаревает
 
-# --- публикация ---
-
-# publish_path: /opt/ladon/state/published-domains.txt
-# publish_interval: 10s
-
 # --- прочее ---
 
 # ignore_peer: 10.10.0.1   # peer, чьи DNS-запросы игнорируются (gateway self)

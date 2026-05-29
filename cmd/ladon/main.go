@@ -396,12 +396,6 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 	if f.DNSFreshness > 0 {
 		cfg.DNSFreshness = f.DNSFreshness
 	}
-	if f.PublishPath != "" {
-		cfg.PublishPath = f.PublishPath
-	}
-	if f.PublishInterval > 0 {
-		cfg.PublishInterval = f.PublishInterval
-	}
 	if f.IgnorePeer != "" {
 		cfg.IgnorePeer = f.IgnorePeer
 	}
