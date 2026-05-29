@@ -114,8 +114,6 @@ ipset:
 
 hot_ttl: 48h
 dns_freshness: 3h
-publish_path: /opt/ladon/state/published.txt
-publish_interval: 5s
 ignore_peer: 10.20.0.1
 `
 	path := writeTemp(t, yaml)
