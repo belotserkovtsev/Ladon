@@ -106,7 +106,7 @@ probe:
 scorer:
   interval: 5m
   window: 12h
-  fail_threshold: 100
+  promote_threshold: 100
 
 ipset:
   engine_name: prod
@@ -127,27 +127,14 @@ ignore_peer: 10.20.0.1
 	if f.Probe.Timeout != time.Second {
 		t.Errorf("probe timeout = %v", f.Probe.Timeout)
 	}
-	if f.Scorer.FailThreshold != 100 {
-		t.Errorf("scorer threshold = %d", f.Scorer.FailThreshold)
+	if f.Scorer.PromoteThreshold != 100 {
+		t.Errorf("scorer promote_threshold = %d", f.Scorer.PromoteThreshold)
 	}
 	if f.HotTTL != 48*time.Hour {
 		t.Errorf("hot_ttl = %v", f.HotTTL)
 	}
 	if f.IgnorePeer != "10.20.0.1" {
 		t.Errorf("ignore_peer = %q", f.IgnorePeer)
-	}
-}
-
-// The new promote_threshold key must parse into Scorer.PromoteThreshold (the
-// deprecated fail_threshold is covered by TestLoad_FullShape above).
-func TestLoad_PromoteThresholdKey(t *testing.T) {
-	path := writeTemp(t, "scorer:\n  promote_threshold: 42\n")
-	f, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if f.Scorer.PromoteThreshold != 42 {
-		t.Errorf("promote_threshold parsed to %d, want 42", f.Scorer.PromoteThreshold)
 	}
 }
 

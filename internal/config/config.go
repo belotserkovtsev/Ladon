@@ -80,10 +80,6 @@ type ScorerSection struct {
 	Interval         time.Duration `yaml:"interval"`
 	Window           time.Duration `yaml:"window"`
 	PromoteThreshold int           `yaml:"promote_threshold"`
-	// FailThreshold is the pre-v1.4 name for PromoteThreshold. Still parsed so
-	// existing configs don't silently revert to the default; promote_threshold
-	// wins if both are set. Deprecated.
-	FailThreshold int `yaml:"fail_threshold"`
 }
 
 // IpsetSection mirrors the ipset knobs.

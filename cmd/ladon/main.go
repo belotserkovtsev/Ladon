@@ -385,8 +385,6 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 	}
 	if f.Scorer.PromoteThreshold > 0 {
 		cfg.Scorer.PromoteThreshold = f.Scorer.PromoteThreshold
-	} else if f.Scorer.FailThreshold > 0 { // deprecated alias
-		cfg.Scorer.PromoteThreshold = f.Scorer.FailThreshold
 	}
 	if f.Ipset.EngineName != "" {
 		cfg.IpsetName = f.Ipset.EngineName
