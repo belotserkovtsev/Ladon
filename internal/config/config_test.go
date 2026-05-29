@@ -138,6 +138,19 @@ ignore_peer: 10.20.0.1
 	}
 }
 
+// The new promote_threshold key must parse into Scorer.PromoteThreshold (the
+// deprecated fail_threshold is covered by TestLoad_FullShape above).
+func TestLoad_PromoteThresholdKey(t *testing.T) {
+	path := writeTemp(t, "scorer:\n  promote_threshold: 42\n")
+	f, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if f.Scorer.PromoteThreshold != 42 {
+		t.Errorf("promote_threshold parsed to %d, want 42", f.Scorer.PromoteThreshold)
+	}
+}
+
 func TestLoad_MissingFileIsError(t *testing.T) {
 	_, err := Load(filepath.Join(t.TempDir(), "does-not-exist.yaml"))
 	if err == nil {

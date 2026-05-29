@@ -30,7 +30,7 @@ func Ingest(ctx context.Context, s *storage.Store, e Event) (*Observation, error
 		return nil, nil
 	}
 
-	if err := s.UpsertDomain(ctx, domain, e.Peer, e.Timestamp); err != nil {
+	if err := s.UpsertDomain(ctx, domain, e.Timestamp); err != nil {
 		return nil, err
 	}
 	return &Observation{Domain: domain, Peer: e.Peer}, nil

@@ -94,7 +94,7 @@ func CombineExitCompare(localCode prober.FailureCode, remote RemoteState) (Verdi
 	case RemoteOK:
 		// Full chain succeeded on remote — solid confirmation that the
 		// target is reachable from clean vantage points and the local
-		// failure is real DPI. Promote to Hot regardless of local code
+		// failure is real DPI. Verdict is Blocked regardless of local code
 		// class.
 		return Blocked, "remote:ok"
 
@@ -104,7 +104,7 @@ func CombineExitCompare(localCode prober.FailureCode, remote RemoteState) (Verdi
 		// TCP+TLS layer evidence is sufficient — that's where the block
 		// happens. For HTTP-class ambiguous codes (cutoff/timeout/error)
 		// we can't distinguish DPI from server-side severing without an
-		// HTTP-stage answer; conservatively downgrade to Ignore to avoid
+		// HTTP-stage answer; conservatively downgrade to Clear to avoid
 		// the Yandex-class FP.
 		if isAmbiguousCode(localCode) {
 			return Clear, "remote:tcp+tls-only|local:ambig"
@@ -117,7 +117,7 @@ func CombineExitCompare(localCode prober.FailureCode, remote RemoteState) (Verdi
 // isAmbiguousCode reports whether a FailureCode could plausibly come from
 // either DPI or a server-side defense (anti-bot, rate-limit, geo-WAF). These
 // codes need stronger remote evidence (full HTTP-stage success) to confirm
-// DPI; lacking that, exit-compare downgrades them to Ignore.
+// DPI; lacking that, exit-compare downgrades them to Clear.
 //
 // All three live at the HTTP layer of the staged probe — that's exactly
 // where server-side severing manifests. TCP/TLS-layer codes don't have

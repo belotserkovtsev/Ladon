@@ -33,14 +33,19 @@ var schema = []migrate.Migration{
 			return reconcileLegacy(ctx, tx)
 		},
 	},
-	// v2+ — append clean, version-numbered steps here, e.g.:
-	// {
-	// 	Version: 2,
-	// 	Name:    "index probes(domain, created_at) for the scorer count",
-	// 	Up: migrate.SQL(
-	// 		`CREATE INDEX IF NOT EXISTS idx_probes_domain_created ON probes(domain, created_at)`,
-	// 	),
-	// },
+	{
+		Version: 2,
+		Name:    "index probes(domain, created_at) for the scorer's per-domain count",
+		// The scorer runs CountBlockedVerdicts (WHERE domain=? AND created_at>=?
+		// AND verdict='blocked') once per hot domain every interval; probes grows
+		// unbounded until an operator prunes, so this keeps that count off a full
+		// table scan. Lives here, not in schema.sql, so fresh and upgraded DBs
+		// both get it through the same path.
+		Up: migrate.SQL(
+			`CREATE INDEX IF NOT EXISTS idx_probes_domain_created ON probes(domain, created_at)`,
+		),
+	},
+	// v3+ — append clean, version-numbered steps here.
 }
 
 // reconcileLegacy converges an un-versioned (pre-user_version) database to the

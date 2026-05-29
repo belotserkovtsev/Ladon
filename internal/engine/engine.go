@@ -479,9 +479,10 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 			}
 		}
 	default:
-		if err := store.SetDomainState(ctx, domain, "watch", cooldown); err != nil {
-			log.Printf("set state watch %q: %v", domain, err)
-		}
+		// Classify and CombineExitCompare only ever yield Blocked or Clear; this
+		// guards against a future verdict slipping through unhandled rather than
+		// silently mis-stating the domain's state.
+		log.Printf("probe %s → unhandled verdict %q, leaving state unchanged", domain, verdict)
 	}
 }
 

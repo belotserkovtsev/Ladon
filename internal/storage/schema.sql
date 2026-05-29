@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS domains (
     cooldown_until TEXT
 );
 
--- verdict holds the decision.Verdict ('blocked'/'clear'/'inconclusive') for
+-- verdict holds the decision.Verdict ('blocked'/'clear') for
 -- the authoritative (batch) cycle, stamped on the local anchor row after
 -- exit-compare combine. Inline fast-path rows leave it NULL (provisional).
 -- The scorer counts verdict='blocked' to promote hot→cache.

@@ -25,7 +25,7 @@ func newStoreWithHot(t *testing.T, domain string, fails int, spread time.Duratio
 	}
 
 	now := time.Now().UTC()
-	_ = s.UpsertDomain(ctx, domain, "", now)
+	_ = s.UpsertDomain(ctx, domain, now)
 	_ = s.SetDomainState(ctx, domain, "hot", now)
 	_ = s.UpsertHotEntry(ctx, domain, "tcp_connect_failed", now.Add(24*time.Hour))
 

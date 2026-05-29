@@ -79,7 +79,7 @@ func waitForState(t *testing.T, ctx context.Context, s *storage.Store, domain, w
 // TestPipelineLatencyQueryToHot measures the full hot-path:
 //
 //	dnsmasq writes → tailer reads → watcher ingests → inline probe fires →
-//	TCP dial times out → decision=Hot → hot_entries upserted.
+//	TCP dial times out → verdict=Blocked → hot_entries upserted.
 //
 // Expected wall clock is dominated by the probe timeout (default 200ms here).
 // The interesting quantity is the envelope — how much overhead the pipeline

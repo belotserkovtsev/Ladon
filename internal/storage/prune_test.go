@@ -24,7 +24,7 @@ func TestPrune(t *testing.T) {
 	recent := time.Date(2026, 4, 16, 14, 0, 0, 0, time.UTC)
 
 	mustUpsert := func(domain string) {
-		if err := s.UpsertDomain(ctx, domain, "", time.Time{}); err != nil {
+		if err := s.UpsertDomain(ctx, domain, time.Time{}); err != nil {
 			t.Fatalf("upsert dom %s: %v", domain, err)
 		}
 	}

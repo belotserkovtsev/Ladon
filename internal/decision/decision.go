@@ -3,7 +3,7 @@
 // A Verdict answers one question — "is this domain blocked?" — and is kept
 // deliberately separate from the pipeline state a domain sits in
 // (new/watch/hot/cache/ignore). The engine maps verdict→state at a single
-// seam (see engine.probeDomain): Blocked→hot, Clear→ignore, Inconclusive→watch.
+// seam (see engine.probeDomain): Blocked→hot, Clear→ignore.
 //
 // Current policy:
 //
@@ -18,20 +18,19 @@
 // verdict only. ptr(false) means we tried and got severed; ptr(true) means
 // we read a real response OR the server actively rejected with a typed
 // TLS alert (mTLS challenge etc., handled inside prober — see
-// prober.IsServerReachable). Either way the path is reachable, so Ignore.
+// prober.IsServerReachable). Either way the path is reachable, so Clear.
 package decision
 
 import "github.com/belotserkovtsev/ladon/internal/prober"
 
 // Verdict is the censorship judgment for one probe cycle: is the domain
-// blocked, reachable (clear), or undetermined (inconclusive). It is NOT a
-// pipeline state — the engine translates a verdict into a domains.state.
+// blocked or reachable (clear). It is NOT a pipeline state — the engine
+// translates a verdict into a domains.state.
 type Verdict string
 
 const (
-	Clear        Verdict = "clear"        // path works directly — no block
-	Inconclusive Verdict = "inconclusive" // couldn't decide
-	Blocked      Verdict = "blocked"      // DPI/censorship interfering — tunnel it
+	Clear   Verdict = "clear"   // path works directly — no block
+	Blocked Verdict = "blocked" // DPI/censorship interfering — tunnel it
 )
 
 // Classify maps a probe result to a verdict.
@@ -48,8 +47,8 @@ func Classify(r prober.Result) Verdict {
 	// 1.3 ClientHello-targeted block: TLSOK is true (the 1.2 fallback
 	// succeeded), HTTPOK is true (server responded over 1.2), but the
 	// browser the user actually drives speaks 1.3 by default. Treating
-	// this as Ignore would silently leave the user breaking; treating
-	// it as Hot tunnels via Ladon and keeps Chrome/Firefox 1.3 working.
+	// this as Clear would silently leave the user breaking; treating
+	// it as Blocked tunnels via Ladon and keeps Chrome/Firefox 1.3 working.
 	if r.FailureCode == prober.CodeTLS13Block {
 		return Blocked
 	}

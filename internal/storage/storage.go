@@ -173,7 +173,7 @@ func formatTime(t time.Time) string {
 
 // UpsertDomain records a domain observation. If the row exists, it bumps
 // hit_count and last_seen_at; otherwise it inserts a new row in state='new'.
-func (s *Store) UpsertDomain(ctx context.Context, domain, peer string, seenAt time.Time) error {
+func (s *Store) UpsertDomain(ctx context.Context, domain string, seenAt time.Time) error {
 	if seenAt.IsZero() {
 		seenAt = time.Now().UTC()
 	}

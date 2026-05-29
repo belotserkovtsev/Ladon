@@ -118,10 +118,10 @@ func TestUpsertDomainCreatesAndBumps(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	if err := s.UpsertDomain(ctx, "example.com", "10.10.0.2", time.Time{}); err != nil {
+	if err := s.UpsertDomain(ctx, "example.com", time.Time{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpsertDomain(ctx, "example.com", "10.10.0.2", time.Time{}); err != nil {
+	if err := s.UpsertDomain(ctx, "example.com", time.Time{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -144,7 +144,7 @@ func TestInsertProbeAndStampVerdict(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	if err := s.UpsertDomain(ctx, "example.com", "", time.Time{}); err != nil {
+	if err := s.UpsertDomain(ctx, "example.com", time.Time{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -259,16 +259,18 @@ func TestMigrateSchemaFromLegacyDB(t *testing.T) {
 		t.Errorf("row not preserved: hit_count=%d, want 5", hc)
 	}
 
-	// Baseline stamped so future runs know where the DB sits.
+	// Version stamped to the latest migration so future runs know where the DB
+	// sits and re-apply nothing.
+	wantVer := schema[len(schema)-1].Version
 	var ver int
 	if err := s.wdb.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&ver); err != nil {
 		t.Fatal(err)
 	}
-	if ver != 1 {
-		t.Errorf("user_version = %d, want 1", ver)
+	if ver != wantVer {
+		t.Errorf("user_version = %d, want %d", ver, wantVer)
 	}
 
-	// Idempotent: a second pass sees user_version=1 and runs nothing.
+	// Idempotent: a second pass sees the current user_version and runs nothing.
 	if err := migrate.Run(ctx, s.wdb, schema); err != nil {
 		t.Fatalf("second migrate pass: %v", err)
 	}

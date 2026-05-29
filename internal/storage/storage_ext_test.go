@@ -22,7 +22,7 @@ func TestProbeEligible(t *testing.T) {
 	})
 
 	t.Run("state=new, no cooldown", func(t *testing.T) {
-		_ = s.UpsertDomain(ctx, "fresh.test", "", now)
+		_ = s.UpsertDomain(ctx, "fresh.test", now)
 		ok, _ := s.ProbeEligible(ctx, "fresh.test", now)
 		if !ok {
 			t.Fatal("new with null cooldown must be eligible")
@@ -30,7 +30,7 @@ func TestProbeEligible(t *testing.T) {
 	})
 
 	t.Run("state=hot, cooldown expired", func(t *testing.T) {
-		_ = s.UpsertDomain(ctx, "hot-expired.test", "", now)
+		_ = s.UpsertDomain(ctx, "hot-expired.test", now)
 		_ = s.SetDomainState(ctx, "hot-expired.test", "hot", now.Add(-time.Minute))
 		ok, _ := s.ProbeEligible(ctx, "hot-expired.test", now)
 		if !ok {
@@ -39,7 +39,7 @@ func TestProbeEligible(t *testing.T) {
 	})
 
 	t.Run("state=hot, cooldown active", func(t *testing.T) {
-		_ = s.UpsertDomain(ctx, "hot-cooling.test", "", now)
+		_ = s.UpsertDomain(ctx, "hot-cooling.test", now)
 		_ = s.SetDomainState(ctx, "hot-cooling.test", "hot", now.Add(5*time.Minute))
 		ok, _ := s.ProbeEligible(ctx, "hot-cooling.test", now)
 		if ok {
@@ -48,7 +48,7 @@ func TestProbeEligible(t *testing.T) {
 	})
 
 	t.Run("state=ignore → not eligible", func(t *testing.T) {
-		_ = s.UpsertDomain(ctx, "boring.test", "", now)
+		_ = s.UpsertDomain(ctx, "boring.test", now)
 		_ = s.SetDomainState(ctx, "boring.test", "ignore", time.Time{})
 		ok, _ := s.ProbeEligible(ctx, "boring.test", now)
 		if ok {
@@ -57,7 +57,7 @@ func TestProbeEligible(t *testing.T) {
 	})
 
 	t.Run("state=cache → not eligible", func(t *testing.T) {
-		_ = s.UpsertDomain(ctx, "permanent.test", "", now)
+		_ = s.UpsertDomain(ctx, "permanent.test", now)
 		_ = s.PromoteCache(ctx, "permanent.test", "test", now)
 		ok, _ := s.ProbeEligible(ctx, "permanent.test", now)
 		if ok {
@@ -72,9 +72,9 @@ func TestLookupIPsByETLD(t *testing.T) {
 	now := time.Now().UTC()
 
 	// Seed two siblings under fbcdn.net and one under unrelated.com.
-	_ = s.UpsertDomain(ctx, "aaa.fbcdn.net", "", now)
-	_ = s.UpsertDomain(ctx, "bbb.fbcdn.net", "", now)
-	_ = s.UpsertDomain(ctx, "hello.unrelated.com", "", now)
+	_ = s.UpsertDomain(ctx, "aaa.fbcdn.net", now)
+	_ = s.UpsertDomain(ctx, "bbb.fbcdn.net", now)
+	_ = s.UpsertDomain(ctx, "hello.unrelated.com", now)
 
 	_ = s.UpsertDNSObservation(ctx, "aaa.fbcdn.net", "1.1.1.1", now)
 	_ = s.UpsertDNSObservation(ctx, "aaa.fbcdn.net", "1.1.1.2", now)
@@ -138,7 +138,7 @@ func TestCountBlockedVerdicts(t *testing.T) {
 	now := time.Now().UTC()
 
 	ok, fail := true, false
-	_ = s.UpsertDomain(ctx, "example.test", "", now)
+	_ = s.UpsertDomain(ctx, "example.test", now)
 	// verdict=="" leaves the row provisional (NULL) — the inline fast-path case,
 	// which must NOT count toward promotion.
 	insert := func(verdict string, at time.Time) {
@@ -187,7 +187,7 @@ func TestListProbeCandidatesExcludesDenied(t *testing.T) {
 		"unrelated.test",        // should remain a candidate
 		"noise.allow-only.test", // only on allow list
 	} {
-		if err := s.UpsertDomain(ctx, d, "", now); err != nil {
+		if err := s.UpsertDomain(ctx, d, now); err != nil {
 			t.Fatalf("upsert %s: %v", d, err)
 		}
 	}
@@ -227,9 +227,9 @@ func TestListProbeCandidatesETLDFamilyDeny(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 
-	_ = s.UpsertDomain(ctx, "a.family.test", "", now)
-	_ = s.UpsertDomain(ctx, "b.family.test", "", now)
-	_ = s.UpsertDomain(ctx, "other.test", "", now)
+	_ = s.UpsertDomain(ctx, "a.family.test", now)
+	_ = s.UpsertDomain(ctx, "b.family.test", now)
+	_ = s.UpsertDomain(ctx, "other.test", now)
 	_ = s.UpsertManual(ctx, "family.test", "deny")
 
 	cands, err := s.ListProbeCandidates(ctx, 100, now)
@@ -255,9 +255,9 @@ func TestDeleteDeniedDomains(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 
-	_ = s.UpsertDomain(ctx, "exact.deny", "", now)
-	_ = s.UpsertDomain(ctx, "sub.fam.deny", "", now) // etld+1 = fam.deny
-	_ = s.UpsertDomain(ctx, "keeper.test", "", now)
+	_ = s.UpsertDomain(ctx, "exact.deny", now)
+	_ = s.UpsertDomain(ctx, "sub.fam.deny", now) // etld+1 = fam.deny
+	_ = s.UpsertDomain(ctx, "keeper.test", now)
 
 	_ = s.UpsertManual(ctx, "exact.deny", "deny")
 	_ = s.UpsertManual(ctx, "fam.deny", "deny")
@@ -301,10 +301,10 @@ func TestPruneDoesNotResurrectDenied(t *testing.T) {
 
 	// Seed: denied.test is in hot and cache (as if previously probed), plain.test
 	// is the control row that should behave as before.
-	_ = s.UpsertDomain(ctx, "denied.test", "", now)
-	_ = s.UpsertDomain(ctx, "plain.test", "", now)
+	_ = s.UpsertDomain(ctx, "denied.test", now)
+	_ = s.UpsertDomain(ctx, "plain.test", now)
 	_ = s.UpsertHotEntry(ctx, "denied.test", "old verdict", now.Add(24*time.Hour))
-	_ = s.PromoteCache(ctx, "denied.test", "repeated_fail", now)
+	_ = s.PromoteCache(ctx, "denied.test", "repeated_block", now)
 	_ = s.UpsertHotEntry(ctx, "plain.test", "old verdict", now.Add(24*time.Hour))
 
 	// Operator adds the deny entry after the fact.

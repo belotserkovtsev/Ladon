@@ -132,7 +132,7 @@ func mustObserve(t *testing.T, s *storage.Store, domain, ip string, now time.Tim
 	ctx := context.Background()
 	// Real ingest flow does both — UpsertDomain populates etld_plus_one which
 	// LookupIPsByETLD's JOIN depends on.
-	if err := s.UpsertDomain(ctx, domain, "", now); err != nil {
+	if err := s.UpsertDomain(ctx, domain, now); err != nil {
 		t.Fatalf("upsert dom %s: %v", domain, err)
 	}
 	if err := s.UpsertDNSObservation(ctx, domain, ip, now); err != nil {

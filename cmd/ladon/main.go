@@ -78,7 +78,7 @@ func main() {
 		if err := prober.Validate(domain); err != nil {
 			fatal("%v", err)
 		}
-		if err := store.UpsertDomain(ctx, domain, "", time.Time{}); err != nil {
+		if err := store.UpsertDomain(ctx, domain, time.Time{}); err != nil {
 			fatal("upsert: %v", err)
 		}
 		res := prober.Probe(ctx, domain, 0)
