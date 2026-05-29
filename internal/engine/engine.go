@@ -4,6 +4,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -108,6 +109,7 @@ type Config struct {
 	InlineProbeConcurrency int           // max concurrent inline probes (0 disables inline fast-path)
 	HotTTL                 time.Duration // lifetime of a hot_entries row
 	ExpiryInterval         time.Duration // hot_entries sweep cadence
+	MaintenanceInterval    time.Duration // WAL checkpoint + probes/dns_cache prune cadence
 	IpsetName              string        // engine-managed ipset name (default ladon_engine)
 	ManualIpsetName        string        // dnsmasq-managed ipset name (default ladon_manual)
 	CIDRIpsetName          string        // CIDR ipset name for hash:net entries (default ladon_cidr; "" disables)
@@ -156,6 +158,7 @@ func Defaults(logPath string) Config {
 		InlineProbeConcurrency: 8,
 		HotTTL:                 24 * time.Hour,
 		ExpiryInterval:         30 * time.Second,
+		MaintenanceInterval:    time.Hour,
 		IpsetName:              "ladon_engine",
 		ManualIpsetName:        "ladon_manual",
 		CIDRIpsetName:          "ladon_cidr",
@@ -224,23 +227,39 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	// a single buffered slot coalesces storms of hot events into one sync pass.
 	ipsetTrigger := make(chan struct{}, 1)
 
-	errCh := make(chan error, 5)
+	errCh := make(chan error, 6)
 
-	go func() { errCh <- runTailer(ctx, store, cfg, sem, ipsetTrigger) }()
-	go func() { errCh <- runProbeWorker(ctx, store, cfg, ipsetTrigger) }()
-	go func() { errCh <- runExpirySweeper(ctx, store, cfg) }()
-	go func() { errCh <- runIpsetSyncer(ctx, store, cfg, ipsetTrigger) }()
-	go func() { errCh <- scorer.Run(ctx, store, cfg.Scorer) }()
-
-	<-ctx.Done()
-	select {
-	case err := <-errCh:
-		if err != nil && ctx.Err() == nil {
-			return err
-		}
-	default:
+	// launch runs a pipeline stage and reports to errCh only if it returns
+	// BEFORE shutdown was requested. A stage exiting early (a tailer log-read
+	// error, a probe-worker DB failure, …) is abnormal: report it so Run returns
+	// non-nil, the process exits, and systemd's Restart= fires — instead of the
+	// daemon sitting "active" with a dead stage and stale ipsets.
+	launch := func(name string, fn func() error) {
+		go func() {
+			err := fn()
+			if ctx.Err() != nil {
+				return // graceful shutdown — stage unwinding on ctx, not a failure
+			}
+			if err == nil {
+				err = errors.New("exited unexpectedly")
+			}
+			errCh <- fmt.Errorf("%s: %w", name, err)
+		}()
 	}
-	return ctx.Err()
+
+	launch("tailer", func() error { return runTailer(ctx, store, cfg, sem, ipsetTrigger) })
+	launch("probe-worker", func() error { return runProbeWorker(ctx, store, cfg, ipsetTrigger) })
+	launch("expiry-sweeper", func() error { return runExpirySweeper(ctx, store, cfg) })
+	launch("ipset-syncer", func() error { return runIpsetSyncer(ctx, store, cfg, ipsetTrigger) })
+	launch("maintenance", func() error { return runMaintenance(ctx, store, cfg) })
+	launch("scorer", func() error { return scorer.Run(ctx, store, cfg.Scorer) })
+
+	select {
+	case <-ctx.Done():
+		return nil // graceful shutdown (SIGTERM) — clean exit
+	case err := <-errCh:
+		return err // a stage died mid-run — fail fast so systemd restarts us
+	}
 }
 
 func runTailer(ctx context.Context, store *storage.Store, cfg Config, sem chan struct{}, ipsetTrigger chan<- struct{}) error {
@@ -699,6 +718,57 @@ func runExpirySweeper(ctx context.Context, store *storage.Store, cfg Config) err
 			}
 			if n > 0 {
 				log.Printf("expired %d hot entries", n)
+			}
+		}
+	}
+}
+
+// runMaintenance bounds on-disk growth on a slow cadence. Nothing here affects
+// correctness — it only reclaims space the rest of the engine never reads again:
+//   - WAL checkpoint(TRUNCATE): the long-lived read pool blocks SQLite's passive
+//     auto-truncate, so the -wal file grows without this.
+//   - prune probes older than the scorer's window (the scorer only ever counts
+//     verdicts within Scorer.Window, so older rows are dead weight).
+//   - prune dns_cache observations past their freshness horizon (reads already
+//     filter on DNSFreshness, so stale rows are never shipped to the ipset).
+//
+// Retentions carry generous margins so a clock skew or a wider window never
+// deletes a row a reader still wants.
+func runMaintenance(ctx context.Context, store *storage.Store, cfg Config) error {
+	interval := cfg.MaintenanceInterval
+	if interval <= 0 {
+		interval = time.Hour
+	}
+	probeRetention := 2 * cfg.Scorer.Window
+	if probeRetention <= 0 {
+		probeRetention = 48 * time.Hour
+	}
+	dnsRetention := cfg.DNSFreshness
+	if dnsRetention < 7*24*time.Hour {
+		dnsRetention = 7 * 24 * time.Hour
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			now := time.Now().UTC()
+			if err := store.Checkpoint(ctx); err != nil {
+				log.Printf("maintenance: wal checkpoint: %v", err)
+			}
+			if n, err := store.PruneProbes(ctx, now.Add(-probeRetention)); err != nil {
+				log.Printf("maintenance: prune probes: %v", err)
+			} else if n > 0 {
+				log.Printf("maintenance: pruned %d probes older than %s", n, probeRetention)
+			}
+			if n, err := store.PruneDNSCache(ctx, now.Add(-dnsRetention)); err != nil {
+				log.Printf("maintenance: prune dns_cache: %v", err)
+			} else if n > 0 {
+				log.Printf("maintenance: pruned %d dns_cache rows older than %s", n, dnsRetention)
 			}
 		}
 	}

@@ -592,6 +592,27 @@ func (s *Store) PruneProbes(ctx context.Context, before time.Time) (int64, error
 	return deleteWithOptionalBefore(ctx, s.wdb, "probes", "created_at", before)
 }
 
+// PruneDNSCache deletes dns_cache rows by last_seen_at. See PruneCache for
+// zero-time semantics. Reads already ignore rows older than DNSFreshness, so
+// deleting stale observations is a pure space reclaim with no behavior change.
+func (s *Store) PruneDNSCache(ctx context.Context, before time.Time) (int64, error) {
+	return deleteWithOptionalBefore(ctx, s.wdb, "dns_cache", "last_seen_at", before)
+}
+
+// Checkpoint runs a TRUNCATE-mode WAL checkpoint: it merges the -wal file back
+// into the main database and resets it to zero length. The long-lived read pool
+// keeps WAL pages referenced, which prevents SQLite's passive auto-checkpoint
+// from truncating, so the engine calls this periodically to bound WAL growth.
+// Best-effort: if a reader is mid-transaction SQLite returns busy and leaves the
+// WAL in place — the next tick retries.
+func (s *Store) Checkpoint(ctx context.Context) error {
+	rows, err := s.wdb.QueryContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`)
+	if err != nil {
+		return err
+	}
+	return rows.Close()
+}
+
 // DeleteDeniedDomains removes rows from the domains table whose domain or
 // eTLD+1 matches an entry in manual_entries with list_name='deny'. These
 // domains should never appear in any engine-tracked table — the tailer skips

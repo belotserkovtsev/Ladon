@@ -29,6 +29,10 @@ import (
 	"github.com/belotserkovtsev/ladon/internal/watcher"
 )
 
+// version is stamped at build time via -ldflags "-X main.version=<tag>"
+// (see .github/workflows/release.yml). Defaults to "dev" for local builds.
+var version = "dev"
+
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage: ladon [-db PATH] [-config PATH] <cmd> [args]
 commands:
@@ -45,10 +49,15 @@ commands:
 func main() {
 	dbPath := flag.String("db", filepath.Join("state", "ladon.db"), "path to SQLite database")
 	configPath := flag.String("config", "", "path to YAML config file (optional — defaults apply if empty)")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Usage = usage
 	flag.Parse()
 	args := flag.Args()
 
+	if *showVersion || (len(args) > 0 && args[0] == "version") {
+		fmt.Println("ladon", version)
+		return
+	}
 	if len(args) == 0 {
 		usage()
 		os.Exit(2)
@@ -302,6 +311,8 @@ func pruneCmd(ctx context.Context, store *storage.Store, rest []string) {
 }
 
 func runCmd(ctx context.Context, store *storage.Store, configPath string, rest []string) {
+	fmt.Fprintf(os.Stderr, "ladon %s starting\n", version)
+
 	// Self-migrate before the daemon touches the DB. Init is idempotent (a
 	// no-op on an already-current schema), so this closes the upgrade gap where
 	// swapping the binary and restarting `ladon run` without re-running init-db

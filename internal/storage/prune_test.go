@@ -103,6 +103,53 @@ func TestPrune(t *testing.T) {
 	}
 }
 
+// TestPruneDNSCacheAndCheckpoint covers the maintenance helpers: PruneDNSCache
+// deletes by last_seen_at (not created_at), and Checkpoint must not error on a
+// healthy DB.
+func TestPruneDNSCacheAndCheckpoint(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "engine.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	if err := s.Init(ctx); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	old := time.Date(2026, 4, 14, 0, 0, 0, 0, time.UTC)
+	cutoff := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	recent := time.Date(2026, 4, 16, 14, 0, 0, 0, time.UTC)
+
+	if err := s.UpsertDNSObservation(ctx, "stale.test", "1.1.1.1", old); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertDNSObservation(ctx, "fresh.test", "2.2.2.2", recent); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.PruneDNSCache(ctx, cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("pruned dns_cache rows = %d, want 1 (stale only)", n)
+	}
+
+	var remaining int
+	if err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(*) FROM dns_cache`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 1 {
+		t.Errorf("dns_cache rows after prune = %d, want 1 (fresh survives)", remaining)
+	}
+
+	// Best-effort WAL checkpoint must succeed on a healthy DB.
+	if err := s.Checkpoint(ctx); err != nil {
+		t.Errorf("checkpoint: %v", err)
+	}
+}
+
 func mustExec(t *testing.T, s *Store, q string, args ...any) {
 	t.Helper()
 	if _, err := s.wdb.ExecContext(context.Background(), q, args...); err != nil {
