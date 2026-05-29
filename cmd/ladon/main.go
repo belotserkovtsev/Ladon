@@ -117,8 +117,8 @@ func main() {
 			fatal("list: %v", err)
 		}
 		for _, d := range doms {
-			fmt.Printf("%-40s state=%-6s hits=%d peers=%d last=%s\n",
-				d.Domain, d.State, d.HitCount, d.PeerCount, d.LastSeenAt)
+			fmt.Printf("%-40s state=%-6s hits=%d last=%s\n",
+				d.Domain, d.State, d.HitCount, d.LastSeenAt)
 		}
 
 	case "tail":
@@ -375,8 +375,10 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 	if f.Scorer.Window > 0 {
 		cfg.Scorer.Window = f.Scorer.Window
 	}
-	if f.Scorer.FailThreshold > 0 {
-		cfg.Scorer.FailThreshold = f.Scorer.FailThreshold
+	if f.Scorer.PromoteThreshold > 0 {
+		cfg.Scorer.PromoteThreshold = f.Scorer.PromoteThreshold
+	} else if f.Scorer.FailThreshold > 0 { // deprecated alias
+		cfg.Scorer.PromoteThreshold = f.Scorer.FailThreshold
 	}
 	if f.Ipset.EngineName != "" {
 		cfg.IpsetName = f.Ipset.EngineName
@@ -420,9 +422,7 @@ func toStorageResult(r prober.Result) storage.ProbeResult {
 		TCPOK:         &tcp,
 		TLSOK:         &tls,
 		HTTPOK:        r.HTTPOK,
-		ResolvedIPs:   r.ResolvedIPs,
 		FailureReason: r.FailureReason,
-		LatencyMS:     r.LatencyMS,
 	}
 }
 

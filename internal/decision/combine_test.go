@@ -66,39 +66,39 @@ func TestCombineExitCompare(t *testing.T) {
 		wantVerdict Verdict
 		wantTagSubs string // substring expected in tag (for grep-friendliness)
 	}{
-		// Remote unavailable — keep local Hot regardless of code.
-		{"tcp_timeout / unavail → hot", prober.CodeTCPTimeout, RemoteUnavailable, Hot, "unavailable"},
-		{"http_cutoff / unavail → hot", prober.CodeHTTPCutoff, RemoteUnavailable, Hot, "unavailable"},
+		// Remote unavailable — keep local Blocked regardless of code.
+		{"tcp_timeout / unavail → hot", prober.CodeTCPTimeout, RemoteUnavailable, Blocked, "unavailable"},
+		{"http_cutoff / unavail → hot", prober.CodeHTTPCutoff, RemoteUnavailable, Blocked, "unavailable"},
 
 		// Remote OK — full chain success confirms DPI on local.
-		{"tcp_timeout / remote ok → hot", prober.CodeTCPTimeout, RemoteOK, Hot, "ok"},
-		{"tls_handshake_timeout / remote ok → hot", prober.CodeTLSHandshakeTimeout, RemoteOK, Hot, "ok"},
-		{"http_reset / remote ok → hot", prober.CodeHTTPReset, RemoteOK, Hot, "ok"},
-		{"http_cutoff / remote ok → hot", prober.CodeHTTPCutoff, RemoteOK, Hot, "ok"},
+		{"tcp_timeout / remote ok → hot", prober.CodeTCPTimeout, RemoteOK, Blocked, "ok"},
+		{"tls_handshake_timeout / remote ok → hot", prober.CodeTLSHandshakeTimeout, RemoteOK, Blocked, "ok"},
+		{"http_reset / remote ok → hot", prober.CodeHTTPReset, RemoteOK, Blocked, "ok"},
+		{"http_cutoff / remote ok → hot", prober.CodeHTTPCutoff, RemoteOK, Blocked, "ok"},
 
 		// Remote HTTP-fail — server-side severing, never DPI.
-		// The Yandex-class fix: BOTH vantages http_cutoff → Ignore (was Hot).
-		{"http_cutoff / remote http_fail → ignore (yandex fix)", prober.CodeHTTPCutoff, RemoteHTTPFail, Ignore, "http_fail"},
-		{"http_timeout / remote http_fail → ignore", prober.CodeHTTPTimeout, RemoteHTTPFail, Ignore, "http_fail"},
-		{"http_error / remote http_fail → ignore", prober.CodeHTTPError, RemoteHTTPFail, Ignore, "http_fail"},
-		// Even high-conf codes get Ignore here — if remote sees TCP+TLS ok
+		// The Yandex-class fix: BOTH vantages http_cutoff → Clear (was Blocked).
+		{"http_cutoff / remote http_fail → ignore (yandex fix)", prober.CodeHTTPCutoff, RemoteHTTPFail, Clear, "http_fail"},
+		{"http_timeout / remote http_fail → ignore", prober.CodeHTTPTimeout, RemoteHTTPFail, Clear, "http_fail"},
+		{"http_error / remote http_fail → ignore", prober.CodeHTTPError, RemoteHTTPFail, Clear, "http_fail"},
+		// Even high-conf codes get Clear here — if remote sees TCP+TLS ok
 		// but HTTP fails, the target is fundamentally not-routing-fixable.
-		{"tls_handshake_timeout / remote http_fail → ignore", prober.CodeTLSHandshakeTimeout, RemoteHTTPFail, Ignore, "http_fail"},
+		{"tls_handshake_timeout / remote http_fail → ignore", prober.CodeTLSHandshakeTimeout, RemoteHTTPFail, Clear, "http_fail"},
 
 		// Remote TCP/TLS fail — both vantages can't even handshake. Not DPI.
-		{"tcp_timeout / remote fail → ignore", prober.CodeTCPTimeout, RemoteFail, Ignore, "fail"},
-		{"http_cutoff / remote fail → ignore", prober.CodeHTTPCutoff, RemoteFail, Ignore, "fail"},
+		{"tcp_timeout / remote fail → ignore", prober.CodeTCPTimeout, RemoteFail, Clear, "fail"},
+		{"http_cutoff / remote fail → ignore", prober.CodeHTTPCutoff, RemoteFail, Clear, "fail"},
 
 		// Legacy remote (TCP+TLS ok, HTTP not run).
-		// High-conf codes: TCP/TLS evidence is enough → Hot.
-		{"tcp_timeout / remote tcp+tls-only → hot", prober.CodeTCPTimeout, RemoteTCPTLSOnly, Hot, "tcp+tls-ok"},
-		{"tls_handshake_timeout / remote tcp+tls-only → hot", prober.CodeTLSHandshakeTimeout, RemoteTCPTLSOnly, Hot, "tcp+tls-ok"},
-		{"http_reset / remote tcp+tls-only → hot", prober.CodeHTTPReset, RemoteTCPTLSOnly, Hot, "tcp+tls-ok"},
+		// High-conf codes: TCP/TLS evidence is enough → Blocked.
+		{"tcp_timeout / remote tcp+tls-only → hot", prober.CodeTCPTimeout, RemoteTCPTLSOnly, Blocked, "tcp+tls-ok"},
+		{"tls_handshake_timeout / remote tcp+tls-only → hot", prober.CodeTLSHandshakeTimeout, RemoteTCPTLSOnly, Blocked, "tcp+tls-ok"},
+		{"http_reset / remote tcp+tls-only → hot", prober.CodeHTTPReset, RemoteTCPTLSOnly, Blocked, "tcp+tls-ok"},
 		// Ambiguous codes: TCP/TLS evidence not enough — could still be
-		// server-side severing on HTTP. Conservative Ignore.
-		{"http_cutoff / remote tcp+tls-only → ignore (ambig)", prober.CodeHTTPCutoff, RemoteTCPTLSOnly, Ignore, "ambig"},
-		{"http_timeout / remote tcp+tls-only → ignore (ambig)", prober.CodeHTTPTimeout, RemoteTCPTLSOnly, Ignore, "ambig"},
-		{"http_error / remote tcp+tls-only → ignore (ambig)", prober.CodeHTTPError, RemoteTCPTLSOnly, Ignore, "ambig"},
+		// server-side severing on HTTP. Conservative Clear.
+		{"http_cutoff / remote tcp+tls-only → ignore (ambig)", prober.CodeHTTPCutoff, RemoteTCPTLSOnly, Clear, "ambig"},
+		{"http_timeout / remote tcp+tls-only → ignore (ambig)", prober.CodeHTTPTimeout, RemoteTCPTLSOnly, Clear, "ambig"},
+		{"http_error / remote tcp+tls-only → ignore (ambig)", prober.CodeHTTPError, RemoteTCPTLSOnly, Clear, "ambig"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

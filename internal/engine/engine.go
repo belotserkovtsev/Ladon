@@ -414,7 +414,7 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 	// Phase 1: local probe (always). This is the gateway-side view; if it says
 	// the destination is reachable, no exit comparison can change that.
 	res := cfg.LocalProber.Probe(ctx, domain, ips)
-	persistProbe(ctx, store, res)
+	localID := persistProbe(ctx, store, res)
 	verdict := decision.Classify(res)
 	hotReason := reasonFromProbe(res)
 
@@ -427,8 +427,8 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 	// from TCP+TLS-only-OK (legacy remote) from HTTP-stage-fail. The latter
 	// matters for HTTP-class ambiguous local codes (http_cutoff/timeout/error)
 	// where server-side severing — not DPI — is the cause; pre-PR combine
-	// looked only at TCP+TLS and false-promoted Yandex-class endpoints to Hot.
-	if useExitCompare && verdict == decision.Hot && cfg.RemoteProber != nil {
+	// looked only at TCP+TLS and false-promoted Yandex-class endpoints to Blocked.
+	if useExitCompare && verdict == decision.Blocked && cfg.RemoteProber != nil {
 		rres := cfg.RemoteProber.Probe(ctx, domain, ips)
 		persistProbe(ctx, store, rres)
 		newVerdict, tag := decision.CombineExitCompare(res.FailureCode, decision.ClassifyRemote(rres))
@@ -436,10 +436,19 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 		hotReason = "local:" + reasonFromProbe(res) + "|" + tag + ":" + reasonFromProbe(rres)
 	}
 
+	// Stamp the authoritative cycle verdict on the local anchor row. Only the
+	// batch path (useExitCompare) is authoritative; the inline fast-path leaves
+	// verdict NULL — provisional, not counted by the scorer toward promotion.
+	if useExitCompare && localID != 0 {
+		if err := store.SetProbeVerdict(ctx, localID, string(verdict)); err != nil {
+			log.Printf("set verdict %q: %v", domain, err)
+		}
+	}
+
 	cooldown := time.Now().UTC().Add(cfg.ProbeCooldown)
 
 	switch verdict {
-	case decision.Hot:
+	case decision.Blocked:
 		if err := store.SetDomainState(ctx, domain, "hot", cooldown); err != nil {
 			log.Printf("set state hot %q: %v", domain, err)
 		}
@@ -453,7 +462,7 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 		case ipsetTrigger <- struct{}{}:
 		default:
 		}
-	case decision.Ignore:
+	case decision.Clear:
 		if err := store.SetDomainState(ctx, domain, "ignore", cooldown); err != nil {
 			log.Printf("set state ignore %q: %v", domain, err)
 		}
@@ -476,24 +485,25 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 	}
 }
 
-// persistProbe writes one probes row. Both local and remote results go through
-// here so the probes table keeps a per-backend audit trail without any schema
-// change — the FailureReason text already distinguishes them when callers
-// prefix it (e.g. "remote:tcp:timeout").
-func persistProbe(ctx context.Context, store *storage.Store, res prober.Result) {
+// persistProbe writes one probes row and returns its id. Both local and remote
+// results go through here so the probes table keeps a per-backend audit trail —
+// the FailureReason text distinguishes them when callers prefix it (e.g.
+// "remote:tcp:timeout"). Returns 0 on error.
+func persistProbe(ctx context.Context, store *storage.Store, res prober.Result) int64 {
 	dns, tcp, tls := res.DNSOK, res.TCPOK, res.TLSOK
-	if _, err := store.InsertProbe(ctx, storage.ProbeResult{
+	id, err := store.InsertProbe(ctx, storage.ProbeResult{
 		Domain:        res.Domain,
 		DNSOK:         &dns,
 		TCPOK:         &tcp,
 		TLSOK:         &tls,
 		HTTPOK:        res.HTTPOK,
-		ResolvedIPs:   res.ResolvedIPs,
 		FailureReason: res.FailureReason,
-		LatencyMS:     res.LatencyMS,
-	}, time.Time{}); err != nil {
+	}, time.Time{})
+	if err != nil {
 		log.Printf("persist probe %q: %v", res.Domain, err)
+		return 0
 	}
+	return id
 }
 
 func reasonFromProbe(r prober.Result) string {

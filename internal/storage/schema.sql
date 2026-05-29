@@ -4,13 +4,14 @@ CREATE TABLE IF NOT EXISTS domains (
     first_seen_at TEXT,
     last_seen_at TEXT,
     hit_count INTEGER NOT NULL DEFAULT 0,
-    peer_count INTEGER NOT NULL DEFAULT 0,
     state TEXT NOT NULL DEFAULT 'new',
-    score REAL NOT NULL DEFAULT 0,
-    cooldown_until TEXT,
-    last_probe_id INTEGER
+    cooldown_until TEXT
 );
 
+-- verdict holds the decision.Verdict ('blocked'/'clear'/'inconclusive') for
+-- the authoritative (batch) cycle, stamped on the local anchor row after
+-- exit-compare combine. Inline fast-path rows leave it NULL (provisional).
+-- The scorer counts verdict='blocked' to promote hot→cache.
 CREATE TABLE IF NOT EXISTS probes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     domain TEXT NOT NULL,
@@ -18,9 +19,8 @@ CREATE TABLE IF NOT EXISTS probes (
     tcp_ok INTEGER,
     tls_ok INTEGER,
     http_ok INTEGER,
-    resolved_ips_json TEXT,
     failure_reason TEXT,
-    latency_ms INTEGER,
+    verdict TEXT,
     created_at TEXT NOT NULL
 );
 

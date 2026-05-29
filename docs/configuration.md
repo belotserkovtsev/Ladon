@@ -33,7 +33,7 @@ probe:
 scorer:
   interval: 10m
   window: 24h
-  fail_threshold: 50
+  promote_threshold: 50   # blocked-вердиктов в окне для hot→cache (старое имя fail_threshold ещё принимается)
 
 ipset:
   engine_name: ladon_engine # probe-driven hot/cache

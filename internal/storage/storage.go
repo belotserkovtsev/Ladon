@@ -5,7 +5,6 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -128,9 +127,67 @@ func (s *Store) Init(ctx context.Context) error {
 	if _, err := s.wdb.ExecContext(ctx, schemaSQL); err != nil {
 		return err
 	}
+	if err := s.migrateSchema(ctx); err != nil {
+		return err
+	}
 	// Backfill etld_plus_one for any rows that pre-date the column population.
 	_, err := s.BackfillETLDPlusOne(ctx)
 	return err
+}
+
+// migrateSchema reconciles a pre-existing DB with the current schema. New DBs
+// already match schema.sql, so every step is a guarded no-op; existing DBs get
+// probes.verdict added and the retired columns dropped. Idempotent.
+func (s *Store) migrateSchema(ctx context.Context) error {
+	has := func(table, col string) (bool, error) {
+		rows, err := s.wdb.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+		if err != nil {
+			return false, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var cid, notnull, pk int
+			var name, ctype string
+			var dflt sql.NullString
+			if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+				return false, err
+			}
+			if name == col {
+				return true, nil
+			}
+		}
+		return false, rows.Err()
+	}
+
+	// Required: scorer counts blocked verdicts off this column.
+	if ok, err := has("probes", "verdict"); err != nil {
+		return err
+	} else if !ok {
+		if _, err := s.wdb.ExecContext(ctx, `ALTER TABLE probes ADD COLUMN verdict TEXT`); err != nil {
+			return fmt.Errorf("add probes.verdict: %w", err)
+		}
+	}
+
+	// Retire columns no longer read by any code path (KISS — minimal data).
+	for _, d := range []struct{ table, col string }{
+		{"domains", "score"},
+		{"domains", "peer_count"},
+		{"domains", "last_probe_id"},
+		{"probes", "resolved_ips_json"},
+		{"probes", "latency_ms"},
+	} {
+		ok, err := has(d.table, d.col)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		if _, err := s.wdb.ExecContext(ctx, `ALTER TABLE `+d.table+` DROP COLUMN `+d.col); err != nil {
+			return fmt.Errorf("drop %s.%s: %w", d.table, d.col, err)
+		}
+	}
+	return nil
 }
 
 // BackfillETLDPlusOne fills etld_plus_one for rows where it is NULL or empty.
@@ -190,14 +247,10 @@ func (s *Store) UpsertDomain(ctx context.Context, domain, peer string, seenAt ti
 			`UPDATE domains SET last_seen_at = ?, hit_count = hit_count + 1 WHERE domain = ?`,
 			ts, domain)
 	case sql.ErrNoRows:
-		peerCount := 0
-		if peer != "" {
-			peerCount = 1
-		}
 		_, err = tx.ExecContext(ctx, `
-			INSERT INTO domains (domain, etld_plus_one, first_seen_at, last_seen_at, hit_count, peer_count, state)
-			VALUES (?, ?, ?, ?, 1, ?, 'new')
-		`, domain, etld.Compute(domain), ts, ts, peerCount)
+			INSERT INTO domains (domain, etld_plus_one, first_seen_at, last_seen_at, hit_count, state)
+			VALUES (?, ?, ?, ?, 1, 'new')
+		`, domain, etld.Compute(domain), ts, ts)
 	}
 	if err != nil {
 		return err
@@ -205,64 +258,47 @@ func (s *Store) UpsertDomain(ctx context.Context, domain, peer string, seenAt ti
 	return tx.Commit()
 }
 
-// ProbeResult is the shape accepted by InsertProbe.
+// ProbeResult is the shape accepted by InsertProbe. It carries the raw probe
+// observations; the cycle verdict is stamped separately via SetProbeVerdict
+// once decision/exit-compare has run.
 type ProbeResult struct {
 	Domain        string
 	DNSOK         *bool
 	TCPOK         *bool
 	TLSOK         *bool
 	HTTPOK        *bool
-	ResolvedIPs   []string
 	FailureReason string
-	LatencyMS     int
 }
 
 func (s *Store) InsertProbe(ctx context.Context, r ProbeResult, createdAt time.Time) (int64, error) {
 	if createdAt.IsZero() {
 		createdAt = time.Now().UTC()
 	}
-	ts := formatTime(createdAt)
-
-	ips, err := json.Marshal(r.ResolvedIPs)
-	if err != nil {
-		return 0, err
-	}
-
-	tx, err := s.wdb.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback()
-
-	res, err := tx.ExecContext(ctx, `
+	res, err := s.wdb.ExecContext(ctx, `
 		INSERT INTO probes (
-			domain, dns_ok, tcp_ok, tls_ok, http_ok,
-			resolved_ips_json, failure_reason, latency_ms, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			domain, dns_ok, tcp_ok, tls_ok, http_ok, failure_reason, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
 	`,
 		r.Domain,
 		boolPtrToNullInt(r.DNSOK),
 		boolPtrToNullInt(r.TCPOK),
 		boolPtrToNullInt(r.TLSOK),
 		boolPtrToNullInt(r.HTTPOK),
-		string(ips),
 		nullableString(r.FailureReason),
-		r.LatencyMS,
-		ts,
+		formatTime(createdAt),
 	)
 	if err != nil {
 		return 0, err
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return 0, err
-	}
+	return res.LastInsertId()
+}
 
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE domains SET last_probe_id = ? WHERE domain = ?`, id, r.Domain); err != nil {
-		return 0, err
-	}
-	return id, tx.Commit()
+// SetProbeVerdict stamps the final cycle verdict onto a probe row (the local
+// anchor row of an authoritative batch cycle). Counted later by the scorer.
+func (s *Store) SetProbeVerdict(ctx context.Context, id int64, verdict string) error {
+	_, err := s.wdb.ExecContext(ctx,
+		`UPDATE probes SET verdict = ? WHERE id = ?`, verdict, id)
+	return err
 }
 
 // Domain is a row from the domains table.
@@ -272,11 +308,8 @@ type Domain struct {
 	FirstSeenAt   string
 	LastSeenAt    string
 	HitCount      int
-	PeerCount     int
 	State         string
-	Score         float64
 	CooldownUntil string
-	LastProbeID   *int64
 }
 
 // UpsertDNSObservation records that `ip` was seen as an answer for `domain`.
@@ -390,15 +423,18 @@ func (s *Store) ListCacheEntries(ctx context.Context) ([]string, error) {
 	return out, rows.Err()
 }
 
-// CountFailingProbes returns how many probes for `domain` since `since`
-// recorded a failure (TCP or TLS not OK). Used by scorer to decide when
-// repeated evidence warrants a hot → cache promotion.
-func (s *Store) CountFailingProbes(ctx context.Context, domain string, since time.Time) (int, error) {
+// CountBlockedVerdicts returns how many authoritative probe cycles for
+// `domain` since `since` concluded the domain is blocked (verdict='blocked').
+// Counting the decision-level verdict — not raw transport failure — is what
+// lets differential/L7 blocks (tls13_block, http_cutoff, …) accrue toward a
+// hot → cache promotion. Those leave tcp_ok/tls_ok=1, so the old transport
+// check never counted them and such domains never graduated.
+func (s *Store) CountBlockedVerdicts(ctx context.Context, domain string, since time.Time) (int, error) {
 	ts := formatTime(since)
 	var n int
 	err := s.rdb.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM probes
-		WHERE domain = ? AND created_at >= ? AND (COALESCE(tcp_ok, 0) = 0 OR COALESCE(tls_ok, 0) = 0)
+		WHERE domain = ? AND created_at >= ? AND verdict = 'blocked'
 	`, domain, ts).Scan(&n)
 	return n, err
 }
@@ -492,8 +528,8 @@ func (s *Store) ListProbeCandidates(ctx context.Context, limit int, now time.Tim
 	ts := formatTime(now)
 	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT domain, COALESCE(etld_plus_one, ''), COALESCE(first_seen_at, ''),
-		       COALESCE(last_seen_at, ''), hit_count, peer_count, state, score,
-		       COALESCE(cooldown_until, ''), last_probe_id
+		       COALESCE(last_seen_at, ''), hit_count, state,
+		       COALESCE(cooldown_until, '')
 		FROM domains
 		WHERE state IN ('new', 'watch', 'hot')
 		  AND (cooldown_until IS NULL OR cooldown_until <= ?)
@@ -513,8 +549,7 @@ func (s *Store) ListProbeCandidates(ctx context.Context, limit int, now time.Tim
 		var d Domain
 		if err := rows.Scan(
 			&d.Domain, &d.ETLDPlusOne, &d.FirstSeenAt, &d.LastSeenAt,
-			&d.HitCount, &d.PeerCount, &d.State, &d.Score,
-			&d.CooldownUntil, &d.LastProbeID,
+			&d.HitCount, &d.State, &d.CooldownUntil,
 		); err != nil {
 			return nil, err
 		}
@@ -638,7 +673,7 @@ func (s *Store) DeleteDeniedDomains(ctx context.Context) (int64, error) {
 func (s *Store) ResetOrphanedDomains(ctx context.Context) (int64, error) {
 	res, err := s.wdb.ExecContext(ctx, `
 		UPDATE domains
-		SET state = 'new', cooldown_until = NULL, last_probe_id = NULL
+		SET state = 'new', cooldown_until = NULL
 		WHERE state IN ('hot', 'cache', 'ignore')
 		  AND domain NOT IN (SELECT domain FROM hot_entries)
 		  AND domain NOT IN (SELECT domain FROM cache_entries)
@@ -692,8 +727,8 @@ func countWithOptionalBefore(ctx context.Context, db *sql.DB, table, tsColumn st
 func (s *Store) ListRecentDomains(ctx context.Context, limit int) ([]Domain, error) {
 	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT domain, COALESCE(etld_plus_one, ''), COALESCE(first_seen_at, ''),
-		       COALESCE(last_seen_at, ''), hit_count, peer_count, state, score,
-		       COALESCE(cooldown_until, ''), last_probe_id
+		       COALESCE(last_seen_at, ''), hit_count, state,
+		       COALESCE(cooldown_until, '')
 		FROM domains ORDER BY last_seen_at DESC LIMIT ?
 	`, limit)
 	if err != nil {
@@ -706,8 +741,7 @@ func (s *Store) ListRecentDomains(ctx context.Context, limit int) ([]Domain, err
 		var d Domain
 		if err := rows.Scan(
 			&d.Domain, &d.ETLDPlusOne, &d.FirstSeenAt, &d.LastSeenAt,
-			&d.HitCount, &d.PeerCount, &d.State, &d.Score,
-			&d.CooldownUntil, &d.LastProbeID,
+			&d.HitCount, &d.State, &d.CooldownUntil,
 		); err != nil {
 			return nil, err
 		}

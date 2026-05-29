@@ -132,35 +132,42 @@ func TestIsInDenyList(t *testing.T) {
 	}
 }
 
-func TestCountFailingProbes(t *testing.T) {
+func TestCountBlockedVerdicts(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
 
 	ok, fail := true, false
-	// Three fails, two successes for same domain; one old fail outside window.
 	_ = s.UpsertDomain(ctx, "example.test", "", now)
-	insert := func(dns, tcp, tls *bool, at time.Time) {
-		if _, err := s.InsertProbe(ctx, ProbeResult{
+	// verdict=="" leaves the row provisional (NULL) — the inline fast-path case,
+	// which must NOT count toward promotion.
+	insert := func(verdict string, at time.Time) {
+		id, err := s.InsertProbe(ctx, ProbeResult{
 			Domain: "example.test",
-			DNSOK:  dns, TCPOK: tcp, TLSOK: tls,
-		}, at); err != nil {
+			DNSOK:  &ok, TCPOK: &fail, TLSOK: &fail,
+		}, at)
+		if err != nil {
 			t.Fatal(err)
 		}
+		if verdict != "" {
+			if err := s.SetProbeVerdict(ctx, id, verdict); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
-	insert(&ok, &fail, &fail, now.Add(-10*time.Minute))
-	insert(&ok, &fail, &fail, now.Add(-20*time.Minute))
-	insert(&ok, &fail, &fail, now.Add(-30*time.Minute))
-	insert(&ok, &ok, &ok, now.Add(-40*time.Minute))   // success, not counted
-	insert(&ok, &ok, &ok, now.Add(-50*time.Minute))   // success
-	insert(&ok, &fail, &fail, now.Add(-48*time.Hour)) // old fail, outside window
+	insert("blocked", now.Add(-10*time.Minute))
+	insert("blocked", now.Add(-20*time.Minute))
+	insert("blocked", now.Add(-30*time.Minute))
+	insert("clear", now.Add(-40*time.Minute)) // clear verdict, not counted
+	insert("", now.Add(-50*time.Minute))      // provisional/inline, not counted
+	insert("blocked", now.Add(-48*time.Hour)) // blocked but outside window
 
-	n, err := s.CountFailingProbes(ctx, "example.test", now.Add(-time.Hour))
+	n, err := s.CountBlockedVerdicts(ctx, "example.test", now.Add(-time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if n != 3 {
-		t.Fatalf("want 3 failing probes in last hour, got %d", n)
+		t.Fatalf("want 3 blocked verdicts in last hour, got %d", n)
 	}
 }
 

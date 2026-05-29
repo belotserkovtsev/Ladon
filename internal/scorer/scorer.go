@@ -1,7 +1,7 @@
-// Package scorer promotes hot domains into cache once repeated-failure
-// evidence accumulates. Cache entries have no TTL and survive the 24h
-// hot_entries expiry sweep — engine will keep tunneling them until the
-// operator clears them or a future re-probe (Phase 7) reverses the call.
+// Package scorer promotes hot domains into cache once enough blocked verdicts
+// accumulate. Cache entries have no TTL and survive the 24h hot_entries expiry
+// sweep — engine will keep tunneling them until the operator clears them or a
+// future re-probe (Phase 7) reverses the call.
 package scorer
 
 import (
@@ -14,29 +14,29 @@ import (
 
 // Config tunes promotion thresholds.
 type Config struct {
-	Interval      time.Duration // how often the scorer wakes up
-	Window        time.Duration // probes outside this window are ignored
-	FailThreshold int           // minimum failing probes required in window
+	Interval        time.Duration // how often the scorer wakes up
+	Window          time.Duration // verdicts outside this window are ignored
+	PromoteThreshold int          // minimum blocked verdicts required in window
 }
 
 // Defaults returns production-grade values: scan every 10 minutes, look at
-// the last 24 hours of probes, promote only when ≥50 probes have failed.
+// the last 24 hours of probes, promote only when ≥50 cycles concluded blocked.
 // With cooldown=5m the same domain can't be probed more than ~288 times per
-// day, so 50 fails naturally implies 4+ hours of persistent failure — enough
-// to rule out transient network blips or one-off CDN hiccups. Hot_entries
-// (24h TTL) keeps shorter-lived blocks tunneled in the meantime.
+// day, so 50 blocked verdicts naturally imply 4+ hours of persistent blocking
+// — enough to rule out transient network blips or one-off CDN hiccups.
+// Hot_entries (24h TTL) keeps shorter-lived blocks tunneled in the meantime.
 func Defaults() Config {
 	return Config{
-		Interval:      10 * time.Minute,
-		Window:        24 * time.Hour,
-		FailThreshold: 50,
+		Interval:         10 * time.Minute,
+		Window:           24 * time.Hour,
+		PromoteThreshold: 50,
 	}
 }
 
 // Run is a long-running goroutine. Cancel ctx to stop.
 func Run(ctx context.Context, store *storage.Store, cfg Config) error {
-	if cfg.FailThreshold <= 0 {
-		cfg.FailThreshold = 3
+	if cfg.PromoteThreshold <= 0 {
+		cfg.PromoteThreshold = 3
 	}
 	if cfg.Window <= 0 {
 		cfg.Window = 24 * time.Hour
@@ -59,15 +59,15 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 		}
 		promoted := 0
 		for _, d := range hots {
-			fails, err := store.CountFailingProbes(ctx, d, since)
+			blocks, err := store.CountBlockedVerdicts(ctx, d, since)
 			if err != nil {
-				log.Printf("scorer: count probes %q: %v", d, err)
+				log.Printf("scorer: count verdicts %q: %v", d, err)
 				continue
 			}
-			if fails < cfg.FailThreshold {
+			if blocks < cfg.PromoteThreshold {
 				continue
 			}
-			if err := store.PromoteCache(ctx, d, "repeated_fail", now); err != nil {
+			if err := store.PromoteCache(ctx, d, "repeated_block", now); err != nil {
 				log.Printf("scorer: promote %q: %v", d, err)
 				continue
 			}
@@ -75,7 +75,7 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 		}
 		if promoted > 0 {
 			log.Printf("scorer: promoted %d hot → cache (window=%s threshold=%d)",
-				promoted, cfg.Window, cfg.FailThreshold)
+				promoted, cfg.Window, cfg.PromoteThreshold)
 		}
 	}
 

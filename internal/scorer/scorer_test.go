@@ -35,11 +35,16 @@ func newStoreWithHot(t *testing.T, domain string, fails int, spread time.Duratio
 	step := spread / time.Duration(fails+1)
 	for i := 0; i < fails; i++ {
 		at := now.Add(-time.Duration(i+1) * step)
-		if _, err := s.InsertProbe(ctx, storage.ProbeResult{
+		id, err := s.InsertProbe(ctx, storage.ProbeResult{
 			Domain: domain,
 			DNSOK:  &ok, TCPOK: &fail, TLSOK: &fail,
-		}, at); err != nil {
+		}, at)
+		if err != nil {
 			t.Fatalf("insert probe: %v", err)
+		}
+		// Scorer counts blocked verdicts, not raw transport failure.
+		if err := s.SetProbeVerdict(ctx, id, "blocked"); err != nil {
+			t.Fatalf("set verdict: %v", err)
 		}
 	}
 	return s
@@ -66,7 +71,7 @@ func TestPromotesWhenThresholdMet(t *testing.T) {
 	s := newStoreWithHot(t, "blocked.test", 5, time.Hour)
 	ctx := context.Background()
 
-	runPromoteOnce(t, s, Config{Window: 2 * time.Hour, FailThreshold: 3})
+	runPromoteOnce(t, s, Config{Window: 2 * time.Hour, PromoteThreshold: 3})
 
 	cache, err := s.ListCacheEntries(ctx)
 	if err != nil {
@@ -81,7 +86,7 @@ func TestDoesNotPromoteBelowThreshold(t *testing.T) {
 	s := newStoreWithHot(t, "flaky.test", 2, time.Hour)
 	ctx := context.Background()
 
-	runPromoteOnce(t, s, Config{Window: 2 * time.Hour, FailThreshold: 5})
+	runPromoteOnce(t, s, Config{Window: 2 * time.Hour, PromoteThreshold: 5})
 
 	cache, err := s.ListCacheEntries(ctx)
 	if err != nil {
@@ -97,7 +102,7 @@ func TestIgnoresFailsOutsideWindow(t *testing.T) {
 	s := newStoreWithHot(t, "stale.test", 5, 48*time.Hour)
 	ctx := context.Background()
 
-	runPromoteOnce(t, s, Config{Window: time.Hour, FailThreshold: 3})
+	runPromoteOnce(t, s, Config{Window: time.Hour, PromoteThreshold: 3})
 
 	cache, err := s.ListCacheEntries(ctx)
 	if err != nil {

@@ -63,7 +63,7 @@ func ClassifyRemote(r prober.Result) RemoteState {
 
 // CombineExitCompare folds local FailureCode and RemoteState into the final
 // verdict for the exit-compare batch path. Called only when local already
-// classified to Hot — Ignore-from-local short-circuits before reaching here,
+// classified to Blocked — Clear-from-local short-circuits before reaching here,
 // and remote can't override "local says reachable" anyway.
 //
 // The tag string is appended to hot_entries.reason for observability so the
@@ -71,9 +71,9 @@ func ClassifyRemote(r prober.Result) RemoteState {
 func CombineExitCompare(localCode prober.FailureCode, remote RemoteState) (Verdict, string) {
 	switch remote {
 	case RemoteUnavailable:
-		// Safe default: keep the local Hot verdict so a probe-server
-		// outage doesn't cascade into Ignore-ing real DPI blocks.
-		return Hot, "remote:unavailable"
+		// Safe default: keep the local Blocked verdict so a probe-server
+		// outage doesn't cascade into Clear-ing real DPI blocks.
+		return Blocked, "remote:unavailable"
 
 	case RemoteHTTPFail:
 		// Both vantages got past TCP+TLS but HTTP stage severed on both
@@ -83,20 +83,20 @@ func CombineExitCompare(localCode prober.FailureCode, remote RemoteState) (Verdi
 		// commercial-hosting AS — local at AS9123 Timeweb gets
 		// http_cutoff, remote at the orchestrator AS gets http_cutoff
 		// too. Pre-PR combine looked only at TCP+TLS and false-promoted
-		// these to Hot.
-		return Ignore, "remote:http_fail"
+		// these to Blocked.
+		return Clear, "remote:http_fail"
 
 	case RemoteFail:
 		// Both probers see real failure: dead server, wrong port,
 		// symmetric geofence. Not our problem.
-		return Ignore, "remote:fail"
+		return Clear, "remote:fail"
 
 	case RemoteOK:
 		// Full chain succeeded on remote — solid confirmation that the
 		// target is reachable from clean vantage points and the local
 		// failure is real DPI. Promote to Hot regardless of local code
 		// class.
-		return Hot, "remote:ok"
+		return Blocked, "remote:ok"
 
 	case RemoteTCPTLSOnly:
 		// Legacy remote that doesn't run HTTP stage. For TCP/TLS-class
@@ -107,11 +107,11 @@ func CombineExitCompare(localCode prober.FailureCode, remote RemoteState) (Verdi
 		// HTTP-stage answer; conservatively downgrade to Ignore to avoid
 		// the Yandex-class FP.
 		if isAmbiguousCode(localCode) {
-			return Ignore, "remote:tcp+tls-only|local:ambig"
+			return Clear, "remote:tcp+tls-only|local:ambig"
 		}
-		return Hot, "remote:tcp+tls-ok"
+		return Blocked, "remote:tcp+tls-ok"
 	}
-	return Ignore, "remote:unknown"
+	return Clear, "remote:unknown"
 }
 
 // isAmbiguousCode reports whether a FailureCode could plausibly come from

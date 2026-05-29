@@ -46,9 +46,9 @@ probe:
 # --- scorer: когда hot → cache ---
 
 scorer:
-  interval: 10m        # как часто scorer проходится
-  window: 24h          # окно для подсчёта fails
-  fail_threshold: 50   # порог fails для промоушна
+  interval: 10m            # как часто scorer проходится
+  window: 24h              # окно для подсчёта blocked-вердиктов
+  promote_threshold: 50    # порог blocked-вердиктов для hot→cache (deprecated alias: fail_threshold)
 
 # --- routing ---
 
