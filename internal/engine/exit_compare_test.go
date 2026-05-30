@@ -49,7 +49,7 @@ func TestExitCompare_RemoteOKConfirmsHot(t *testing.T) {
 	if err := s.UpsertDNSObservation(ctx, "blocked.test", unreachableIP, time.Now()); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := s.UpsertDomain(ctx, "blocked.test", "", time.Time{}); err != nil {
+	if err := s.UpsertDomain(ctx, "blocked.test", time.Time{}); err != nil {
 		t.Fatalf("upsert dom: %v", err)
 	}
 
@@ -97,7 +97,7 @@ func TestExitCompare_RemoteFailOverrulesLocalHot(t *testing.T) {
 	if err := s.UpsertDNSObservation(ctx, "blocked.test", unreachableIP, time.Now()); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := s.UpsertDomain(ctx, "blocked.test", "", time.Time{}); err != nil {
+	if err := s.UpsertDomain(ctx, "blocked.test", time.Time{}); err != nil {
 		t.Fatalf("upsert dom: %v", err)
 	}
 	// Simulate prior inline-probe FP: domain is already in hot_entries.
@@ -142,7 +142,7 @@ func TestExitCompare_RemoteTransportFailureKeepsHot(t *testing.T) {
 	if err := s.UpsertDNSObservation(ctx, "blocked.test", unreachableIP, time.Now()); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := s.UpsertDomain(ctx, "blocked.test", "", time.Time{}); err != nil {
+	if err := s.UpsertDomain(ctx, "blocked.test", time.Time{}); err != nil {
 		t.Fatalf("upsert dom: %v", err)
 	}
 
@@ -191,7 +191,7 @@ func TestExitCompare_InlinePathSkipsRemote(t *testing.T) {
 	if err := s.UpsertDNSObservation(ctx, "blocked.test", unreachableIP, time.Now()); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := s.UpsertDomain(ctx, "blocked.test", "", time.Time{}); err != nil {
+	if err := s.UpsertDomain(ctx, "blocked.test", time.Time{}); err != nil {
 		t.Fatalf("upsert dom: %v", err)
 	}
 

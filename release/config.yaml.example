@@ -46,9 +46,9 @@ probe:
 # --- scorer: когда hot → cache ---
 
 scorer:
-  interval: 10m        # как часто scorer проходится
-  window: 24h          # окно для подсчёта fails
-  fail_threshold: 50   # порог fails для промоушна
+  interval: 10m            # как часто scorer проходится
+  window: 24h              # окно для подсчёта blocked-вердиктов
+  promote_threshold: 50    # порог blocked-вердиктов для hot→cache
 
 # --- routing ---
 
@@ -62,6 +62,7 @@ ipset:
 
 hot_ttl: 24h           # срок жизни записи в hot_entries
 dns_freshness: 6h      # возраст, после которого IP из dns_cache устаревает
+family_confirm_threshold: 10  # порог членов eTLD+1-семьи. один порог, две популяции: covered (новые поддомены не пробятся) считает только state=cache; экспансия IP всей семьи (CDN) — hot+cache
 
 # --- прочее ---
 

@@ -29,6 +29,10 @@ import (
 	"github.com/belotserkovtsev/ladon/internal/watcher"
 )
 
+// version is stamped at build time via -ldflags "-X main.version=<tag>"
+// (see .github/workflows/release.yml). Defaults to "dev" for local builds.
+var version = "dev"
+
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage: ladon [-db PATH] [-config PATH] <cmd> [args]
 commands:
@@ -45,10 +49,15 @@ commands:
 func main() {
 	dbPath := flag.String("db", filepath.Join("state", "ladon.db"), "path to SQLite database")
 	configPath := flag.String("config", "", "path to YAML config file (optional — defaults apply if empty)")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Usage = usage
 	flag.Parse()
 	args := flag.Args()
 
+	if *showVersion || (len(args) > 0 && args[0] == "version") {
+		fmt.Println("ladon", version)
+		return
+	}
 	if len(args) == 0 {
 		usage()
 		os.Exit(2)
@@ -78,7 +87,7 @@ func main() {
 		if err := prober.Validate(domain); err != nil {
 			fatal("%v", err)
 		}
-		if err := store.UpsertDomain(ctx, domain, "", time.Time{}); err != nil {
+		if err := store.UpsertDomain(ctx, domain, time.Time{}); err != nil {
 			fatal("upsert: %v", err)
 		}
 		res := prober.Probe(ctx, domain, 0)
@@ -117,8 +126,8 @@ func main() {
 			fatal("list: %v", err)
 		}
 		for _, d := range doms {
-			fmt.Printf("%-40s state=%-6s hits=%d peers=%d last=%s\n",
-				d.Domain, d.State, d.HitCount, d.PeerCount, d.LastSeenAt)
+			fmt.Printf("%-40s state=%-6s hits=%d last=%s\n",
+				d.Domain, d.State, d.HitCount, d.LastSeenAt)
 		}
 
 	case "tail":
@@ -302,6 +311,16 @@ func pruneCmd(ctx context.Context, store *storage.Store, rest []string) {
 }
 
 func runCmd(ctx context.Context, store *storage.Store, configPath string, rest []string) {
+	fmt.Fprintf(os.Stderr, "ladon %s starting\n", version)
+
+	// Self-migrate before the daemon touches the DB. Init is idempotent (a
+	// no-op on an already-current schema), so this closes the upgrade gap where
+	// swapping the binary and restarting `ladon run` without re-running init-db
+	// would leave the daemon querying a column the migration hadn't added yet.
+	if err := store.Init(ctx); err != nil {
+		fatal("migrate: %v", err)
+	}
+
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	fromStart := fs.Bool("from-start", false, "process whole log from the beginning")
 	allow := fs.String("manual-allow", "", "path to manual allow list (optional)")
@@ -375,8 +394,8 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 	if f.Scorer.Window > 0 {
 		cfg.Scorer.Window = f.Scorer.Window
 	}
-	if f.Scorer.FailThreshold > 0 {
-		cfg.Scorer.FailThreshold = f.Scorer.FailThreshold
+	if f.Scorer.PromoteThreshold > 0 {
+		cfg.Scorer.PromoteThreshold = f.Scorer.PromoteThreshold
 	}
 	if f.Ipset.EngineName != "" {
 		cfg.IpsetName = f.Ipset.EngineName
@@ -395,6 +414,9 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 	}
 	if f.DNSFreshness > 0 {
 		cfg.DNSFreshness = f.DNSFreshness
+	}
+	if f.FamilyConfirmThreshold > 0 {
+		cfg.FamilyConfirmThreshold = f.FamilyConfirmThreshold
 	}
 	if f.IgnorePeer != "" {
 		cfg.IgnorePeer = f.IgnorePeer
@@ -420,9 +442,7 @@ func toStorageResult(r prober.Result) storage.ProbeResult {
 		TCPOK:         &tcp,
 		TLSOK:         &tls,
 		HTTPOK:        r.HTTPOK,
-		ResolvedIPs:   r.ResolvedIPs,
 		FailureReason: r.FailureReason,
-		LatencyMS:     r.LatencyMS,
 	}
 }
 

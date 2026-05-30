@@ -2,3 +2,4 @@
 state/*.db
 /ladon
 /ladon.exe
+/dist/

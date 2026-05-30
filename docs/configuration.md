@@ -33,7 +33,7 @@ probe:
 scorer:
   interval: 10m
   window: 24h
-  fail_threshold: 50
+  promote_threshold: 50   # blocked-вердиктов в окне для hot→cache
 
 ipset:
   engine_name: ladon_engine # probe-driven hot/cache
@@ -43,24 +43,50 @@ ipset:
 
 hot_ttl: 24h
 dns_freshness: 6h
+family_confirm_threshold: 10   # порог членов eTLD+1-семьи. один порог, две популяции: covered (новые поддомены не пробятся) считает только state=cache; экспансия IP всей семьи — hot+cache
 ```
 
 Полный набор полей и defaults — в
 [`internal/engine/Defaults()`](../internal/engine/engine.go) и
 [`release/config.yaml.example`](../release/config.yaml.example).
 
+> `promote_threshold` считает probes по итоговому `verdict='blocked'` (исход
+> `decision.Classify`), а не по сырым транспортным флагам — поэтому тонкие
+> блоки (`tls13_block`, `http_cutoff`) с проходящими TCP+TLS тоже идут в зачёт.
+> Вердикт штампуется только на batch-пути; inline-проба оставляет `verdict`
+> NULL и не учитывается.
+
+## Состояния домена
+
+Состояние пайплайна (`domains.state`) отделено от исхода пробы (вердикт
+`blocked` / `clear`):
+
+| state | смысл |
+|---|---|
+| `new` | наблюдался, ещё не классифицирован |
+| `hot` | проба дала `blocked`; строка в `hot_entries` (TTL = `hot_ttl`) |
+| `cache` | scorer подтвердил блок (`promote_threshold` вердиктов в окне) → бессрочная строка в `cache_entries`, hot-строка снята |
+| `covered` | член подтверждённой eTLD+1-семьи (≥ `family_confirm_threshold` в `cache`); индивидуально не пробится, маршрутизируется через экспансию IP семьи |
+| `ignore` | проба дала `clear` (или exit-compare снял FP) |
+
+`covered` исключён из probe-очередей; проверка семьи — единая точка в
+`probeDomain`, общая для inline и batch.
+
 ## CLI
 
 ```
-ladon -db <path> [-config <path>] <subcommand> [args]
+ladon [-version] -db <path> [-config <path>] <subcommand> [args]
 ```
 
-Подкоманды: `init-db`, `run`, `probe <domain>`, `observe <domain>`,
-`list [N]`, `hot`, `tail <log>`, `prune`. Флаги `-manual-allow` /
+Подкоманды: `init-db`, `run`, `probe <domain>`, `observe <domain> [peer]`,
+`list [N]`, `hot`, `tail [-from-start] <log>`, `prune`. Глобальный `-version`
+(или подкоманда `version`) печатает версию и выходит. Флаги `-manual-allow` /
 `-manual-deny` на `run` перебивают одноимённые YAML-поля.
 
-`init-db` обязателен перед первым запуском — `run` НЕ создаёт schema
-автоматически.
+`run` самомигрирует БД на старте (`store.Init` → раннер `internal/migrate`):
+на пустой БД разворачивает схему, на существующей — догоняет до актуальной,
+так что swap бинарника + рестарт не оставят демон на устаревшей схеме.
+`init-db` — явная идемпотентная команда создать БД заранее.
 
 ## Manual lists
 
@@ -117,5 +143,7 @@ HTTP-контракт remote-сервера — в [probe-api.md](probe-api.md).
 `ladon prune` чистит `hot_entries` / `cache_entries` / `probes` —
 обычно после смены probe-логики или для подрезания истории.
 Поддерживает `-dry-run`, `-before <RFC3339>`, комбинации флагов.
-Полная справка — `ladon prune -h`. После prune `state` сбрасывается в
-`new` для доменов без активных записей.
+Полная справка — `ladon prune -h`. После prune домены в `hot`/`cache`/`ignore`
+без backing-строки сбрасываются в `new` (перепроба с нуля); `covered` не
+затрагивается — covered-домены вернутся к пробам, только когда семья перестанет
+быть подтверждённой.

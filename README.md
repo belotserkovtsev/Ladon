@@ -33,7 +33,8 @@ curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/ins
 - **Четырёхстадийный probe** — DNS → TCP:443 → TLS handshake → HTTP read до 32KB.
 - **20+ типизированных failure-кодов** — `tls_alert`, `tls_garbage`, `tls_reset`, `tls13_block`, `mtls_required`, `tcp_refused`, `http_cutoff`, `http_451`, ...
 - **Server-active vs path-active** — TLS alert / RST / `connection refused` отделены от timeout / cutoff / garbage.
-- **24h temporal accumulation** — порог подтверждённых failures для постоянного списка.
+- **24h temporal accumulation** — порог blocked-вердиктов в окне для постоянного списка.
+- **Семья как единица** — при ≥N подтверждённых поддоменов eTLD+1 семья тянется в туннель целиком: её IP разворачиваются скопом, новые поддомены (`covered`) больше не пробятся.
 - **Опциональный exit-compare** — второй observer из другой геолокации.
 
 Полная методология — в [docs/methodology.md](docs/methodology.md).

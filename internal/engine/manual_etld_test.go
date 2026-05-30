@@ -71,6 +71,7 @@ func TestComputeDesiredIPs_HotStillNeedsTwoConfirmed(t *testing.T) {
 
 	cfg := Defaults("/dev/null")
 	cfg.IpsetName = ""
+	cfg.FamilyConfirmThreshold = 2 // exercise the gate at 2: below it must not expand
 	desired, _, err := computeDesiredIPs(ctx, s, cfg)
 	if err != nil {
 		t.Fatalf("computeDesiredIPs: %v", err)
@@ -116,14 +117,55 @@ func TestComputeDesiredIPs_HotWithTwoConfirmedExpands(t *testing.T) {
 
 	cfg := Defaults("/dev/null")
 	cfg.IpsetName = ""
+	cfg.FamilyConfirmThreshold = 2 // at the gate: 2 confirmed → expand the family
 	desired, _, err := computeDesiredIPs(ctx, s, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, ip := range []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"} {
 		if _, ok := desired[ip]; !ok {
-			t.Errorf("missing %s — ≥2 hot siblings should pull whole family", ip)
+			t.Errorf("missing %s — confirmed members at threshold should pull whole family", ip)
 		}
+	}
+}
+
+// TestComputeDesiredIPs_DefaultThresholdHoldsAgainstFewConfirmed documents the
+// raised production default: two confirmed siblings are NOT enough to expand a
+// family, so a broad-namespace family (google.com/azure.com seen with ~2
+// confirmed members) never drags its whole IP space into the tunnel.
+func TestComputeDesiredIPs_DefaultThresholdHoldsAgainstFewConfirmed(t *testing.T) {
+	ctx := context.Background()
+	s, err := storage.Open(filepath.Join(t.TempDir(), "engine.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+	if err := s.Init(ctx); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	now := time.Now().UTC()
+	for _, d := range []struct{ dom, ip string }{
+		{"a.bigcorp.test", "1.1.1.1"},
+		{"b.bigcorp.test", "2.2.2.2"},
+		{"c.bigcorp.test", "3.3.3.3"},
+	} {
+		mustObserve(t, s, d.dom, d.ip, now)
+	}
+	_ = s.UpsertHotEntry(ctx, "a.bigcorp.test", "fail", now.Add(24*time.Hour))
+	_ = s.UpsertHotEntry(ctx, "b.bigcorp.test", "fail", now.Add(24*time.Hour))
+
+	cfg := Defaults("/dev/null") // FamilyConfirmThreshold defaults to 10
+	cfg.IpsetName = ""
+	desired, _, err := computeDesiredIPs(ctx, s, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := desired["1.1.1.1"]; !ok {
+		t.Error("a hot member's own IP should be routed")
+	}
+	if _, ok := desired["3.3.3.3"]; ok {
+		t.Error("DNS-only sibling expanded on only 2 confirmed — must not at the default threshold")
 	}
 }
 
@@ -132,7 +174,7 @@ func mustObserve(t *testing.T, s *storage.Store, domain, ip string, now time.Tim
 	ctx := context.Background()
 	// Real ingest flow does both — UpsertDomain populates etld_plus_one which
 	// LookupIPsByETLD's JOIN depends on.
-	if err := s.UpsertDomain(ctx, domain, "", now); err != nil {
+	if err := s.UpsertDomain(ctx, domain, now); err != nil {
 		t.Fatalf("upsert dom %s: %v", domain, err)
 	}
 	if err := s.UpsertDNSObservation(ctx, domain, ip, now); err != nil {

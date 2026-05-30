@@ -95,7 +95,7 @@ TLS либо размещение проб-сервера в доверенно�
 `local` — результат локальной пробы (TCP+TLS с шлюза, всегда запускается).
 `remote` — твой сервер (запускается только если local упал).
 
-| local | remote | вердикт | почему |
+| local | remote | состояние | почему |
 |---|---|---|---|
 | OK | — (не вызывается) | Ignore | direct работает, тоннель не нужен |
 | FAIL | OK | **Hot** | настоящий DPI-блок: с шлюза не достучаться, твоя точка достучалась |
@@ -112,11 +112,15 @@ FAIL — это и есть сигнатура L7-DPI (handshake разрешё�
 твоего proб-сервера как сигнал «remote сказал FAIL»**. Иначе outage proб-сервера
 тихо начал бы снимать ipset с реально-заблокированных доменов. Транспортная
 ошибка распознаётся по префиксу `remote:` в reason — `RemoteProber` (см.
-`internal/prober/remote.go::failedRemote`) проставляет его всегда, и движок
-проверяет это в `engine.probeDomain` через `isRemoteTransportFailure`.
+`internal/prober/remote.go::failedRemote`) проставляет его всегда, а движок
+классифицирует remote-результат через `decision.ClassifyRemote`
+(`internal/decision/combine.go`), которая для транспортного фейла отдаёт
+`RemoteUnavailable` (вызывая `prober.Result.IsRemoteTransportFailure()`).
 
-В `hot_entries.reason` пишется комбинированная причина:
-`local:tcp:i/o timeout|remote:ok` — для дебага, чтобы видеть оба сигнала.
+В `hot_entries.reason` пишется комбинированная причина вида
+`local:<reason>|<combine-tag>:<remote-reason>` — для дебага, чтобы видеть оба
+сигнала и какая ветка `CombineExitCompare` сработала. Например
+`local:tcp_timeout: i/o timeout|remote:ok:ok`.
 
 ## Пример минимального сервера на bash
 

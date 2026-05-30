@@ -5,12 +5,12 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/belotserkovtsev/ladon/internal/etld"
+	"github.com/belotserkovtsev/ladon/internal/migrate"
 	"modernc.org/sqlite"
 )
 
@@ -124,8 +124,11 @@ func (s *Store) Close() error {
 	return rerr
 }
 
+// Init brings the database schema up to date and runs lightweight backfills. It
+// is idempotent — safe to call on every startup — so both the init-db subcommand
+// and the run daemon invoke it, and an already-current database is left untouched.
 func (s *Store) Init(ctx context.Context) error {
-	if _, err := s.wdb.ExecContext(ctx, schemaSQL); err != nil {
+	if err := migrate.Run(ctx, s.wdb, schema); err != nil {
 		return err
 	}
 	// Backfill etld_plus_one for any rows that pre-date the column population.
@@ -170,7 +173,7 @@ func formatTime(t time.Time) string {
 
 // UpsertDomain records a domain observation. If the row exists, it bumps
 // hit_count and last_seen_at; otherwise it inserts a new row in state='new'.
-func (s *Store) UpsertDomain(ctx context.Context, domain, peer string, seenAt time.Time) error {
+func (s *Store) UpsertDomain(ctx context.Context, domain string, seenAt time.Time) error {
 	if seenAt.IsZero() {
 		seenAt = time.Now().UTC()
 	}
@@ -190,14 +193,10 @@ func (s *Store) UpsertDomain(ctx context.Context, domain, peer string, seenAt ti
 			`UPDATE domains SET last_seen_at = ?, hit_count = hit_count + 1 WHERE domain = ?`,
 			ts, domain)
 	case sql.ErrNoRows:
-		peerCount := 0
-		if peer != "" {
-			peerCount = 1
-		}
 		_, err = tx.ExecContext(ctx, `
-			INSERT INTO domains (domain, etld_plus_one, first_seen_at, last_seen_at, hit_count, peer_count, state)
-			VALUES (?, ?, ?, ?, 1, ?, 'new')
-		`, domain, etld.Compute(domain), ts, ts, peerCount)
+			INSERT INTO domains (domain, etld_plus_one, first_seen_at, last_seen_at, hit_count, state)
+			VALUES (?, ?, ?, ?, 1, 'new')
+		`, domain, etld.Compute(domain), ts, ts)
 	}
 	if err != nil {
 		return err
@@ -205,64 +204,47 @@ func (s *Store) UpsertDomain(ctx context.Context, domain, peer string, seenAt ti
 	return tx.Commit()
 }
 
-// ProbeResult is the shape accepted by InsertProbe.
+// ProbeResult is the shape accepted by InsertProbe. It carries the raw probe
+// observations; the cycle verdict is stamped separately via SetProbeVerdict
+// once decision/exit-compare has run.
 type ProbeResult struct {
 	Domain        string
 	DNSOK         *bool
 	TCPOK         *bool
 	TLSOK         *bool
 	HTTPOK        *bool
-	ResolvedIPs   []string
 	FailureReason string
-	LatencyMS     int
 }
 
 func (s *Store) InsertProbe(ctx context.Context, r ProbeResult, createdAt time.Time) (int64, error) {
 	if createdAt.IsZero() {
 		createdAt = time.Now().UTC()
 	}
-	ts := formatTime(createdAt)
-
-	ips, err := json.Marshal(r.ResolvedIPs)
-	if err != nil {
-		return 0, err
-	}
-
-	tx, err := s.wdb.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback()
-
-	res, err := tx.ExecContext(ctx, `
+	res, err := s.wdb.ExecContext(ctx, `
 		INSERT INTO probes (
-			domain, dns_ok, tcp_ok, tls_ok, http_ok,
-			resolved_ips_json, failure_reason, latency_ms, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			domain, dns_ok, tcp_ok, tls_ok, http_ok, failure_reason, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
 	`,
 		r.Domain,
 		boolPtrToNullInt(r.DNSOK),
 		boolPtrToNullInt(r.TCPOK),
 		boolPtrToNullInt(r.TLSOK),
 		boolPtrToNullInt(r.HTTPOK),
-		string(ips),
 		nullableString(r.FailureReason),
-		r.LatencyMS,
-		ts,
+		formatTime(createdAt),
 	)
 	if err != nil {
 		return 0, err
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return 0, err
-	}
+	return res.LastInsertId()
+}
 
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE domains SET last_probe_id = ? WHERE domain = ?`, id, r.Domain); err != nil {
-		return 0, err
-	}
-	return id, tx.Commit()
+// SetProbeVerdict stamps the final cycle verdict onto a probe row (the local
+// anchor row of an authoritative batch cycle). Counted later by the scorer.
+func (s *Store) SetProbeVerdict(ctx context.Context, id int64, verdict string) error {
+	_, err := s.wdb.ExecContext(ctx,
+		`UPDATE probes SET verdict = ? WHERE id = ?`, verdict, id)
+	return err
 }
 
 // Domain is a row from the domains table.
@@ -272,11 +254,8 @@ type Domain struct {
 	FirstSeenAt   string
 	LastSeenAt    string
 	HitCount      int
-	PeerCount     int
 	State         string
-	Score         float64
 	CooldownUntil string
-	LastProbeID   *int64
 }
 
 // UpsertDNSObservation records that `ip` was seen as an answer for `domain`.
@@ -345,6 +324,55 @@ func (s *Store) ProbeEligible(ctx context.Context, domain string, now time.Time)
 	return cd.String <= ts, nil
 }
 
+// FamilyConfirmed reports whether at least `threshold` domains sharing this
+// eTLD+1 are durably blocked (state 'cache'). Counting only cache — the stable
+// anchors that are never converted to 'covered' — keeps confirmation steady as
+// hot/new members get covered (counting hot too would let covering its own
+// members drop the family below threshold and flap). The count is capped at the
+// threshold so a big CDN family doesn't scan thousands of rows.
+func (s *Store) FamilyConfirmed(ctx context.Context, etldPlusOne string, threshold int) (bool, error) {
+	if etldPlusOne == "" || threshold <= 0 {
+		return false, nil
+	}
+	var n int
+	err := s.rdb.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM (
+			SELECT 1 FROM domains
+			WHERE etld_plus_one = ? AND state = 'cache'
+			LIMIT ?
+		)`, etldPlusOne, threshold).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n >= threshold, nil
+}
+
+// MarkCovered flips a non-anchor member of a confirmed family to 'covered': it
+// is routed via the family's eTLD+1 IP expansion, so it is never probed
+// individually (both probe-candidate queries exclude 'covered'). Only 'new' and
+// 'hot' rows are touched — never 'cache' (the anchors that keep the family
+// confirmed). A flipped 'hot' member also sheds its hot_entries row, leaving it
+// in exactly one tier. Returns whether a row was flipped.
+func (s *Store) MarkCovered(ctx context.Context, domain string) (bool, error) {
+	tx, err := s.wdb.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx,
+		`UPDATE domains SET state = 'covered' WHERE domain = ? AND state IN ('new', 'hot')`, domain)
+	if err != nil {
+		return false, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return false, tx.Commit() // anchor (cache) or already covered — nothing to do
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM hot_entries WHERE domain = ?`, domain); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
 // PromoteCache upserts a cache_entries row and flips the domain's state to
 // 'cache'. Cache entries have no TTL — they persist until a re-probe reverses
 // them or the operator clears the row.
@@ -358,15 +386,39 @@ func (s *Store) PromoteCache(ctx context.Context, domain, reason string, at time
 		return err
 	}
 	defer tx.Rollback()
+
+	// Fold the hot_entries reason (the DPI detail, e.g. "local:tls13_block|…")
+	// into the cache reason before we drop the hot row, so the audit trail
+	// survives the tier transition. A missing/empty hot reason leaves the
+	// caller's reason (e.g. "repeated_block") as-is.
+	fullReason := reason
+	var hotReason sql.NullString
+	if err := tx.QueryRowContext(ctx,
+		`SELECT reason FROM hot_entries WHERE domain = ?`, domain).Scan(&hotReason); err == nil &&
+		hotReason.Valid && hotReason.String != "" {
+		fullReason = reason + " (" + hotReason.String + ")"
+	}
+
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO cache_entries (domain, promoted_at, reason)
 		VALUES (?, ?, ?)
 		ON CONFLICT(domain) DO UPDATE SET promoted_at = excluded.promoted_at, reason = excluded.reason
-	`, domain, ts, nullableString(reason)); err != nil {
+	`, domain, ts, nullableString(fullReason)); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE domains SET state = 'cache' WHERE domain = ?`, domain); err != nil {
+		return err
+	}
+	// Promotion moves the domain from the hot tier (24h TTL) to the durable
+	// cache tier — drop the now-redundant hot_entries row. cache_entries already
+	// keeps it in the ipset union; cache-state domains are never re-probed so the
+	// row won't be recreated; and leaving it made the scorer re-promote the same
+	// domain every cycle (ListHotEntries still returned it) and double-count it
+	// toward computeDesiredIPs' eTLD-expansion gate. With this, a domain sits in
+	// exactly one tier (hot XOR cache).
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM hot_entries WHERE domain = ?`, domain); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -390,15 +442,18 @@ func (s *Store) ListCacheEntries(ctx context.Context) ([]string, error) {
 	return out, rows.Err()
 }
 
-// CountFailingProbes returns how many probes for `domain` since `since`
-// recorded a failure (TCP or TLS not OK). Used by scorer to decide when
-// repeated evidence warrants a hot → cache promotion.
-func (s *Store) CountFailingProbes(ctx context.Context, domain string, since time.Time) (int, error) {
+// CountBlockedVerdicts returns how many authoritative probe cycles for
+// `domain` since `since` concluded the domain is blocked (verdict='blocked').
+// Counting the decision-level verdict — not raw transport failure — is what
+// lets differential/L7 blocks (tls13_block, http_cutoff, …) accrue toward a
+// hot → cache promotion. Those leave tcp_ok/tls_ok=1, so the old transport
+// check never counted them and such domains never graduated.
+func (s *Store) CountBlockedVerdicts(ctx context.Context, domain string, since time.Time) (int, error) {
 	ts := formatTime(since)
 	var n int
 	err := s.rdb.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM probes
-		WHERE domain = ? AND created_at >= ? AND (COALESCE(tcp_ok, 0) = 0 OR COALESCE(tls_ok, 0) = 0)
+		WHERE domain = ? AND created_at >= ? AND verdict = 'blocked'
 	`, domain, ts).Scan(&n)
 	return n, err
 }
@@ -492,8 +547,8 @@ func (s *Store) ListProbeCandidates(ctx context.Context, limit int, now time.Tim
 	ts := formatTime(now)
 	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT domain, COALESCE(etld_plus_one, ''), COALESCE(first_seen_at, ''),
-		       COALESCE(last_seen_at, ''), hit_count, peer_count, state, score,
-		       COALESCE(cooldown_until, ''), last_probe_id
+		       COALESCE(last_seen_at, ''), hit_count, state,
+		       COALESCE(cooldown_until, '')
 		FROM domains
 		WHERE state IN ('new', 'watch', 'hot')
 		  AND (cooldown_until IS NULL OR cooldown_until <= ?)
@@ -513,8 +568,7 @@ func (s *Store) ListProbeCandidates(ctx context.Context, limit int, now time.Tim
 		var d Domain
 		if err := rows.Scan(
 			&d.Domain, &d.ETLDPlusOne, &d.FirstSeenAt, &d.LastSeenAt,
-			&d.HitCount, &d.PeerCount, &d.State, &d.Score,
-			&d.CooldownUntil, &d.LastProbeID,
+			&d.HitCount, &d.State, &d.CooldownUntil,
 		); err != nil {
 			return nil, err
 		}
@@ -611,6 +665,27 @@ func (s *Store) PruneProbes(ctx context.Context, before time.Time) (int64, error
 	return deleteWithOptionalBefore(ctx, s.wdb, "probes", "created_at", before)
 }
 
+// PruneDNSCache deletes dns_cache rows by last_seen_at. See PruneCache for
+// zero-time semantics. Reads already ignore rows older than DNSFreshness, so
+// deleting stale observations is a pure space reclaim with no behavior change.
+func (s *Store) PruneDNSCache(ctx context.Context, before time.Time) (int64, error) {
+	return deleteWithOptionalBefore(ctx, s.wdb, "dns_cache", "last_seen_at", before)
+}
+
+// Checkpoint runs a TRUNCATE-mode WAL checkpoint: it merges the -wal file back
+// into the main database and resets it to zero length. The long-lived read pool
+// keeps WAL pages referenced, which prevents SQLite's passive auto-checkpoint
+// from truncating, so the engine calls this periodically to bound WAL growth.
+// Best-effort: if a reader is mid-transaction SQLite returns busy and leaves the
+// WAL in place — the next tick retries.
+func (s *Store) Checkpoint(ctx context.Context) error {
+	rows, err := s.wdb.QueryContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`)
+	if err != nil {
+		return err
+	}
+	return rows.Close()
+}
+
 // DeleteDeniedDomains removes rows from the domains table whose domain or
 // eTLD+1 matches an entry in manual_entries with list_name='deny'. These
 // domains should never appear in any engine-tracked table — the tailer skips
@@ -638,7 +713,7 @@ func (s *Store) DeleteDeniedDomains(ctx context.Context) (int64, error) {
 func (s *Store) ResetOrphanedDomains(ctx context.Context) (int64, error) {
 	res, err := s.wdb.ExecContext(ctx, `
 		UPDATE domains
-		SET state = 'new', cooldown_until = NULL, last_probe_id = NULL
+		SET state = 'new', cooldown_until = NULL
 		WHERE state IN ('hot', 'cache', 'ignore')
 		  AND domain NOT IN (SELECT domain FROM hot_entries)
 		  AND domain NOT IN (SELECT domain FROM cache_entries)
@@ -692,8 +767,8 @@ func countWithOptionalBefore(ctx context.Context, db *sql.DB, table, tsColumn st
 func (s *Store) ListRecentDomains(ctx context.Context, limit int) ([]Domain, error) {
 	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT domain, COALESCE(etld_plus_one, ''), COALESCE(first_seen_at, ''),
-		       COALESCE(last_seen_at, ''), hit_count, peer_count, state, score,
-		       COALESCE(cooldown_until, ''), last_probe_id
+		       COALESCE(last_seen_at, ''), hit_count, state,
+		       COALESCE(cooldown_until, '')
 		FROM domains ORDER BY last_seen_at DESC LIMIT ?
 	`, limit)
 	if err != nil {
@@ -706,8 +781,7 @@ func (s *Store) ListRecentDomains(ctx context.Context, limit int) ([]Domain, err
 		var d Domain
 		if err := rows.Scan(
 			&d.Domain, &d.ETLDPlusOne, &d.FirstSeenAt, &d.LastSeenAt,
-			&d.HitCount, &d.PeerCount, &d.State, &d.Score,
-			&d.CooldownUntil, &d.LastProbeID,
+			&d.HitCount, &d.State, &d.CooldownUntil,
 		); err != nil {
 			return nil, err
 		}

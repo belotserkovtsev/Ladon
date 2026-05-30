@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/belotserkovtsev/ladon/internal/migrate"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -116,10 +118,10 @@ func TestUpsertDomainCreatesAndBumps(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	if err := s.UpsertDomain(ctx, "example.com", "10.10.0.2", time.Time{}); err != nil {
+	if err := s.UpsertDomain(ctx, "example.com", time.Time{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpsertDomain(ctx, "example.com", "10.10.0.2", time.Time{}); err != nil {
+	if err := s.UpsertDomain(ctx, "example.com", time.Time{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -138,22 +140,20 @@ func TestUpsertDomainCreatesAndBumps(t *testing.T) {
 	}
 }
 
-func TestInsertProbeLinksToDomain(t *testing.T) {
+func TestInsertProbeAndStampVerdict(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	if err := s.UpsertDomain(ctx, "example.com", "", time.Time{}); err != nil {
+	if err := s.UpsertDomain(ctx, "example.com", time.Time{}); err != nil {
 		t.Fatal(err)
 	}
 
 	ok := true
 	id, err := s.InsertProbe(ctx, ProbeResult{
-		Domain:      "example.com",
-		DNSOK:       &ok,
-		TCPOK:       &ok,
-		TLSOK:       &ok,
-		ResolvedIPs: []string{"93.184.216.34"},
-		LatencyMS:   42,
+		Domain: "example.com",
+		DNSOK:  &ok,
+		TCPOK:  &ok,
+		TLSOK:  &ok,
 	}, time.Time{})
 	if err != nil {
 		t.Fatal(err)
@@ -162,11 +162,116 @@ func TestInsertProbeLinksToDomain(t *testing.T) {
 		t.Fatalf("expected non-zero probe id")
 	}
 
-	doms, err := s.ListRecentDomains(ctx, 1)
+	// Fresh probe row is provisional (verdict NULL) — not yet counted.
+	if n, err := s.CountBlockedVerdicts(ctx, "example.com", time.Time{}); err != nil {
+		t.Fatal(err)
+	} else if n != 0 {
+		t.Fatalf("want 0 blocked verdicts before stamp, got %d", n)
+	}
+
+	if err := s.SetProbeVerdict(ctx, id, "blocked"); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.CountBlockedVerdicts(ctx, "example.com", time.Time{}); err != nil {
+		t.Fatal(err)
+	} else if n != 1 {
+		t.Fatalf("want 1 blocked verdict after stamp, got %d", n)
+	}
+}
+
+// TestMigrateSchemaFromLegacyDB seeds a pre-v1.4 schema (retired columns
+// present, no verdict, user_version=0), runs the migration list, and asserts the
+// dead columns are dropped, probes.verdict is added, existing rows survive,
+// user_version is stamped to the baseline, and a second pass is a no-op. Also
+// confirms the modernc build supports ALTER TABLE DROP COLUMN inside a tx.
+func TestMigrateSchemaFromLegacyDB(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "legacy.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if doms[0].LastProbeID == nil || *doms[0].LastProbeID != id {
-		t.Fatalf("last_probe_id not linked: %+v", doms[0].LastProbeID)
+	t.Cleanup(func() { s.Close() })
+
+	legacy := `
+		CREATE TABLE domains (
+			domain TEXT PRIMARY KEY, etld_plus_one TEXT, first_seen_at TEXT,
+			last_seen_at TEXT, hit_count INTEGER NOT NULL DEFAULT 0,
+			peer_count INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'new',
+			score REAL NOT NULL DEFAULT 0, cooldown_until TEXT, last_probe_id INTEGER
+		);
+		CREATE TABLE probes (
+			id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL,
+			dns_ok INTEGER, tcp_ok INTEGER, tls_ok INTEGER, http_ok INTEGER,
+			resolved_ips_json TEXT, failure_reason TEXT, latency_ms INTEGER,
+			created_at TEXT NOT NULL
+		);`
+	if _, err := s.wdb.ExecContext(ctx, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.wdb.ExecContext(ctx,
+		`INSERT INTO domains(domain, state, hit_count) VALUES('keep.test', 'hot', 5)`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := migrate.Run(ctx, s.wdb, schema); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	cols := func(table string) map[string]bool {
+		rows, err := s.wdb.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		m := map[string]bool{}
+		for rows.Next() {
+			var cid, notnull, pk int
+			var name, ctype string
+			var dflt sql.NullString
+			if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+				t.Fatal(err)
+			}
+			m[name] = true
+		}
+		return m
+	}
+	d, p := cols("domains"), cols("probes")
+	for _, dead := range []string{"score", "peer_count", "last_probe_id"} {
+		if d[dead] {
+			t.Errorf("domains.%s should have been dropped", dead)
+		}
+	}
+	for _, dead := range []string{"resolved_ips_json", "latency_ms"} {
+		if p[dead] {
+			t.Errorf("probes.%s should have been dropped", dead)
+		}
+	}
+	if !p["verdict"] {
+		t.Error("probes.verdict should have been added")
+	}
+
+	var hc int
+	if err := s.wdb.QueryRowContext(ctx,
+		`SELECT hit_count FROM domains WHERE domain='keep.test'`).Scan(&hc); err != nil {
+		t.Fatalf("seed row lost: %v", err)
+	}
+	if hc != 5 {
+		t.Errorf("row not preserved: hit_count=%d, want 5", hc)
+	}
+
+	// Version stamped to the latest migration so future runs know where the DB
+	// sits and re-apply nothing.
+	wantVer := schema[len(schema)-1].Version
+	var ver int
+	if err := s.wdb.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&ver); err != nil {
+		t.Fatal(err)
+	}
+	if ver != wantVer {
+		t.Errorf("user_version = %d, want %d", ver, wantVer)
+	}
+
+	// Idempotent: a second pass sees the current user_version and runs nothing.
+	if err := migrate.Run(ctx, s.wdb, schema); err != nil {
+		t.Fatalf("second migrate pass: %v", err)
 	}
 }

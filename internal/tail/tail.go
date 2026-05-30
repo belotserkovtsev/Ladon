@@ -1,5 +1,6 @@
-// Package tail follows a log file like `tail -F`, surviving truncation,
-// rotation (inode change), and brief disappearance.
+// Package tail follows a log file like `tail -F`, surviving truncation
+// (in place / logrotate copytruncate), rotation (inode change), and brief
+// disappearance.
 //
 // Unlike a plain polling tail, EOF waits block on an fsnotify watcher, so
 // new data is dispatched within kernel-event latency (~sub-millisecond on
@@ -111,16 +112,23 @@ func Follow(ctx context.Context, path string, opts Options) (<-chan string, <-ch
 			events = watcher.Events
 		}
 
+		// pending holds a partial line read at EOF (no terminating newline yet).
+		// We only emit newline-terminated lines, so a torn write — an fsnotify
+		// tick landing mid-line — never splits one log line into two events. The
+		// fragment is carried until the rest arrives, and dropped on rotation
+		// (the truncated/replaced content it belonged to is gone).
+		var pending string
+
 		for {
 			if err := ctx.Err(); err != nil {
 				return
 			}
 
-			line, err := reader.ReadString('\n')
-			if len(line) > 0 {
-				if line[len(line)-1] == '\n' {
-					line = line[:len(line)-1]
-				}
+			chunk, err := reader.ReadString('\n')
+			if err == nil {
+				line := pending + chunk
+				pending = ""
+				line = line[:len(line)-1] // drop the trailing '\n'
 				if len(line) > 0 && line[len(line)-1] == '\r' {
 					line = line[:len(line)-1]
 				}
@@ -131,11 +139,12 @@ func Follow(ctx context.Context, path string, opts Options) (<-chan string, <-ch
 				}
 				continue
 			}
-
-			if err != nil && !errors.Is(err, io.EOF) {
+			if !errors.Is(err, io.EOF) {
 				errs <- err
 				return
 			}
+			// EOF: stash the unterminated remainder (if any) until more arrives.
+			pending += chunk
 
 			// EOF — wait for a write event or timer tick.
 			timer := time.NewTimer(opts.PollInterval)
@@ -153,11 +162,27 @@ func Follow(ctx context.Context, path string, opts Options) (<-chan string, <-ch
 
 			if time.Since(lastStat) >= opts.ReopenCheckEvery {
 				lastStat = time.Now()
-				fi, err := os.Stat(path)
-				if err == nil && inode(fi) != curIno {
+				// Create/rename rotation (logrotate default): a new inode sits
+				// at the path → reopen fresh.
+				if fi, err := os.Stat(path); err == nil && inode(fi) != curIno {
 					_ = openFile()
+					pending = "" // new inode → the old partial line is gone
 					if watcher != nil {
 						events = watcher.Events
+					}
+				} else if truncatedBelowReader(f) {
+					// Copytruncate / truncate-in-place rotation: same inode, but
+					// the file shrank below our read offset, so it was truncated
+					// out from under us. The pre-truncate content — including any
+					// buffered partial — is gone, so drop the partial regardless
+					// of whether the seek succeeds (a failed seek is retried on
+					// the next tick). Then seek back to the start and reset the
+					// buffered reader so we pick up the post-truncation content
+					// instead of silently dropping lines until the file regrew
+					// past the stale offset.
+					pending = ""
+					if _, err := f.Seek(0, io.SeekStart); err == nil {
+						reader.Reset(f)
 					}
 				}
 			}
@@ -175,4 +200,26 @@ func drainEvents(ch <-chan fsnotify.Event) {
 			return
 		}
 	}
+}
+
+// truncatedBelowReader reports whether f was truncated in place: its current
+// size is smaller than our read position. For an append-only log that can only
+// happen when the file was reset (logrotate copytruncate). The inode is
+// unchanged in that case, so the inode comparison can't detect it. We compare
+// the file descriptor's offset (advanced by bufio's read-ahead, so it sits at
+// the last byte we fetched) against the live size; only a shrink trips it, so
+// normal growth never false-positives.
+func truncatedBelowReader(f *os.File) bool {
+	if f == nil {
+		return false
+	}
+	pos, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return false
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Size() < pos
 }

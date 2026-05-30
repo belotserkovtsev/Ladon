@@ -15,37 +15,37 @@ func TestClassify(t *testing.T) {
 		{
 			name: "dns fail → ignore (not our problem)",
 			in:   prober.Result{DNSOK: false},
-			want: Ignore,
+			want: Clear,
 		},
 		{
 			name: "tcp fail → hot (reachable name, blocked host)",
 			in:   prober.Result{DNSOK: true, TCPOK: false},
-			want: Hot,
+			want: Blocked,
 		},
 		{
 			name: "tls fail → hot (handshake interception)",
 			in:   prober.Result{DNSOK: true, TCPOK: true, TLSOK: false},
-			want: Hot,
+			want: Blocked,
 		},
 		{
 			name: "everything ok → ignore (direct path works)",
 			in:   prober.Result{DNSOK: true, TCPOK: true, TLSOK: true},
-			want: Ignore,
+			want: Clear,
 		},
 		{
 			name: "tls ok, http cutoff → hot (L7 DPI severs stream)",
 			in:   prober.Result{DNSOK: true, TCPOK: true, TLSOK: true, HTTPOK: ptrBool(false)},
-			want: Hot,
+			want: Blocked,
 		},
 		{
 			name: "tls ok, http ok → ignore (real end-to-end response)",
 			in:   prober.Result{DNSOK: true, TCPOK: true, TLSOK: true, HTTPOK: ptrBool(true)},
-			want: Ignore,
+			want: Clear,
 		},
 		{
 			name: "tls ok, http nil (older remote) → ignore (back-compat)",
 			in:   prober.Result{DNSOK: true, TCPOK: true, TLSOK: true},
-			want: Ignore,
+			want: Clear,
 		},
 		{
 			name: "tls13_block (1.2 fallback ok, 1.3 path-blocked) → hot",
@@ -54,7 +54,7 @@ func TestClassify(t *testing.T) {
 				HTTPOK:      ptrBool(true),
 				FailureCode: prober.CodeTLS13Block,
 			},
-			want: Hot,
+			want: Blocked,
 		},
 	}
 	for _, tc := range cases {
