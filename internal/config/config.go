@@ -29,9 +29,10 @@ type File struct {
 	Scorer ScorerSection `yaml:"scorer"`
 	Ipset  IpsetSection  `yaml:"ipset"`
 
-	HotTTL       time.Duration `yaml:"hot_ttl"`
-	DNSFreshness time.Duration `yaml:"dns_freshness"`
-	IgnorePeer   string        `yaml:"ignore_peer"`
+	HotTTL                 time.Duration `yaml:"hot_ttl"`
+	DNSFreshness           time.Duration `yaml:"dns_freshness"`
+	IgnorePeer             string        `yaml:"ignore_peer"`
+	FamilyConfirmThreshold int           `yaml:"family_confirm_threshold"`
 
 	// AllowExtensions are bundled allow-list presets enabled by name. Each
 	// name resolves to <ExtensionsPath>/<name>.txt and is loaded with the

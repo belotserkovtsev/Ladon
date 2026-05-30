@@ -115,6 +115,7 @@ type Config struct {
 	CIDRIpsetName          string        // CIDR ipset name for hash:net entries (default ladon_cidr; "" disables)
 	IpsetInterval          time.Duration // ipset reconcile cadence (periodic safety sweep)
 	DNSFreshness           time.Duration // how recent a dns_cache entry must be to ship IPs to ipset
+	FamilyConfirmThreshold int           // ≥N confirmed (hot/cache) members → trust the eTLD+1 family: expand its IPs AND stop probing new members (state=covered)
 	Scorer                 scorer.Config // hot → cache promotion settings
 	ManualAllowPath        string        // optional path to manual allow list file
 	ManualDenyPath         string        // optional path to manual deny list file
@@ -164,6 +165,7 @@ func Defaults(logPath string) Config {
 		CIDRIpsetName:          "ladon_cidr",
 		IpsetInterval:          30 * time.Second, // fallback safety sweep; Hot events trigger immediate syncs
 		DNSFreshness:           6 * time.Hour,
+		FamilyConfirmThreshold: 10, // empirically: captures all CDN families (≥50 members) while excluding broad-namespace ones with few confirmed (google.com/azure.com seen at 2)
 		Scorer:                 scorer.Defaults(),
 		ManualAllowPath:        "",
 		ManualDenyPath:         "",
@@ -320,10 +322,24 @@ func runTailer(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 					continue
 				}
 				ingested++
-				// Inline probe fast-path: kick off right after ingest so a
-				// freshly-observed blocked domain lands in the ipset within
-				// sub-second, not after the next probe-worker tick.
-				tryInlineProbe(ctx, store, cfg, ev.Domain, sem, ipsetTrigger)
+				// If this domain's eTLD+1 family is already confirmed blocked,
+				// don't probe it: mark it 'covered' (excluded from both probe
+				// paths) and nudge the ipset syncer, which routes its IP via the
+				// family's eTLD+1 expansion. This stops re-probing every rotating
+				// CDN subdomain once the family is trusted. Otherwise take the
+				// inline fast-path so a freshly-observed blocked domain lands in
+				// the ipset sub-second.
+				if confirmed, _ := store.FamilyConfirmed(ctx, etld.Compute(ev.Domain), cfg.FamilyConfirmThreshold); confirmed {
+					if _, err := store.MarkCovered(ctx, ev.Domain); err != nil {
+						log.Printf("mark covered %q: %v", ev.Domain, err)
+					}
+					select {
+					case ipsetTrigger <- struct{}{}:
+					default:
+					}
+				} else {
+					tryInlineProbe(ctx, store, cfg, ev.Domain, sem, ipsetTrigger)
+				}
 			case dnsmasq.Reply:
 				parsed := net.ParseIP(ev.Target)
 				// We operate on v4 only — stun0, WG subnet, iptables rules
@@ -658,11 +674,13 @@ func computeDesiredIPs(ctx context.Context, store *storage.Store, cfg Config) (m
 		sources = append(sources, d)
 	}
 
-	// confirmedByETLD counts hot+cache evidence per family. The ≥2 gate keeps
-	// expansion conservative — one accidentally-failed probe shouldn't drag a
-	// whole CDN's IP space into the tunnel. hot_entries and cache_entries are
-	// disjoint (PromoteCache drops the hot row on promotion), so a single domain
-	// is counted exactly once across the two loops below — no double-count.
+	// confirmedByETLD counts confirmed-blocked members per family. The
+	// FamilyConfirmThreshold gate keeps expansion conservative: a broad-namespace
+	// family (google.com, azure.com) with only a couple of confirmed members must
+	// NOT drag its whole IP space into the tunnel — only families with many
+	// confirmed members (real CDNs: fbcdn, googlevideo, akamai clusters) expand.
+	// hot_entries and cache_entries are disjoint (PromoteCache drops the hot row
+	// on promotion), so a single domain is counted exactly once below.
 	confirmedByETLD := map[string]int{}
 	for _, d := range hots {
 		if r := etld.Compute(d); r != "" {
@@ -686,7 +704,7 @@ func computeDesiredIPs(ctx context.Context, store *storage.Store, cfg Config) (m
 			desired[ip] = struct{}{}
 		}
 		root := etld.Compute(d)
-		if root == "" || confirmedByETLD[root] < 2 {
+		if root == "" || confirmedByETLD[root] < cfg.FamilyConfirmThreshold {
 			continue
 		}
 		if _, done := expandedETLDs[root]; done {

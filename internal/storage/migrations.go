@@ -45,7 +45,16 @@ var schema = []migrate.Migration{
 			`CREATE INDEX IF NOT EXISTS idx_probes_domain_created ON probes(domain, created_at)`,
 		),
 	},
-	// v3+ — append clean, version-numbered steps here.
+	{
+		Version: 3,
+		Name:    "index domains(etld_plus_one, state) for the family-confirmation count",
+		// FamilyConfirmed counts hot/cache members per eTLD+1 on every ingest;
+		// this keeps that count off a full domains scan.
+		Up: migrate.SQL(
+			`CREATE INDEX IF NOT EXISTS idx_domains_etld_state ON domains(etld_plus_one, state)`,
+		),
+	},
+	// v4+ — append clean, version-numbered steps here.
 }
 
 // reconcileLegacy converges an un-versioned (pre-user_version) database to the

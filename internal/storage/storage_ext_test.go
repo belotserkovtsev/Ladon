@@ -171,6 +171,52 @@ func TestCountBlockedVerdicts(t *testing.T) {
 	}
 }
 
+// TestFamilyConfirmedAndMarkCovered covers the family-confirmation gate and the
+// new→covered transition: a family is confirmed at >= threshold hot/cache
+// members; MarkCovered flips only 'new' members (never the hot/cache anchors);
+// a covered domain is no longer probe-eligible.
+func TestFamilyConfirmedAndMarkCovered(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// fam.test: 1 cache + 2 hot anchors = 3 confirmed members.
+	for i, d := range []string{"a.fam.test", "b.fam.test", "c.fam.test"} {
+		if err := s.UpsertDomain(ctx, d, now); err != nil {
+			t.Fatal(err)
+		}
+		st := "hot"
+		if i == 0 {
+			st = "cache"
+		}
+		if err := s.SetDomainState(ctx, d, st, time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = s.UpsertDomain(ctx, "new.fam.test", now)      // state=new, same family
+	_ = s.UpsertDomain(ctx, "lonely.other.test", now) // different family, state=new
+
+	if ok, err := s.FamilyConfirmed(ctx, "fam.test", 3); err != nil || !ok {
+		t.Fatalf("fam.test confirmed at threshold 3: ok=%v err=%v", ok, err)
+	}
+	if ok, _ := s.FamilyConfirmed(ctx, "fam.test", 4); ok {
+		t.Error("fam.test must NOT be confirmed at threshold 4 (only 3 members)")
+	}
+	if ok, _ := s.FamilyConfirmed(ctx, "other.test", 3); ok {
+		t.Error("other.test must not be confirmed (0 hot/cache members)")
+	}
+
+	if flipped, err := s.MarkCovered(ctx, "new.fam.test"); err != nil || !flipped {
+		t.Fatalf("new.fam.test should flip new→covered: flipped=%v err=%v", flipped, err)
+	}
+	if flipped, _ := s.MarkCovered(ctx, "a.fam.test"); flipped {
+		t.Error("a.fam.test is a cache anchor — MarkCovered must not touch it")
+	}
+	if ok, _ := s.ProbeEligible(ctx, "new.fam.test", now); ok {
+		t.Error("covered domain must not be probe-eligible")
+	}
+}
+
 // ListProbeCandidates must exclude domains whose exact name or eTLD+1 matches
 // a manual deny entry. Without this filter the batch probe worker resurrects
 // denied domains into hot_entries after operators prune + ResetOrphanedDomains

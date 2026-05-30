@@ -415,6 +415,9 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 	if f.DNSFreshness > 0 {
 		cfg.DNSFreshness = f.DNSFreshness
 	}
+	if f.FamilyConfirmThreshold > 0 {
+		cfg.FamilyConfirmThreshold = f.FamilyConfirmThreshold
+	}
 	if f.IgnorePeer != "" {
 		cfg.IgnorePeer = f.IgnorePeer
 	}

@@ -43,6 +43,7 @@ ipset:
 
 hot_ttl: 24h
 dns_freshness: 6h
+family_confirm_threshold: 10   # ≥N подтверждённых поддоменов eTLD+1 → семья считается заблокированной (экспансия IP + новые поддомены не пробятся, state=covered)
 ```
 
 Полный набор полей и defaults — в

@@ -324,6 +324,42 @@ func (s *Store) ProbeEligible(ctx context.Context, domain string, now time.Time)
 	return cd.String <= ts, nil
 }
 
+// FamilyConfirmed reports whether at least `threshold` domains sharing this
+// eTLD+1 are confirmed blocked (state hot or cache). The count is capped at the
+// threshold so a big CDN family doesn't scan thousands of rows. Used to decide
+// when a family is trusted enough to expand its IPs and stop probing new members.
+func (s *Store) FamilyConfirmed(ctx context.Context, etldPlusOne string, threshold int) (bool, error) {
+	if etldPlusOne == "" || threshold <= 0 {
+		return false, nil
+	}
+	var n int
+	err := s.rdb.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM (
+			SELECT 1 FROM domains
+			WHERE etld_plus_one = ? AND state IN ('hot', 'cache')
+			LIMIT ?
+		)`, etldPlusOne, threshold).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n >= threshold, nil
+}
+
+// MarkCovered flips a domain from 'new' to 'covered': it belongs to a confirmed
+// blocked family and is routed via the family's eTLD+1 IP expansion, so it is
+// never probed individually (both probe-candidate queries exclude 'covered').
+// Only 'new' rows are touched, so the hot/cache anchors that keep the family
+// confirmed are never demoted. Returns whether a row was flipped.
+func (s *Store) MarkCovered(ctx context.Context, domain string) (bool, error) {
+	res, err := s.wdb.ExecContext(ctx,
+		`UPDATE domains SET state = 'covered' WHERE domain = ? AND state = 'new'`, domain)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 // PromoteCache upserts a cache_entries row and flips the domain's state to
 // 'cache'. Cache entries have no TTL — they persist until a re-probe reverses
 // them or the operator clears the row.
