@@ -337,15 +337,39 @@ func (s *Store) PromoteCache(ctx context.Context, domain, reason string, at time
 		return err
 	}
 	defer tx.Rollback()
+
+	// Fold the hot_entries reason (the DPI detail, e.g. "local:tls13_block|…")
+	// into the cache reason before we drop the hot row, so the audit trail
+	// survives the tier transition. A missing/empty hot reason leaves the
+	// caller's reason (e.g. "repeated_block") as-is.
+	fullReason := reason
+	var hotReason sql.NullString
+	if err := tx.QueryRowContext(ctx,
+		`SELECT reason FROM hot_entries WHERE domain = ?`, domain).Scan(&hotReason); err == nil &&
+		hotReason.Valid && hotReason.String != "" {
+		fullReason = reason + " (" + hotReason.String + ")"
+	}
+
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO cache_entries (domain, promoted_at, reason)
 		VALUES (?, ?, ?)
 		ON CONFLICT(domain) DO UPDATE SET promoted_at = excluded.promoted_at, reason = excluded.reason
-	`, domain, ts, nullableString(reason)); err != nil {
+	`, domain, ts, nullableString(fullReason)); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE domains SET state = 'cache' WHERE domain = ?`, domain); err != nil {
+		return err
+	}
+	// Promotion moves the domain from the hot tier (24h TTL) to the durable
+	// cache tier — drop the now-redundant hot_entries row. cache_entries already
+	// keeps it in the ipset union; cache-state domains are never re-probed so the
+	// row won't be recreated; and leaving it made the scorer re-promote the same
+	// domain every cycle (ListHotEntries still returned it) and double-count it
+	// toward computeDesiredIPs' eTLD-expansion gate. With this, a domain sits in
+	// exactly one tier (hot XOR cache).
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM hot_entries WHERE domain = ?`, domain); err != nil {
 		return err
 	}
 	return tx.Commit()

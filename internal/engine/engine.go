@@ -660,7 +660,9 @@ func computeDesiredIPs(ctx context.Context, store *storage.Store, cfg Config) (m
 
 	// confirmedByETLD counts hot+cache evidence per family. The ≥2 gate keeps
 	// expansion conservative — one accidentally-failed probe shouldn't drag a
-	// whole CDN's IP space into the tunnel.
+	// whole CDN's IP space into the tunnel. hot_entries and cache_entries are
+	// disjoint (PromoteCache drops the hot row on promotion), so a single domain
+	// is counted exactly once across the two loops below — no double-count.
 	confirmedByETLD := map[string]int{}
 	for _, d := range hots {
 		if r := etld.Compute(d); r != "" {
