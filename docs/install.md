@@ -13,7 +13,7 @@ curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/ins
 - определит архитектуру (amd64/arm64) и скачает последнюю версию + проверит sha256;
 - поставит зависимости (`ipset`, `sqlite3`, `dnsmasq`);
 - разложит бинарь, systemd-unit, конфиги и extensions в `/opt/ladon` и `/etc/ladon`;
-- создаст ipset'ы `ladon_engine` + `ladon_manual` с правильными опциями + сохранит ipset state в `/etc/iptables/ipsets`;
+- создаст ipset'ы `ladon_engine` + `ladon_manual` + `ladon_cidr` с правильными опциями + сохранит ipset state в `/etc/iptables/ipsets`;
 - установит CAP_NET_ADMIN drop-in для dnsmasq (нужно для нативных `ipset=` директив);
 - инициализирует БД, перезапустит dnsmasq и запустит ladon;
 - напечатает example iptables/routing-сетапа который **тебе нужно сделать руками**.
@@ -21,7 +21,7 @@ curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/ins
 **Что скрипт НЕ делает:** не трогает iptables / ip rule / routing tables.
 Это зона ответственности оператора — только ты знаешь какой у тебя tunnel-интерфейс, fwmark-схема, peer-subnet и т.д. Ладон просто наполняет ipset'ы; куда направлять трафик при попадании destination IP в эти ipset'ы — твой выбор. Скрипт в конце печатает example для типичного WireGuard split-tunnel сетапа.
 
-**Обновление:** тот же `install.sh` повторно. Скрипт идемпотентен: подтянет latest-версию с GitHub, перезапишет бинарь / systemd-unit / extensions, **сохранит** `config.yaml` и `manual-{allow,deny}.txt`, перезапустит ladon. Подходит и для первой установки и для апгрейда.
+**Обновление:** тот же `install.sh` повторно. Скрипт идемпотентен: подтянет latest-версию с GitHub, перезапишет бинарь / systemd-unit / extensions, **сохранит** `config.yaml` и `manual-{allow,deny}.txt`, перезапустит ladon. Подходит и для первой установки и для апгрейда. Схему БД мигрировать руками не нужно — `run` сам прогоняет миграции на старте (идемпотентно, по `PRAGMA user_version`): старая БД доводится до актуальной формы автоматически.
 
 Удаление:
 
@@ -164,9 +164,10 @@ ip route replace default dev tun0 table ladon
 
 ## 4. Инициализация и запуск
 
-> **`init-db` обязателен перед первым запуском.** Подкоманда `run` НЕ создаёт
-> schema автоматически — без `init-db` журнал заспамится `no such table:
-> domains/probes/...` и сервис будет non-functional.
+> **`run` сам разворачивает и мигрирует схему на старте** (`store.Init`,
+> идемпотентно по `PRAGMA user_version`): на пустой БД создаст таблицы, на
+> существующей догонит до актуальной. `init-db` ниже — явный шаг создать БД
+> заранее (рекомендуется в установке, чтобы поймать ошибки до запуска сервиса).
 
 ```bash
 # Создать схему БД
@@ -202,7 +203,9 @@ for SET in ladon_engine ladon_manual ladon_cidr; do
   echo -n "$SET: "; ipset list "$SET" -t 2>/dev/null | grep '^Number'
 done
 
-# Последние 10 blocked-вердиктов
+# Последние 10 blocked-вердиктов. verdict штампуется только на batch-пути;
+# inline-проба оставляет verdict NULL, поэтому WHERE verdict='blocked' их не
+# покажет — пустой результат на свежей БД это нормально.
 sqlite3 -column /opt/ladon/state/engine.db \
   "SELECT domain, verdict, failure_reason, created_at
    FROM probes
@@ -275,3 +278,14 @@ systemctl restart ladon
 Уменьши `ProbeBatch` или подними `ProbeInterval` в `engine.Defaults()` (требует
 пересборки бинаря). Либо подними `ProbeCooldown` — домены будут пере-пробоваться
 реже.
+
+**Рост файла БД / `*.db-wal`**
+
+Ladon сам подрезает БД фоновой стадией maintenance (`MaintenanceInterval`,
+дефолт 1ч) — ручной уборки не нужно. На каждом тике: WAL checkpoint в режиме
+TRUNCATE (схлопывает `*.db-wal` в основной файл — long-lived read-пул блокирует
+пассивный auto-checkpoint, поэтому явно), прунинг `probes` старше `2 ×
+Scorer.Window` и `dns_cache` старше `max(DNSFreshness, 7 суток)`. Это только
+реклейм места, на корректность не влияет. Сам файл БД при этом не ужимается
+(свободные страницы переиспользуются) — для разового сжатия `VACUUM` вручную в
+окно обслуживания.
