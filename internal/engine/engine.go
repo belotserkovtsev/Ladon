@@ -322,24 +322,12 @@ func runTailer(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 					continue
 				}
 				ingested++
-				// If this domain's eTLD+1 family is already confirmed blocked,
-				// don't probe it: mark it 'covered' (excluded from both probe
-				// paths) and nudge the ipset syncer, which routes its IP via the
-				// family's eTLD+1 expansion. This stops re-probing every rotating
-				// CDN subdomain once the family is trusted. Otherwise take the
-				// inline fast-path so a freshly-observed blocked domain lands in
-				// the ipset sub-second.
-				if confirmed, _ := store.FamilyConfirmed(ctx, etld.Compute(ev.Domain), cfg.FamilyConfirmThreshold); confirmed {
-					if _, err := store.MarkCovered(ctx, ev.Domain); err != nil {
-						log.Printf("mark covered %q: %v", ev.Domain, err)
-					}
-					select {
-					case ipsetTrigger <- struct{}{}:
-					default:
-					}
-				} else {
-					tryInlineProbe(ctx, store, cfg, ev.Domain, sem, ipsetTrigger)
-				}
+				// Inline probe fast-path: kick off right after ingest so a
+				// freshly-observed blocked domain lands in the ipset within
+				// sub-second. probeDomain short-circuits to 'covered' for members
+				// of an already-confirmed family, so no probe fires for
+				// established CDN churn (handled once, in probeDomain).
+				tryInlineProbe(ctx, store, cfg, ev.Domain, sem, ipsetTrigger)
 			case dnsmasq.Reply:
 				parsed := net.ParseIP(ev.Target)
 				// We operate on v4 only — stun0, WG subnet, iptables rules
@@ -436,6 +424,21 @@ func probeOnce(ctx context.Context, store *storage.Store, cfg Config, ipsetTrigg
 func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain string, ipsetTrigger chan<- struct{}, useExitCompare bool) {
 	if err := prober.Validate(domain); err != nil {
 		_ = store.SetDomainState(ctx, domain, "ignore", time.Time{})
+		return
+	}
+	// Single chokepoint for BOTH probe paths (inline + batch worker): if this
+	// domain's eTLD+1 family is already confirmed blocked, don't probe it. Mark
+	// it 'covered' (excluded from both candidate queries) and nudge the syncer —
+	// its IP is routed via the family's eTLD+1 expansion. Stops re-probing every
+	// rotating CDN subdomain once the family is established.
+	if confirmed, _ := store.FamilyConfirmed(ctx, etld.Compute(domain), cfg.FamilyConfirmThreshold); confirmed {
+		if _, err := store.MarkCovered(ctx, domain); err != nil {
+			log.Printf("mark covered %q: %v", domain, err)
+		}
+		select {
+		case ipsetTrigger <- struct{}{}:
+		default:
+		}
 		return
 	}
 	// Prefer IPs that dnsmasq actually handed to the client — avoids engine/

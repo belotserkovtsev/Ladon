@@ -180,39 +180,53 @@ func TestFamilyConfirmedAndMarkCovered(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 
-	// fam.test: 1 cache + 2 hot anchors = 3 confirmed members.
-	for i, d := range []string{"a.fam.test", "b.fam.test", "c.fam.test"} {
+	// fam.test: 3 durable cache anchors confirm the family.
+	for _, d := range []string{"a.fam.test", "b.fam.test", "c.fam.test"} {
 		if err := s.UpsertDomain(ctx, d, now); err != nil {
 			t.Fatal(err)
 		}
-		st := "hot"
-		if i == 0 {
-			st = "cache"
-		}
-		if err := s.SetDomainState(ctx, d, st, time.Time{}); err != nil {
+		if err := s.SetDomainState(ctx, d, "cache", time.Time{}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	_ = s.UpsertDomain(ctx, "new.fam.test", now)      // state=new, same family
-	_ = s.UpsertDomain(ctx, "lonely.other.test", now) // different family, state=new
+	// A hot member and a new member of the same family, plus an unrelated one.
+	_ = s.UpsertDomain(ctx, "h.fam.test", now)
+	_ = s.SetDomainState(ctx, "h.fam.test", "hot", time.Time{})
+	_ = s.UpsertHotEntry(ctx, "h.fam.test", "tls13_block", now.Add(24*time.Hour))
+	_ = s.UpsertDomain(ctx, "n.fam.test", now)        // new, same family
+	_ = s.UpsertDomain(ctx, "lonely.other.test", now) // new, different family
 
+	// Confirmation counts cache only.
 	if ok, err := s.FamilyConfirmed(ctx, "fam.test", 3); err != nil || !ok {
-		t.Fatalf("fam.test confirmed at threshold 3: ok=%v err=%v", ok, err)
+		t.Fatalf("fam.test confirmed at threshold 3 (3 cache): ok=%v err=%v", ok, err)
 	}
 	if ok, _ := s.FamilyConfirmed(ctx, "fam.test", 4); ok {
-		t.Error("fam.test must NOT be confirmed at threshold 4 (only 3 members)")
+		t.Error("fam.test must NOT be confirmed at threshold 4 (only 3 cache)")
 	}
 	if ok, _ := s.FamilyConfirmed(ctx, "other.test", 3); ok {
-		t.Error("other.test must not be confirmed (0 hot/cache members)")
+		t.Error("other.test must not be confirmed (0 cache members)")
 	}
 
-	if flipped, err := s.MarkCovered(ctx, "new.fam.test"); err != nil || !flipped {
-		t.Fatalf("new.fam.test should flip new→covered: flipped=%v err=%v", flipped, err)
+	// 'new' member → covered.
+	if flipped, err := s.MarkCovered(ctx, "n.fam.test"); err != nil || !flipped {
+		t.Fatalf("n.fam.test (new) should flip to covered: flipped=%v err=%v", flipped, err)
 	}
+	// 'hot' member → covered, and its hot_entries row is shed.
+	if flipped, err := s.MarkCovered(ctx, "h.fam.test"); err != nil || !flipped {
+		t.Fatalf("h.fam.test (hot) should flip to covered: flipped=%v err=%v", flipped, err)
+	}
+	hots, _ := s.ListHotEntries(ctx, now)
+	for _, d := range hots {
+		if d == "h.fam.test" {
+			t.Error("covered hot member must shed its hot_entries row")
+		}
+	}
+	// cache anchor is never touched.
 	if flipped, _ := s.MarkCovered(ctx, "a.fam.test"); flipped {
 		t.Error("a.fam.test is a cache anchor — MarkCovered must not touch it")
 	}
-	if ok, _ := s.ProbeEligible(ctx, "new.fam.test", now); ok {
+	// covered domains are not probe candidates.
+	if ok, _ := s.ProbeEligible(ctx, "n.fam.test", now); ok {
 		t.Error("covered domain must not be probe-eligible")
 	}
 }

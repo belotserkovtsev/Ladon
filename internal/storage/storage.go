@@ -325,9 +325,11 @@ func (s *Store) ProbeEligible(ctx context.Context, domain string, now time.Time)
 }
 
 // FamilyConfirmed reports whether at least `threshold` domains sharing this
-// eTLD+1 are confirmed blocked (state hot or cache). The count is capped at the
-// threshold so a big CDN family doesn't scan thousands of rows. Used to decide
-// when a family is trusted enough to expand its IPs and stop probing new members.
+// eTLD+1 are durably blocked (state 'cache'). Counting only cache — the stable
+// anchors that are never converted to 'covered' — keeps confirmation steady as
+// hot/new members get covered (counting hot too would let covering its own
+// members drop the family below threshold and flap). The count is capped at the
+// threshold so a big CDN family doesn't scan thousands of rows.
 func (s *Store) FamilyConfirmed(ctx context.Context, etldPlusOne string, threshold int) (bool, error) {
 	if etldPlusOne == "" || threshold <= 0 {
 		return false, nil
@@ -336,7 +338,7 @@ func (s *Store) FamilyConfirmed(ctx context.Context, etldPlusOne string, thresho
 	err := s.rdb.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM (
 			SELECT 1 FROM domains
-			WHERE etld_plus_one = ? AND state IN ('hot', 'cache')
+			WHERE etld_plus_one = ? AND state = 'cache'
 			LIMIT ?
 		)`, etldPlusOne, threshold).Scan(&n)
 	if err != nil {
@@ -345,19 +347,30 @@ func (s *Store) FamilyConfirmed(ctx context.Context, etldPlusOne string, thresho
 	return n >= threshold, nil
 }
 
-// MarkCovered flips a domain from 'new' to 'covered': it belongs to a confirmed
-// blocked family and is routed via the family's eTLD+1 IP expansion, so it is
-// never probed individually (both probe-candidate queries exclude 'covered').
-// Only 'new' rows are touched, so the hot/cache anchors that keep the family
-// confirmed are never demoted. Returns whether a row was flipped.
+// MarkCovered flips a non-anchor member of a confirmed family to 'covered': it
+// is routed via the family's eTLD+1 IP expansion, so it is never probed
+// individually (both probe-candidate queries exclude 'covered'). Only 'new' and
+// 'hot' rows are touched — never 'cache' (the anchors that keep the family
+// confirmed). A flipped 'hot' member also sheds its hot_entries row, leaving it
+// in exactly one tier. Returns whether a row was flipped.
 func (s *Store) MarkCovered(ctx context.Context, domain string) (bool, error) {
-	res, err := s.wdb.ExecContext(ctx,
-		`UPDATE domains SET state = 'covered' WHERE domain = ? AND state = 'new'`, domain)
+	tx, err := s.wdb.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
-	n, _ := res.RowsAffected()
-	return n > 0, nil
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx,
+		`UPDATE domains SET state = 'covered' WHERE domain = ? AND state IN ('new', 'hot')`, domain)
+	if err != nil {
+		return false, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return false, tx.Commit() // anchor (cache) or already covered — nothing to do
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM hot_entries WHERE domain = ?`, domain); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
 }
 
 // PromoteCache upserts a cache_entries row and flips the domain's state to
