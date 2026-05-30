@@ -121,6 +121,17 @@ type Config struct {
 	ManualDenyPath         string        // optional path to manual deny list file
 	IgnorePeer             string        // peer IP to skip (gateway self, etc.)
 
+	// DnsmasqConfPath is where the manual-list ipset= snippet gets written.
+	// /etc/dnsmasq.d/ladon-manual.conf on Debian/Ubuntu; /tmp/dnsmasq.d/...
+	// on OpenWRT (which auto-includes /tmp/dnsmasq.d/ by default).
+	DnsmasqConfPath string
+
+	// DnsmasqRestartCmd is run after writing the snippet so dnsmasq picks
+	// up the new ipset= directives (SIGHUP only re-reads /etc/resolv.conf).
+	// systemctl restart dnsmasq on Debian; /etc/init.d/dnsmasq reload on
+	// OpenWRT. Empty disables the auto-bounce.
+	DnsmasqRestartCmd string
+
 	// AllowExtensions are bundled allow-list presets (e.g. "ai", "twitch")
 	// that ship with ladon and are opt-in by name. Each name resolves to
 	// ExtensionsPath/<name>.txt, which is loaded with the same parser as
@@ -170,6 +181,8 @@ func Defaults(logPath string) Config {
 		ManualAllowPath:        "",
 		ManualDenyPath:         "",
 		IgnorePeer:             "10.10.0.1",
+		DnsmasqConfPath:        dnsmasqcfg.DefaultPath,
+		DnsmasqRestartCmd:      dnsmasqcfg.DefaultRestartCmd,
 	}
 }
 
@@ -207,11 +220,11 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 		log.Printf("manual: %v", err)
 	}
 	if cfg.ManualIpsetName != "" {
-		if err := dnsmasqcfg.Write(cfg.ManualIpsetName, manualEntries.Domains); err != nil {
+		if err := dnsmasqcfg.Write(cfg.DnsmasqConfPath, cfg.ManualIpsetName, manualEntries.Domains); err != nil {
 			log.Printf("dnsmasq config write: %v", err)
 		} else {
-			log.Printf("manual: wrote %d domains → %s (ipset=%s)", len(manualEntries.Domains), dnsmasqcfg.Path, cfg.ManualIpsetName)
-			if err := dnsmasqcfg.Restart(ctx); err != nil {
+			log.Printf("manual: wrote %d domains → %s (ipset=%s)", len(manualEntries.Domains), cfg.DnsmasqConfPath, cfg.ManualIpsetName)
+			if err := dnsmasqcfg.Restart(ctx, cfg.DnsmasqRestartCmd); err != nil {
 				log.Printf("dnsmasq restart: %v — manual list will activate on next dnsmasq restart", err)
 			}
 		}

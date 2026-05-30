@@ -1,0 +1,73 @@
+# Example ladon config — OpenWRT.
+#
+# Отличается от config.yaml.example только OpenWRT-специфичными путями
+# (dnsmasq.conf_path в /tmp/, restart_cmd через /etc/init.d/, state/extensions
+# под /var/lib и /usr/share). Всё остальное — те же дефолты.
+#
+# install.sh кладёт этот файл в /etc/ladon/config.yaml автоматически
+# при первой установке (повторный запуск не перезатирает).
+
+# --- paths ---
+
+# logfile: /var/log/dnsmasq.log
+# manual_allow: /etc/ladon/manual-allow.txt
+# manual_deny: /etc/ladon/manual-deny.txt
+extensions_path: /usr/share/ladon/extensions
+publish_path: /var/lib/ladon/state/published-domains.txt
+
+# --- dnsmasq integration ---
+# На OpenWRT dnsmasq init по умолчанию подхватывает /tmp/dnsmasq.d/, так что
+# пишем снипет туда — не нужно лезть в UCI confdir. Restart через procd.
+
+dnsmasq:
+  conf_path: /tmp/dnsmasq.d/ladon-manual.conf
+  restart_cmd: /etc/init.d/dnsmasq reload
+
+# --- probe backend ---
+
+probe:
+  mode: local          # local (default) | exit-compare
+  timeout: 800ms       # TCP/TLS dial timeout
+  cooldown: 5m         # минимальный интервал между probe одного домена
+  concurrency: 8       # семафор inline-probe из tailer
+  # interval: 2s
+  # batch: 4
+
+  # --- exit-compare (опционально, см. docs/probe-api.md) ---
+  # remote:
+  #   url: https://my-probe-server.example.com/probe
+  #   timeout: 2s
+  #   auth_header: Authorization
+  #   auth_value: Bearer mysecrettoken
+
+# --- extensions ---
+# Преднастроенные allow/deny-списки. Полный каталог:
+#   https://github.com/belotserkovtsev/ladon/blob/main/docs/extensions.md
+# allow_extensions:
+#   - ai
+#   - twitch
+#   - tiktok
+
+# --- scorer ---
+
+scorer:
+  interval: 10m
+  window: 24h
+  fail_threshold: 50
+
+# --- routing ---
+
+ipset:
+  engine_name: ladon_engine
+  manual_name: ladon_manual
+  cidr_name:   ladon_cidr
+  interval: 30s
+
+# --- TTL / freshness ---
+
+hot_ttl: 24h
+dns_freshness: 6h
+
+# --- прочее ---
+
+# ignore_peer: 10.10.0.1   # peer, чьи DNS-запросы игнорируются (gateway self)

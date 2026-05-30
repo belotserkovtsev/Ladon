@@ -409,6 +409,14 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 	if f.Ipset.Interval > 0 {
 		cfg.IpsetInterval = f.Ipset.Interval
 	}
+	if f.Dnsmasq.ConfPath != "" {
+		cfg.DnsmasqConfPath = f.Dnsmasq.ConfPath
+	}
+	// Empty restart_cmd is a meaningful "disable" signal — distinguish it
+	// from "unset" by checking the whole Dnsmasq section, not just the field.
+	if f.Dnsmasq.RestartCmd != "" {
+		cfg.DnsmasqRestartCmd = f.Dnsmasq.RestartCmd
+	}
 	if f.HotTTL > 0 {
 		cfg.HotTTL = f.HotTTL
 	}

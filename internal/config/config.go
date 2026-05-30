@@ -25,9 +25,10 @@ type File struct {
 	ManualAllow string `yaml:"manual_allow"`
 	ManualDeny  string `yaml:"manual_deny"`
 
-	Probe  ProbeSection  `yaml:"probe"`
-	Scorer ScorerSection `yaml:"scorer"`
-	Ipset  IpsetSection  `yaml:"ipset"`
+	Probe   ProbeSection   `yaml:"probe"`
+	Scorer  ScorerSection  `yaml:"scorer"`
+	Ipset   IpsetSection   `yaml:"ipset"`
+	Dnsmasq DnsmasqSection `yaml:"dnsmasq"`
 
 	HotTTL                 time.Duration `yaml:"hot_ttl"`
 	DNSFreshness           time.Duration `yaml:"dns_freshness"`
@@ -89,6 +90,14 @@ type IpsetSection struct {
 	ManualName string        `yaml:"manual_name"` // dnsmasq-managed (default ladon_manual; "" disables)
 	CIDRName   string        `yaml:"cidr_name"`   // CIDR hash:net set fed by extensions (default ladon_cidr; "" disables)
 	Interval   time.Duration `yaml:"interval"`
+}
+
+// DnsmasqSection points ladon at the dnsmasq it's collaborating with. Defaults
+// match Debian/Ubuntu (drop-in under /etc/dnsmasq.d/, systemd bounce); OpenWRT
+// example config overrides both.
+type DnsmasqSection struct {
+	ConfPath   string `yaml:"conf_path"`   // default /etc/dnsmasq.d/ladon-manual.conf
+	RestartCmd string `yaml:"restart_cmd"` // default `systemctl restart dnsmasq`; "" disables
 }
 
 // Load reads and parses a YAML file. Returns ErrNotFound if the path is empty

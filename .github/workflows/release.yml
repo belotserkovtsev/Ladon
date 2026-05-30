@@ -60,9 +60,84 @@ jobs:
             dist/ladon-linux-${{ matrix.arch }}.tar.gz.sha256
           retention-days: 7
 
+  build-openwrt:
+    # OpenWRT tarballs ship side-by-side with the Debian ones. Same binary
+    # (Go static, CGO_ENABLED=0), different bundle: procd init unit instead
+    # of systemd, OpenWRT config example. The install.sh in both tarballs
+    # is the same unified dispatcher that detects OS at runtime. Arch names
+    # here mirror what `opkg print-architecture` yields.
+    name: 🏗 build openwrt ${{ matrix.tarball_arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tarball_arch: aarch64
+            goarch: arm64
+            goarm: ""
+            gomips: ""
+          - tarball_arch: armv7
+            goarch: arm
+            goarm: "7"
+            gomips: ""
+          # mipsel_24kc intentionally absent: modernc.org/libc (transitive dep
+          # of modernc.org/sqlite) doesn't ship build files for linux/mipsle.
+          # Bringing MIPS back means either a different pure-Go SQLite backend
+          # (e.g. ncruces/go-sqlite3 via wazero) or a CGO build with musl-mips
+          # toolchain — both larger refactors. Tracked in v1.5+ backlog.
+          - tarball_arch: x86_64
+            goarch: amd64
+            goarm: ""
+            gomips: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build static binary (openwrt)
+        env:
+          TARBALL_ARCH: ${{ matrix.tarball_arch }}
+          GOARCH_OVERRIDE: ${{ matrix.goarch }}
+          GOARM_OVERRIDE: ${{ matrix.goarm }}
+          GOMIPS_OVERRIDE: ${{ matrix.gomips }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          STAGE="dist/ladon-openwrt-${TARBALL_ARCH}-${TAG}"
+          mkdir -p "${STAGE}"
+          CGO_ENABLED=0 GOOS=linux GOARCH="${GOARCH_OVERRIDE}" \
+            GOARM="${GOARM_OVERRIDE}" GOMIPS="${GOMIPS_OVERRIDE}" \
+            go build -trimpath -ldflags="-s -w -X main.version=${TAG}" \
+            -o "${STAGE}/ladon" ./cmd/ladon
+
+          # OpenWRT-specific runtime bundle. procd unit instead of systemd;
+          # OpenWRT-flavoured config example with /tmp/ /usr/share/ /var/lib paths.
+          cp release/ladon.init                       "${STAGE}/"
+          cp release/manual-allow.txt.example         "${STAGE}/"
+          cp release/manual-deny.txt.example          "${STAGE}/"
+          cp release/config.yaml.openwrt.example      "${STAGE}/"
+          cp release/install.sh                       "${STAGE}/"
+          cp release/uninstall.sh                     "${STAGE}/"
+          cp -r release/extensions                    "${STAGE}/"
+
+          tar -czf "dist/ladon-openwrt-${TARBALL_ARCH}.tar.gz" -C dist "ladon-openwrt-${TARBALL_ARCH}-${TAG}"
+          (cd dist && sha256sum "ladon-openwrt-${TARBALL_ARCH}.tar.gz" \
+            > "ladon-openwrt-${TARBALL_ARCH}.tar.gz.sha256")
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ladon-openwrt-${{ matrix.tarball_arch }}
+          path: |
+            dist/ladon-openwrt-${{ matrix.tarball_arch }}.tar.gz
+            dist/ladon-openwrt-${{ matrix.tarball_arch }}.tar.gz.sha256
+          retention-days: 7
+
   publish:
     name: 📦 publish release
-    needs: build
+    needs: [build, build-openwrt]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -78,12 +153,14 @@ jobs:
 
       - name: stage standalone install scripts
         # Publish install.sh / uninstall.sh as separate release assets too,
-        # so the recommended curl one-liner can fetch them via the predictable
-        # /releases/latest/download/install.sh URL without unpacking a tarball.
+        # so the recommended one-liner can fetch them via the predictable
+        # /releases/latest/download/<name>.sh URL without unpacking a tarball.
+        # A single script dispatches Debian vs OpenWRT by sniffing
+        # /etc/openwrt_release vs /etc/os-release.
         run: |
           cp release/install.sh   dist/install.sh
           cp release/uninstall.sh dist/uninstall.sh
-          chmod +x dist/install.sh dist/uninstall.sh
+          chmod +x dist/*.sh
 
       - name: publish GitHub Release
         uses: softprops/action-gh-release@v2

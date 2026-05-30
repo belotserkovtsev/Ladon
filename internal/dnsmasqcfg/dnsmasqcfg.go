@@ -16,20 +16,26 @@ import (
 	"strings"
 )
 
-// Path is where the snippet lives. dnsmasq picks up everything in
-// /etc/dnsmasq.d/ that matches its include glob (set in dnsmasq.conf).
-const Path = "/etc/dnsmasq.d/ladon-manual.conf"
+// DefaultPath is the Debian/Ubuntu drop-in location. OpenWRT passes
+// /tmp/dnsmasq.d/ladon-manual.conf instead — the path is operator-configurable
+// via engine.Config.DnsmasqConfPath (YAML: dnsmasq.conf_path).
+const DefaultPath = "/etc/dnsmasq.d/ladon-manual.conf"
 
-// Write produces the snippet at Path. Atomic via tmp+rename so dnsmasq
+// DefaultRestartCmd is the systemd incantation. OpenWRT operators pass
+// "/etc/init.d/dnsmasq reload" instead via engine.Config.DnsmasqRestartCmd.
+const DefaultRestartCmd = "systemctl restart dnsmasq"
+
+// Write produces the snippet at path. Atomic via tmp+rename so dnsmasq
 // never observes a half-written file. Empty domains list still writes a
 // stub — keeps file present for operator visibility, dnsmasq treats it
 // as a no-op include.
-func Write(ipsetName string, domains []string) error {
+func Write(path, ipsetName string, domains []string) error {
+	if path == "" {
+		return fmt.Errorf("dnsmasqcfg: empty path")
+	}
 	if ipsetName == "" {
 		return fmt.Errorf("dnsmasqcfg: empty ipset name")
 	}
-	// Dedup + sort for stable diff. Operators reading the file want
-	// alphabetical order, not insertion order.
 	uniq := make(map[string]struct{}, len(domains))
 	for _, d := range domains {
 		d = strings.ToLower(strings.TrimSpace(strings.TrimRight(d, ".")))
@@ -54,7 +60,10 @@ func Write(ipsetName string, domains []string) error {
 		fmt.Fprintf(&sb, "ipset=/%s/%s\n", d, ipsetName)
 	}
 
-	dir := filepath.Dir(Path)
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
 	tmp, err := os.CreateTemp(dir, ".ladon-manual.conf.*")
 	if err != nil {
 		return fmt.Errorf("create temp: %w", err)
@@ -73,28 +82,31 @@ func Write(ipsetName string, domains []string) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp: %w", err)
 	}
-	if err := os.Rename(tmpPath, Path); err != nil {
-		return fmt.Errorf("rename %s: %w", Path, err)
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("rename %s: %w", path, err)
 	}
 	return nil
 }
 
-// Restart bounces dnsmasq so it re-reads /etc/dnsmasq.d/*.conf. Required
-// because SIGHUP (systemctl reload) only re-reads /etc/resolv.conf and
-// /etc/hosts — the `ipset=` directives ladon writes here are parsed at
-// startup and ignored on reload. Hardcoded to the systemd service name;
-// ladon only supports systemd-managed dnsmasq.
+// Restart runs the operator-configured restart command (whitespace-split) so
+// dnsmasq re-reads its drop-ins — SIGHUP only re-reads /etc/resolv.conf and
+// /etc/hosts, the `ipset=` directives we write are parsed at startup and
+// ignored on reload.
 //
-// Cost: ~100ms of DNS unavailability per ladon startup. Acceptable
-// because (a) dnsmasq is stateless and comes back instantly, (b) this
-// only runs at ladon start, not per-query, (c) eliminating the manual
-// `systemctl restart dnsmasq` step after editing manual-allow / extensions
-// is worth the blip.
-func Restart(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, "systemctl", "restart", "dnsmasq")
-	out, err := cmd.CombinedOutput()
+// On Debian/Ubuntu the default is `systemctl restart dnsmasq`; on OpenWRT
+// the install script puts `/etc/init.d/dnsmasq reload` in config.yaml.
+// Empty cmd is a no-op — useful in tests and for setups where the operator
+// wants to bounce dnsmasq themselves.
+func Restart(ctx context.Context, cmd string) error {
+	cmd = strings.TrimSpace(cmd)
+	if cmd == "" {
+		return nil
+	}
+	parts := strings.Fields(cmd)
+	c := exec.CommandContext(ctx, parts[0], parts[1:]...)
+	out, err := c.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("systemctl restart dnsmasq: %w (output: %s)", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("%s: %w (output: %s)", cmd, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

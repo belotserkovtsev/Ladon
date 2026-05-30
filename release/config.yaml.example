@@ -58,6 +58,13 @@ ipset:
   cidr_name:   ladon_cidr   # hash:net для CIDR-блоков из extensions (DNS-bypassing services)
   interval: 30s             # safety-reconcile; горячие события триггерят немедленный sync
 
+# --- dnsmasq integration ---
+# Дефолты — для Debian/Ubuntu. На OpenWRT используйте release/config.yaml.openwrt.example.
+
+# dnsmasq:
+#   conf_path: /etc/dnsmasq.d/ladon-manual.conf  # куда ладон пишет ipset= снипет
+#   restart_cmd: systemctl restart dnsmasq       # как бампнуть dnsmasq после записи; "" отключает
+
 # --- TTL / freshness ---
 
 hot_ttl: 24h           # срок жизни записи в hot_entries

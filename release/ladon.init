@@ -1,0 +1,76 @@
+#!/bin/sh /etc/rc.common
+# ladon — smart split-tunneling engine for DPI-censored networks (OpenWRT).
+#
+# What this script does on top of plain procd:
+#   * ensures the three ipsets exist BEFORE ladon starts (OpenWRT has no
+#     /etc/iptables/ipsets equivalent, and ladon expects them present —
+#     it does not `ipset create` itself);
+#   * reacts to /etc/config/dhcp changes (logfacility flip etc.) by
+#     restarting so it picks up the new dnsmasq log path.
+#
+# Routing (firewall4/iptables rules referencing the ipsets) is the
+# operator's job — exactly as on Debian. See docs/install-openwrt.md
+# for an nftables wiring example.
+
+USE_PROCD=1
+START=95
+STOP=10
+
+PROG=/usr/bin/ladon
+CONF=/etc/ladon/config.yaml
+DB=/var/lib/ladon/state/engine.db
+ALLOW=/etc/ladon/manual-allow.txt
+DENY=/etc/ladon/manual-deny.txt
+LOGFILE=/var/log/dnsmasq.log
+
+IPSET_ENGINE=ladon_engine
+IPSET_MANUAL=ladon_manual
+IPSET_CIDR=ladon_cidr
+
+ensure_ipsets() {
+	# ipset list -t fails fast when the set doesn't exist; create with
+	# the same shapes/timeouts the Debian installer uses.
+	ipset list "$IPSET_ENGINE" -t >/dev/null 2>&1 || \
+		ipset create "$IPSET_ENGINE" hash:ip family inet maxelem 65536
+	ipset list "$IPSET_MANUAL" -t >/dev/null 2>&1 || \
+		ipset create "$IPSET_MANUAL" hash:ip family inet maxelem 65536 timeout 86400
+	ipset list "$IPSET_CIDR" -t >/dev/null 2>&1 || \
+		ipset create "$IPSET_CIDR" hash:net family inet maxelem 65536
+}
+
+start_service() {
+	ensure_ipsets
+
+	mkdir -p /var/lib/ladon/state /etc/ladon
+
+	# First-run init-db is idempotent — schema migrations are guarded.
+	"$PROG" -db "$DB" init-db >/dev/null 2>&1 || true
+
+	procd_open_instance ladon
+	procd_set_param command "$PROG" \
+		-db "$DB" \
+		-config "$CONF" \
+		run \
+		-manual-allow "$ALLOW" \
+		-manual-deny  "$DENY" \
+		"$LOGFILE"
+	# respawn threshold=3600s, timeout=5s, retry=0 (infinite): match the
+	# Debian unit's `Restart=always RestartSec=5` semantics.
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param file "$CONF"
+	procd_close_instance
+}
+
+service_triggers() {
+	# Bump ladon when the operator flips dnsmasq logging on/off or changes
+	# the log path — ladon's tail target is wired to /var/log/dnsmasq.log
+	# and there's no point keeping it tailing a dead path.
+	procd_add_reload_trigger "dhcp"
+}
+
+reload_service() {
+	stop
+	start
+}

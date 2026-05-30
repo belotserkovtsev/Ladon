@@ -1,6 +1,8 @@
-# Установка ladon
+# Установка ladon (Debian/Ubuntu)
 
-← [README](../README.md) · [конфигурация](configuration.md) · [extensions](extensions.md)
+← [README](../README.md) · [OpenWRT (beta)](install-openwrt.md) · [конфигурация](configuration.md) · [extensions](extensions.md)
+
+> На OpenWRT — отдельный гайд: [install-openwrt.md](install-openwrt.md).
 
 ## TL;DR — установка одной командой (Debian/Ubuntu)
 
