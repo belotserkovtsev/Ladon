@@ -28,6 +28,7 @@ type File struct {
 	Probe  ProbeSection  `yaml:"probe"`
 	Scorer ScorerSection `yaml:"scorer"`
 	Ipset  IpsetSection  `yaml:"ipset"`
+	Log    LogSection    `yaml:"log"`
 
 	HotTTL                 time.Duration `yaml:"hot_ttl"`
 	DNSFreshness           time.Duration `yaml:"dns_freshness"`
@@ -91,6 +92,16 @@ type IpsetSection struct {
 	Interval   time.Duration `yaml:"interval"`
 }
 
+// LogSection tunes the daemon's structured logging. All fields are optional —
+// the zero value (level=info, format=text) is the production default. journald
+// rendering (priority prefix + no timestamp) is auto-detected at runtime from
+// the JOURNAL_STREAM env var, so operators never set it by hand.
+type LogSection struct {
+	Level  string `yaml:"level"`  // debug|info|warn|error (default info)
+	Format string `yaml:"format"` // text|json (default text)
+	Source bool   `yaml:"source"` // include source file:line (default false)
+}
+
 // Load reads and parses a YAML file. Returns ErrNotFound if the path is empty
 // so callers can fall through to defaults. Missing files at non-empty paths
 // are a real error — the operator asked for a config and we couldn't open it.
@@ -123,6 +134,18 @@ func (f *File) Validate() error {
 	}
 	if f.Probe.Mode == "exit-compare" && f.Probe.Remote.URL == "" {
 		return prober.ErrEmptyURL
+	}
+	switch f.Log.Level {
+	case "", "debug", "info", "warn", "warning", "error", "err":
+		// ok
+	default:
+		return fmt.Errorf("log.level: unknown %q (want debug|info|warn|error)", f.Log.Level)
+	}
+	switch f.Log.Format {
+	case "", "text", "json":
+		// ok
+	default:
+		return fmt.Errorf("log.format: unknown %q (want text|json)", f.Log.Format)
 	}
 	// A preset listed on both sides would load the same file into both
 	// manual_entries tiers — operator confusion, not a useful intent.

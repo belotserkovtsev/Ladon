@@ -54,7 +54,24 @@ var schema = []migrate.Migration{
 			`CREATE INDEX IF NOT EXISTS idx_domains_etld_state ON domains(etld_plus_one, state)`,
 		),
 	},
-	// v4+ — append clean, version-numbered steps here.
+	{
+		Version: 4,
+		Name:    "runtime_meta key/value heartbeat for cross-process status (doctor/status)",
+		// The daemon writes liveness + last-reconcile facts here; the separate
+		// `ladon doctor`/`status` processes read them (they can't see the
+		// daemon's memory). Values that ARE derivable from existing tables
+		// (last observation, last probe) are NOT stored here — only facts the
+		// schema otherwise loses (reconcile timestamps/counts, scorer runs,
+		// process identity).
+		Up: migrate.SQL(
+			`CREATE TABLE IF NOT EXISTS runtime_meta (
+				key        TEXT PRIMARY KEY,
+				value      TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			)`,
+		),
+	},
+	// v5+ — append clean, version-numbered steps here.
 }
 
 // reconcileLegacy converges an un-versioned (pre-user_version) database to the

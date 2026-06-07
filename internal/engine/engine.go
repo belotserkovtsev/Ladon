@@ -6,10 +6,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/belotserkovtsev/ladon/internal/decision"
@@ -18,12 +19,37 @@ import (
 	"github.com/belotserkovtsev/ladon/internal/etld"
 	"github.com/belotserkovtsev/ladon/internal/ipset"
 	"github.com/belotserkovtsev/ladon/internal/manual"
+	"github.com/belotserkovtsev/ladon/internal/obs"
 	"github.com/belotserkovtsev/ladon/internal/prober"
 	"github.com/belotserkovtsev/ladon/internal/scorer"
 	"github.com/belotserkovtsev/ladon/internal/storage"
 	"github.com/belotserkovtsev/ladon/internal/tail"
 	"github.com/belotserkovtsev/ladon/internal/watcher"
 )
+
+// Component-tagged loggers, rebound to the configured default in Run. They
+// default to slog.Default() so package funcs called outside Run (tests) still
+// log somewhere instead of panicking on a nil logger.
+var (
+	logEngine = slog.Default()
+	logTail   = slog.Default()
+	logProbe  = slog.Default()
+	logIpset  = slog.Default()
+	logMaint  = slog.Default()
+)
+
+// setMeta best-effort writes a runtime_meta heartbeat, warning (not failing the
+// stage) if the write errors — a failed meta write means the DB is unhappy,
+// which is worth surfacing but never worth killing the pipeline over.
+func setMeta(ctx context.Context, store *storage.Store, key, value string) {
+	if err := store.SetMeta(ctx, key, value); err != nil {
+		logEngine.Warn("runtime_meta write failed", "key", key, "err", err)
+	}
+}
+
+func setMetaTime(ctx context.Context, store *storage.Store, key string, t time.Time) {
+	setMeta(ctx, store, key, storage.FormatTime(t))
+}
 
 // loadDenyExtensions walks cfg.DenyExtensions, reads each preset from
 // ExtensionsPath/<name>.txt, and upserts its domains into manual_entries
@@ -37,15 +63,15 @@ func loadDenyExtensions(ctx context.Context, store *storage.Store, cfg Config) {
 	for _, name := range cfg.DenyExtensions {
 		path := filepath.Join(cfg.ExtensionsPath, name+".txt")
 		if _, err := os.Stat(path); err != nil {
-			log.Printf("deny extension %q: file not found at %s — check extensions_path", name, path)
+			logEngine.Warn("deny extension file not found", "ext", name, "path", path)
 			continue
 		}
 		n, err := manual.Load(ctx, store, path, "deny")
 		if err != nil {
-			log.Printf("deny extension %q load: %v", name, err)
+			logEngine.Error("deny extension load failed", "ext", name, "err", err)
 			continue
 		}
-		log.Printf("deny extension %s: %d domains from %s", name, n, path)
+		logEngine.Info("deny extension loaded", "ext", name, "domains", n, "path", path)
 	}
 }
 
@@ -84,15 +110,15 @@ func collectManualEntries(cfg Config) (manual.Entries, error) {
 	for _, name := range cfg.AllowExtensions {
 		path := filepath.Join(cfg.ExtensionsPath, name+".txt")
 		if _, err := os.Stat(path); err != nil {
-			log.Printf("allow extension %q: file not found at %s — check extensions_path", name, path)
+			logEngine.Warn("allow extension file not found", "ext", name, "path", path)
 			continue
 		}
 		e, err := manual.ReadEntries(path)
 		if err != nil {
-			log.Printf("allow extension %q read: %v", name, err)
+			logEngine.Error("allow extension read failed", "ext", name, "err", err)
 			continue
 		}
-		log.Printf("allow extension %s: %d domains + %d CIDRs from %s", name, len(e.Domains), len(e.CIDRs), path)
+		logEngine.Info("allow extension loaded", "ext", name, "domains", len(e.Domains), "cidrs", len(e.CIDRs), "path", path)
 		add(e)
 	}
 	return out, nil
@@ -120,6 +146,10 @@ type Config struct {
 	ManualAllowPath        string        // optional path to manual allow list file
 	ManualDenyPath         string        // optional path to manual deny list file
 	IgnorePeer             string        // peer IP to skip (gateway self, etc.)
+
+	// Version is the running binary's version string, recorded to runtime_meta
+	// at startup so `ladon doctor`/`status` can report it. Empty in tests.
+	Version string
 
 	// AllowExtensions are bundled allow-list presets (e.g. "ai", "twitch")
 	// that ship with ladon and are opt-in by name. Each name resolves to
@@ -175,21 +205,34 @@ func Defaults(logPath string) Config {
 
 // Run starts all pipeline stages and blocks until ctx is cancelled.
 func Run(ctx context.Context, store *storage.Store, cfg Config) error {
+	// Bind component loggers off whatever default the CLI configured.
+	logEngine = obs.Logger("engine")
+	logTail = obs.Logger("tailer")
+	logProbe = obs.Logger("prober")
+	logIpset = obs.Logger("ipset")
+	logMaint = obs.Logger("maintenance")
+
+	// Record identity/liveness up front so a `ladon doctor` run right after
+	// startup already sees the process.
+	setMetaTime(ctx, store, "started_at", time.Now().UTC())
+	setMeta(ctx, store, "version", cfg.Version)
+	setMeta(ctx, store, "pid", strconv.Itoa(os.Getpid()))
+
 	if cfg.LocalProber == nil {
 		cfg.LocalProber = prober.NewLocal(cfg.ProbeTimeout)
 	}
 	if cfg.RemoteProber != nil {
-		log.Printf("probe backends: %s (baseline) + %s (exit-compare)",
-			cfg.LocalProber.Name(), cfg.RemoteProber.Name())
+		logEngine.Info("probe backends configured",
+			"baseline", cfg.LocalProber.Name(), "exit_compare", cfg.RemoteProber.Name())
 	} else {
-		log.Printf("probe backend: %s", cfg.LocalProber.Name())
+		logEngine.Info("probe backend configured", "baseline", cfg.LocalProber.Name())
 	}
 	// Manual-deny still goes through the database — engine consults
 	// IsInDenyList during ingest to skip those domains entirely.
 	if n, err := manual.Load(ctx, store, cfg.ManualDenyPath, "deny"); err != nil {
-		log.Printf("manual deny load: %v", err)
+		logEngine.Error("manual deny load failed", "err", err)
 	} else if n > 0 {
-		log.Printf("manual deny: loaded %d entries from %s", n, cfg.ManualDenyPath)
+		logEngine.Info("manual deny loaded", "entries", n, "path", cfg.ManualDenyPath)
 	}
 	loadDenyExtensions(ctx, store, cfg)
 
@@ -204,15 +247,16 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	//      verification. Letting dnsmasq own it keeps that mental model clean.
 	manualEntries, err := collectManualEntries(cfg)
 	if err != nil {
-		log.Printf("manual: %v", err)
+		logEngine.Error("collect manual entries failed", "err", err)
 	}
 	if cfg.ManualIpsetName != "" {
 		if err := dnsmasqcfg.Write(cfg.ManualIpsetName, manualEntries.Domains); err != nil {
-			log.Printf("dnsmasq config write: %v", err)
+			logEngine.Error("dnsmasq config write failed", "err", err)
 		} else {
-			log.Printf("manual: wrote %d domains → %s (ipset=%s)", len(manualEntries.Domains), dnsmasqcfg.Path, cfg.ManualIpsetName)
+			logEngine.Info("manual list written to dnsmasq",
+				"domains", len(manualEntries.Domains), "path", dnsmasqcfg.Path, "ipset", cfg.ManualIpsetName)
 			if err := dnsmasqcfg.Restart(ctx); err != nil {
-				log.Printf("dnsmasq restart: %v — manual list will activate on next dnsmasq restart", err)
+				logEngine.Warn("dnsmasq restart failed — manual list activates on next dnsmasq restart", "err", err)
 			}
 		}
 	}
@@ -318,7 +362,7 @@ func runTailer(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 					Domain: ev.Domain,
 					Peer:   ev.Peer,
 				}); err != nil {
-					log.Printf("ingest %q: %v", ev.Domain, err)
+					logTail.Error("ingest failed", "domain", ev.Domain, "err", err)
 					continue
 				}
 				ingested++
@@ -346,14 +390,14 @@ func runTailer(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 					storeDomain = origin
 				}
 				if err := store.UpsertDNSObservation(ctx, storeDomain, ev.Target, time.Time{}); err != nil {
-					log.Printf("dns_cache %q→%s: %v", storeDomain, ev.Target, err)
+					logTail.Error("dns_cache upsert failed", "domain", storeDomain, "ip", ev.Target, "err", err)
 					continue
 				}
 			default:
 				skipped++
 			}
 		case <-report.C:
-			log.Printf("tailer: ingested=%d skipped=%d", ingested, skipped)
+			logTail.Info("tailer progress", "ingested", ingested, "skipped", skipped)
 		}
 	}
 }
@@ -394,7 +438,7 @@ func runProbeWorker(ctx context.Context, store *storage.Store, cfg Config, ipset
 			return nil
 		case <-ticker.C:
 			if err := probeOnce(ctx, store, cfg, ipsetTrigger); err != nil {
-				log.Printf("probe tick: %v", err)
+				logProbe.Error("probe tick failed", "err", err)
 			}
 		}
 	}
@@ -433,7 +477,7 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 	// rotating CDN subdomain once the family is established.
 	if confirmed, _ := store.FamilyConfirmed(ctx, etld.Compute(domain), cfg.FamilyConfirmThreshold); confirmed {
 		if _, err := store.MarkCovered(ctx, domain); err != nil {
-			log.Printf("mark covered %q: %v", domain, err)
+			logEngine.Error("mark covered failed", "domain", domain, "err", err)
 		}
 		select {
 		case ipsetTrigger <- struct{}{}:
@@ -446,7 +490,7 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 	freshSince := time.Now().UTC().Add(-cfg.DNSFreshness)
 	ips, err := store.LookupIPs(ctx, domain, freshSince)
 	if err != nil {
-		log.Printf("lookup ips %q: %v", domain, err)
+		logEngine.Warn("dns_cache lookup failed", "domain", domain, "err", err)
 	}
 
 	// Phase 1: local probe (always). This is the gateway-side view; if it says
@@ -479,7 +523,7 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 	// verdict NULL — provisional, not counted by the scorer toward promotion.
 	if useExitCompare && localID != 0 {
 		if err := store.SetProbeVerdict(ctx, localID, string(verdict)); err != nil {
-			log.Printf("set verdict %q: %v", domain, err)
+			logProbe.Error("set probe verdict failed", "domain", domain, "err", err)
 		}
 	}
 
@@ -488,13 +532,15 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 	switch verdict {
 	case decision.Blocked:
 		if err := store.SetDomainState(ctx, domain, "hot", cooldown); err != nil {
-			log.Printf("set state hot %q: %v", domain, err)
+			logProbe.Error("set state hot failed", "domain", domain, "err", err)
 		}
 		if err := store.UpsertHotEntry(ctx, domain,
 			hotReason, time.Now().UTC().Add(cfg.HotTTL)); err != nil {
-			log.Printf("upsert hot %q: %v", domain, err)
+			logProbe.Error("upsert hot failed", "domain", domain, "err", err)
 		}
-		log.Printf("probe %s → HOT (%s, %dms)", domain, hotReason, res.LatencyMS)
+		logProbe.Info("probe blocked → hot",
+			"domain", domain, "reason", hotReason,
+			"failure_code", string(res.FailureCode), "latency_ms", res.LatencyMS)
 		// Nudge the ipset syncer — a new IP may now need to be tunneled.
 		select {
 		case ipsetTrigger <- struct{}{}:
@@ -502,15 +548,15 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 		}
 	case decision.Clear:
 		if err := store.SetDomainState(ctx, domain, "ignore", cooldown); err != nil {
-			log.Printf("set state ignore %q: %v", domain, err)
+			logProbe.Error("set state ignore failed", "domain", domain, "err", err)
 		}
 		// If a previous probe (often the inline fast-path) put this domain in
 		// hot_entries, drop it now that we've confirmed it's not actually
 		// blocked. Without this the FP would sit in ipset for the full HotTTL.
 		if removed, err := store.DeleteHotEntry(ctx, domain); err != nil {
-			log.Printf("delete hot %q: %v", domain, err)
+			logProbe.Error("delete hot failed", "domain", domain, "err", err)
 		} else if removed {
-			log.Printf("probe %s → IGNORE (overruled prior hot, %s)", domain, hotReason)
+			logProbe.Info("probe clear → ignore (overruled prior hot)", "domain", domain, "reason", hotReason)
 			select {
 			case ipsetTrigger <- struct{}{}:
 			default:
@@ -520,7 +566,7 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 		// Classify and CombineExitCompare only ever yield Blocked or Clear; this
 		// guards against a future verdict slipping through unhandled rather than
 		// silently mis-stating the domain's state.
-		log.Printf("probe %s → unhandled verdict %q, leaving state unchanged", domain, verdict)
+		logProbe.Warn("unhandled verdict, leaving state unchanged", "domain", domain, "verdict", string(verdict))
 	}
 }
 
@@ -539,7 +585,7 @@ func persistProbe(ctx context.Context, store *storage.Store, res prober.Result) 
 		FailureReason: res.FailureReason,
 	}, time.Time{})
 	if err != nil {
-		log.Printf("persist probe %q: %v", res.Domain, err)
+		logEngine.Error("persist probe failed", "domain", res.Domain, "err", err)
 		return 0
 	}
 	return id
@@ -564,21 +610,23 @@ func syncCIDRSet(ctx context.Context, cfg Config, cidrs []string) {
 	mgr := ipset.New(cfg.CIDRIpsetName)
 	ok, err := mgr.Exists(ctx)
 	if err != nil {
-		log.Printf("ipset %q exists check: %v", cfg.CIDRIpsetName, err)
+		logIpset.Error("cidr ipset exists check failed", "set", cfg.CIDRIpsetName, "err", err)
 		return
 	}
 	if !ok {
 		if len(cidrs) > 0 {
-			log.Printf("ipset %q not found — skipping CIDR sync; create it with `ipset create %s hash:net family inet`", cfg.CIDRIpsetName, cfg.CIDRIpsetName)
+			logIpset.Warn("cidr ipset not found — skipping CIDR sync",
+				"set", cfg.CIDRIpsetName,
+				"hint", fmt.Sprintf("ipset create %s hash:net family inet", cfg.CIDRIpsetName))
 		}
 		return
 	}
 	added, removed, err := mgr.Reconcile(ctx, cidrs)
 	if err != nil {
-		log.Printf("ipset %q reconcile: %v", cfg.CIDRIpsetName, err)
+		logIpset.Error("cidr ipset reconcile failed", "set", cfg.CIDRIpsetName, "err", err)
 		return
 	}
-	log.Printf("ipset %s: +%d -%d (total %d CIDRs)", cfg.CIDRIpsetName, added, removed, len(cidrs))
+	logIpset.Info("cidr ipset synced", "set", cfg.CIDRIpsetName, "added", added, "removed", removed, "total", len(cidrs))
 }
 
 // runIpsetSyncer keeps the gateway-side ipset (e.g. "prod") in sync with
@@ -593,11 +641,13 @@ func runIpsetSyncer(ctx context.Context, store *storage.Store, cfg Config, trigg
 
 	ok, err := mgr.Exists(ctx)
 	if err != nil {
-		log.Printf("ipset exists check %q: %v", cfg.IpsetName, err)
+		logIpset.Error("ipset exists check failed", "set", cfg.IpsetName, "err", err)
 		return nil
 	}
 	if !ok {
-		log.Printf("ipset %q not found — skipping ipset syncer; create it with `ipset create %s hash:ip`", cfg.IpsetName, cfg.IpsetName)
+		logIpset.Warn("ipset not found — skipping ipset syncer",
+			"set", cfg.IpsetName,
+			"hint", fmt.Sprintf("ipset create %s hash:ip", cfg.IpsetName))
 		return nil
 	}
 
@@ -607,7 +657,7 @@ func runIpsetSyncer(ctx context.Context, store *storage.Store, cfg Config, trigg
 	syncNow := func() {
 		desired, expanded, err := computeDesiredIPs(ctx, store, cfg)
 		if err != nil {
-			log.Printf("ipset: compute desired: %v", err)
+			logIpset.Error("compute desired ips failed", "err", err)
 			return
 		}
 		list := make([]string, 0, len(desired))
@@ -616,13 +666,23 @@ func runIpsetSyncer(ctx context.Context, store *storage.Store, cfg Config, trigg
 		}
 		added, removed, err := mgr.Reconcile(ctx, list)
 		if err != nil {
-			log.Printf("ipset reconcile: %v", err)
+			logIpset.Error("ipset reconcile failed", "set", cfg.IpsetName, "err", err)
 			return
 		}
 		if added > 0 || removed > 0 {
-			log.Printf("ipset %s: +%d -%d (total %d, etlds expanded %d)",
-				cfg.IpsetName, added, removed, len(list), expanded)
+			logIpset.Info("ipset synced",
+				"set", cfg.IpsetName, "added", added, "removed", removed,
+				"total", len(list), "etlds_expanded", expanded)
 		}
+		// Record the reconcile outcome for doctor/status — these facts (last
+		// reconcile time, the set size we last pushed) aren't recoverable from
+		// any other table.
+		now := time.Now().UTC()
+		setMetaTime(ctx, store, "last_reconcile_at", now)
+		setMeta(ctx, store, "ipset_engine_size", strconv.Itoa(len(list)))
+		setMeta(ctx, store, "reconcile_added", strconv.Itoa(added))
+		setMeta(ctx, store, "reconcile_removed", strconv.Itoa(removed))
+		setMeta(ctx, store, "ipset_etlds_expanded", strconv.Itoa(expanded))
 	}
 	syncNow()
 
@@ -734,13 +794,16 @@ func runExpirySweeper(ctx context.Context, store *storage.Store, cfg Config) err
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			// Doubles as the engine's liveness heartbeat: a steady tick on a
+			// short cadence is exactly what `ladon doctor` checks for staleness.
+			setMetaTime(ctx, store, "last_tick_at", time.Now().UTC())
 			n, err := store.ExpireHotEntries(ctx, time.Now().UTC())
 			if err != nil {
-				log.Printf("expire hot: %v", err)
+				logEngine.Error("expire hot failed", "err", err)
 				continue
 			}
 			if n > 0 {
-				log.Printf("expired %d hot entries", n)
+				logEngine.Info("expired hot entries", "count", n)
 			}
 		}
 	}
@@ -781,17 +844,17 @@ func runMaintenance(ctx context.Context, store *storage.Store, cfg Config) error
 		case <-ticker.C:
 			now := time.Now().UTC()
 			if err := store.Checkpoint(ctx); err != nil {
-				log.Printf("maintenance: wal checkpoint: %v", err)
+				logMaint.Error("wal checkpoint failed", "err", err)
 			}
 			if n, err := store.PruneProbes(ctx, now.Add(-probeRetention)); err != nil {
-				log.Printf("maintenance: prune probes: %v", err)
+				logMaint.Error("prune probes failed", "err", err)
 			} else if n > 0 {
-				log.Printf("maintenance: pruned %d probes older than %s", n, probeRetention)
+				logMaint.Info("pruned probes", "count", n, "older_than", probeRetention.String())
 			}
 			if n, err := store.PruneDNSCache(ctx, now.Add(-dnsRetention)); err != nil {
-				log.Printf("maintenance: prune dns_cache: %v", err)
+				logMaint.Error("prune dns_cache failed", "err", err)
 			} else if n > 0 {
-				log.Printf("maintenance: pruned %d dns_cache rows older than %s", n, dnsRetention)
+				logMaint.Info("pruned dns_cache", "count", n, "older_than", dnsRetention.String())
 			}
 		}
 	}

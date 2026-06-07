@@ -64,6 +64,17 @@ hot_ttl: 24h           # срок жизни записи в hot_entries
 dns_freshness: 6h      # возраст, после которого IP из dns_cache устаревает
 family_confirm_threshold: 10  # порог членов eTLD+1-семьи. один порог, две популяции: covered (новые поддомены не пробятся) считает только state=cache; экспансия IP всей семьи (CDN) — hot+cache
 
+# --- логи ---
+
+# Всё необязательно. По умолчанию: level=info, format=text.
+# Под systemd ладон сам определяет journald (по JOURNAL_STREAM): убирает свой
+# таймстамп (journald уже ставит) и помечает строки приоритетом, так что
+# `journalctl -u ladon -p warning` начинает фильтровать по уровню.
+# log:
+#   level: info          # debug | info | warn | error
+#   format: text         # text | json (json — под парсинг/шиппинг)
+#   source: false        # добавлять file:line (для отладки)
+
 # --- прочее ---
 
 # ignore_peer: 10.10.0.1   # peer, чьи DNS-запросы игнорируются (gateway self)

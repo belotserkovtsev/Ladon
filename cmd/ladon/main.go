@@ -17,12 +17,16 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/belotserkovtsev/ladon/internal/config"
 	"github.com/belotserkovtsev/ladon/internal/dnsmasq"
+	"github.com/belotserkovtsev/ladon/internal/doctor"
 	"github.com/belotserkovtsev/ladon/internal/engine"
+	"github.com/belotserkovtsev/ladon/internal/obs"
 	"github.com/belotserkovtsev/ladon/internal/prober"
 	"github.com/belotserkovtsev/ladon/internal/storage"
 	"github.com/belotserkovtsev/ladon/internal/tail"
@@ -43,7 +47,10 @@ commands:
   hot
   prune  [-cache] [-hot] [-probes] [-before <ISO date>] [-dry-run]
   tail [-from-start] <logfile>
-  run  [-from-start] [-config PATH] <logfile>`)
+  run  [-from-start] [-config PATH] <logfile>
+  status                  one-glance health snapshot (engine + counts)
+  doctor [-config PATH]   full diagnosis: walks the pipeline, finds the first break
+  why <domain>            decision trail for one domain (probes, state, ipset)`)
 }
 
 func main() {
@@ -147,6 +154,18 @@ func main() {
 		for _, h := range hots {
 			fmt.Println(h)
 		}
+
+	case "status":
+		statusCmd(ctx, store)
+
+	case "doctor":
+		doctorCmd(ctx, store, *configPath, args[1:])
+
+	case "why":
+		if len(args) < 2 {
+			fatal("why: missing domain")
+		}
+		whyCmd(ctx, store, args[1])
 
 	default:
 		fatal("unknown command: %s", args[0])
@@ -311,8 +330,6 @@ func pruneCmd(ctx context.Context, store *storage.Store, rest []string) {
 }
 
 func runCmd(ctx context.Context, store *storage.Store, configPath string, rest []string) {
-	fmt.Fprintf(os.Stderr, "ladon %s starting\n", version)
-
 	// Self-migrate before the daemon touches the DB. Init is idempotent (a
 	// no-op on an already-current schema), so this closes the upgrade gap where
 	// swapping the binary and restarting `ladon run` without re-running init-db
@@ -340,6 +357,12 @@ func runCmd(ctx context.Context, store *storage.Store, configPath string, rest [
 		fatal("%v", err)
 	}
 
+	// Install the structured logger before anything logs. journald rendering is
+	// auto-detected from the environment; the YAML `log:` section tunes level
+	// and format. Everything below this line logs through slog.
+	obs.Setup(logConfig(file))
+	obs.Logger("engine").Info("starting", "version", version)
+
 	logPath := fs.Arg(0)
 	if file != nil && file.Logfile != "" && logPath == "" {
 		logPath = file.Logfile
@@ -352,11 +375,21 @@ func runCmd(ctx context.Context, store *storage.Store, configPath string, rest [
 	cfg.FromStart = *fromStart
 	cfg.ManualAllowPath = *allow
 	cfg.ManualDenyPath = *deny
+	cfg.Version = version
 	applyConfigFile(&cfg, file)
 	if err := engine.Run(ctx, store, cfg); err != nil {
 		fatal("engine: %v", err)
 	}
-	fmt.Fprintln(os.Stderr, "engine: stopped")
+	obs.Logger("engine").Info("stopped")
+}
+
+// logConfig maps the optional YAML log section onto obs.Config. A nil file
+// yields the zero value (level=info, format=text) — the production default.
+func logConfig(f *config.File) obs.Config {
+	if f == nil {
+		return obs.Config{}
+	}
+	return obs.Config{Level: f.Log.Level, Format: f.Log.Format, Source: f.Log.Source}
 }
 
 // applyConfigFile overlays YAML values on top of the engine defaults and
@@ -432,6 +465,202 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 	}
 	cfg.LocalProber = f.BuildLocalProber(cfg.ProbeTimeout)
 	cfg.RemoteProber = f.BuildRemoteProber()
+}
+
+// statusCmd prints a one-glance health snapshot: engine identity/liveness from
+// runtime_meta, pipeline freshness (derived), and domain counts. Read-only and
+// fast — no environment probing (that's `doctor`).
+func statusCmd(ctx context.Context, store *storage.Store) {
+	if err := store.Init(ctx); err != nil {
+		fatal("status: %v", err)
+	}
+	now := time.Now().UTC()
+	meta, _ := store.AllMeta(ctx)
+	counts, _ := store.CountDomainsByState(ctx)
+
+	fmt.Printf("ladon status — %s\n\n", version)
+
+	fmt.Println("движок:")
+	if r, ok := meta["version"]; ok {
+		fmt.Printf("  %-16s %s\n", "версия", r.Value)
+	}
+	if r, ok := meta["pid"]; ok {
+		fmt.Printf("  %-16s %s\n", "pid", r.Value)
+	}
+	if r, ok := meta["started_at"]; ok {
+		fmt.Printf("  %-16s %s\n", "запущен", r.Value)
+	}
+	if r, ok := meta["last_tick_at"]; ok {
+		fmt.Printf("  %-16s %s назад\n", "последний тик", metaAgo(r.Value, now))
+	} else {
+		fmt.Printf("  %-16s %s\n", "последний тик", "нет heartbeat — `ladon run` не запускался?")
+	}
+
+	fmt.Println("\nконвейер:")
+	if t, ok, _ := store.LatestObservationAt(ctx); ok {
+		fmt.Printf("  %-16s %s назад\n", "последний DNS", ago(now.Sub(t)))
+	}
+	if t, ok, _ := store.LatestProbeAt(ctx); ok {
+		fmt.Printf("  %-16s %s назад\n", "последняя проба", ago(now.Sub(t)))
+	}
+	if r, ok := meta["last_reconcile_at"]; ok {
+		size := ""
+		if s, ok := meta["ipset_engine_size"]; ok {
+			size = " (в наборе " + s.Value + " IP)"
+		}
+		fmt.Printf("  %-16s %s назад%s\n", "reconcile", metaAgo(r.Value, now), size)
+	}
+
+	fmt.Println("\nдомены:")
+	known := []string{"new", "hot", "cache", "ignore", "covered"}
+	seen := map[string]bool{}
+	for _, s := range known {
+		fmt.Printf("  %-10s %d\n", s, counts[s])
+		seen[s] = true
+	}
+	var extra []string
+	for s := range counts {
+		if !seen[s] {
+			extra = append(extra, s)
+		}
+	}
+	sort.Strings(extra)
+	for _, s := range extra {
+		fmt.Printf("  %-10s %d\n", s, counts[s])
+	}
+}
+
+// doctorCmd runs the full pipeline diagnosis and exits with the report's code
+// (0 healthy, 1 degraded, 2 broken) so it's usable in scripts and monitors.
+func doctorCmd(ctx context.Context, store *storage.Store, configPath string, rest []string) {
+	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
+	cfgFlag := fs.String("config", "", "path to YAML config (for ipset names)")
+	jsonOut := fs.Bool("json", false, "emit JSON instead of the human report")
+	_ = fs.Parse(rest)
+	if *cfgFlag != "" {
+		configPath = *cfgFlag
+	}
+	if err := store.Init(ctx); err != nil {
+		fatal("doctor: %v", err)
+	}
+	file, err := config.Load(configPath)
+	if err != nil && err != config.ErrNotFound {
+		fatal("doctor: %v", err)
+	}
+	cfg := engine.Defaults("")
+	applyConfigFile(&cfg, file)
+
+	rep := doctor.Run(ctx, store, doctor.Params{
+		Version:         version,
+		IpsetEngineName: cfg.IpsetName,
+		IpsetManualName: cfg.ManualIpsetName,
+		IpsetCIDRName:   cfg.CIDRIpsetName,
+		ExpiryInterval:  cfg.ExpiryInterval,
+		ServiceName:     "ladon",
+		ProbeService:    true,
+		ProbeIpset:      true,
+	})
+	if *jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(rep)
+	} else {
+		rep.Render(os.Stdout)
+	}
+	os.Exit(rep.Exit)
+}
+
+// whyCmd prints the decision trail for one domain: current state, backing tier,
+// observed IPs, and the recent probe history — answering "why is X (not)
+// tunneled?" from the durable record.
+func whyCmd(ctx context.Context, store *storage.Store, domain string) {
+	if err := store.Init(ctx); err != nil {
+		fatal("why: %v", err)
+	}
+	d, ok, err := store.GetDomain(ctx, domain)
+	if err != nil {
+		fatal("why: %v", err)
+	}
+	if !ok {
+		fmt.Printf("%s: не отслеживается (нет в базе)\n", domain)
+		return
+	}
+
+	fmt.Printf("домен:     %s\n", d.Domain)
+	fmt.Printf("eTLD+1:    %s\n", dash(d.ETLDPlusOne))
+	fmt.Printf("состояние: %s\n", d.State)
+	fmt.Printf("замечен:   %s … %s (×%d)\n", dash(d.FirstSeenAt), dash(d.LastSeenAt), d.HitCount)
+	if d.CooldownUntil != "" {
+		fmt.Printf("cooldown:  до %s\n", d.CooldownUntil)
+	}
+	if exp, reason, ok, _ := store.HotEntryFor(ctx, domain); ok {
+		fmt.Printf("hot:       до %s — %s\n", exp, dash(reason))
+	}
+	if at, reason, ok, _ := store.CacheEntryFor(ctx, domain); ok {
+		fmt.Printf("cache:     с %s — %s\n", at, dash(reason))
+	}
+	if ips, _ := store.LookupAllIPs(ctx, domain); len(ips) > 0 {
+		fmt.Printf("IP (%d):    %s\n", len(ips), strings.Join(ips, ", "))
+	}
+
+	probes, _ := store.RecentProbesForDomain(ctx, domain, 10)
+	if len(probes) == 0 {
+		fmt.Println("\nпроб ещё не было.")
+	} else {
+		fmt.Printf("\nпоследние %d проб (новые сверху):\n", len(probes))
+		for _, p := range probes {
+			dns, tcp, tls, http := p.Flags()
+			fmt.Printf("  %s  dns=%-2s tcp=%-2s tls=%-2s http=%-2s  verdict=%-8s %s\n",
+				p.CreatedAt, dns, tcp, tls, http, dash(p.Verdict), p.FailureReason)
+		}
+	}
+
+	fmt.Println()
+	switch d.State {
+	case "hot", "cache":
+		fmt.Println("→ туннелируется (входит в ladon_engine).")
+	case "covered":
+		fmt.Printf("→ туннелируется через семью %s (covered — отдельно не пробится).\n", dash(d.ETLDPlusOne))
+	case "ignore":
+		fmt.Println("→ НЕ туннелируется: последняя проба сочла путь рабочим (clear).")
+		fmt.Println("  если сайт реально не открывается — возможна L7/cert-слепота; добавь в manual-allow.")
+	case "new":
+		fmt.Println("→ ещё не классифицирован (ждёт пробы).")
+	}
+}
+
+// ago renders a duration as a compact RU age token (Nс/Nм/Nч/Nд).
+func ago(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%dс", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dм", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dч", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dд", int(d.Hours()/24))
+	}
+}
+
+// metaAgo parses a storage-layout timestamp and renders its age, or echoes the
+// raw value if it doesn't parse.
+func metaAgo(value string, now time.Time) string {
+	t, ok, err := storage.ParseTime(value)
+	if err != nil || !ok {
+		return value
+	}
+	return ago(now.Sub(t))
+}
+
+func dash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func toStorageResult(r prober.Result) storage.ProbeResult {
