@@ -188,6 +188,9 @@ write_config() {
 
 # ============================ flow ============================
 
+# Clean start: clear screen + scrollback so the banner sits at the top (only on
+# a real terminal — never emit escapes into a pipe/log).
+[[ -t 1 ]] && printf '\033[H\033[2J\033[3J'
 banner
 
 # --- preflight ---
