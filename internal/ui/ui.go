@@ -219,7 +219,8 @@ func Screen(content string) {
 			return
 		}
 		restored = true
-		fmt.Fprint(tty, "\x1b[?25h\x1b[?1049l") // show cursor, leave alt screen
+		// re-enable wrap + scroll, show cursor, leave alt screen
+		fmt.Fprint(tty, "\x1b[?7h\x1b[?1007l\x1b[?25h\x1b[?1049l")
 		if saved != "" {
 			_ = sttyRun(tty, saved)
 		}
@@ -230,9 +231,18 @@ func Screen(content string) {
 	go func() { <-sigs; restore(); os.Exit(130) }()
 	defer func() { signal.Stop(sigs); restore() }()
 
-	fmt.Fprint(tty, "\x1b[?1049h\x1b[?25l") // enter alt screen, hide cursor
+	// enter alt screen, hide cursor, disable line-wrap (long lines clip instead
+	// of wrapping and breaking the layout), enable alternate scroll (mouse wheel
+	// → arrow keys so it scrolls the pager instead of garbling the screen).
+	fmt.Fprint(tty, "\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1007h")
 
 	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	blockW := 0
+	for _, ln := range lines {
+		if w := visibleLen(ln); w > blockW {
+			blockW = w
+		}
+	}
 	offset := 0
 	// draw paints one frame and returns the body-window height, clamping offset.
 	draw := func() (win int) {
@@ -251,10 +261,15 @@ func Screen(content string) {
 		if offset < 0 {
 			offset = 0
 		}
+		pad := (cols - blockW) / 2
+		if pad < 0 {
+			pad = 0
+		}
+		indent := strings.Repeat(" ", pad)
 		fmt.Fprint(tty, "\x1b[2J\x1b[H")
 		for i := 0; i < win; i++ {
-			if li := offset + i; li < len(lines) {
-				fmt.Fprintln(tty, lines[li])
+			if li := offset + i; li < len(lines) && lines[li] != "" {
+				fmt.Fprintln(tty, indent+lines[li])
 			} else {
 				fmt.Fprintln(tty)
 			}
@@ -324,25 +339,70 @@ func readScreenKey(tty *os.File) string {
 	case 'G':
 		return "bottom"
 	case 0x1b:
-		seq := make([]byte, 3)
 		_ = tty.SetReadDeadline(time.Now().Add(40 * time.Millisecond))
-		m, _ := tty.Read(seq)
+		seq := readCSI(tty)
 		_ = tty.SetReadDeadline(time.Time{})
-		if m >= 2 && seq[0] == '[' {
-			switch seq[1] {
-			case 'A':
-				return "up"
-			case 'B':
-				return "down"
-			case '5':
-				return "pgup"
-			case '6':
-				return "pgdn"
-			}
+		switch seq {
+		case "[A", "OA":
+			return "up"
+		case "[B", "OB":
+			return "down"
+		case "[5~":
+			return "pgup"
+		case "[6~":
+			return "pgdn"
+		case "":
+			return "q" // lone Esc
+		default:
+			return "other" // unknown CSI (mouse report etc.) — ignore, don't quit
 		}
-		return "q" // lone Esc
 	}
 	return "other"
+}
+
+// readCSI reads the rest of an escape sequence after ESC: the introducer
+// ('[' or 'O') plus parameter/intermediate bytes up to the final byte. Returns
+// "" when nothing follows (a lone Esc) before the read deadline.
+func readCSI(tty *os.File) string {
+	b := make([]byte, 1)
+	if n, err := tty.Read(b); err != nil || n == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteByte(b[0])
+	if b[0] != '[' && b[0] != 'O' {
+		return sb.String()
+	}
+	for i := 0; i < 48; i++ {
+		n, err := tty.Read(b)
+		if err != nil || n == 0 {
+			break
+		}
+		sb.WriteByte(b[0])
+		if b[0] >= 0x40 && b[0] <= 0x7e { // CSI final byte
+			break
+		}
+	}
+	return sb.String()
+}
+
+// visibleLen counts display columns in s, ignoring ANSI escape sequences.
+func visibleLen(s string) int {
+	n, inEsc := 0, false
+	for _, r := range s {
+		if inEsc {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+				inEsc = false
+			}
+			continue
+		}
+		if r == 0x1b {
+			inEsc = true
+			continue
+		}
+		n++
+	}
+	return n
 }
 
 // bar builds a full-width rule: left corner + a tinted label + fill + right
