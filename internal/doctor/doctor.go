@@ -548,10 +548,3 @@ func trim(b []byte) string {
 	}
 	return s
 }
-
-func orDash(s string) string {
-	if s == "" {
-		return "(dev)"
-	}
-	return s
-}
