@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 	"unicode/utf8"
 )
 
@@ -192,21 +193,20 @@ func padRight(s string, n int) string {
 	return s + strings.Repeat(" ", n-r)
 }
 
-// Screen shows body on the alternate screen buffer, framed to fill the
-// terminal: a full-width title bar on top, the body below, a status bar pinned
-// to the bottom row; it waits for one keypress, then restores the previous
-// screen with no scrollback clutter. Terminal/Linux only — if /dev/tty can't be
-// opened (piped, non-tty, Windows) it just prints the body inline and returns.
-func Screen(title, body string) {
+// Screen shows content on the alternate screen buffer as a simple full-window
+// pager: the content (banner included) scrolls with ↑/↓/j/k, a status bar is
+// pinned to the bottom row, and q/Esc restores the previous screen with no
+// scrollback clutter. Terminal/Linux only — if /dev/tty can't be opened (piped,
+// non-tty, Windows) it just prints the content inline and returns.
+func Screen(content string) {
 	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {
-		fmt.Print(body)
+		fmt.Print(content)
 		return
 	}
 	defer tty.Close()
 
 	st := Style{color: true}
-	rows, cols := termSize(tty)
 
 	// Single-keypress input: no echo, no line buffering.
 	saved, _ := sttyOut(tty, "-g")
@@ -230,22 +230,119 @@ func Screen(title, body string) {
 	go func() { <-sigs; restore(); os.Exit(130) }()
 	defer func() { signal.Stop(sigs); restore() }()
 
-	fmt.Fprint(tty, "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H") // enter alt, hide cursor, clear, home
-	fmt.Fprintln(tty, st.bar("┌─", " LADON · "+title+" ", "─┐", cols))
+	fmt.Fprint(tty, "\x1b[?1049h\x1b[?25l") // enter alt screen, hide cursor
 
-	lines := strings.Split(strings.TrimRight(body, "\n"), "\n")
-	maxBody := rows - 2
-	for i, ln := range lines {
-		if i >= maxBody {
-			break
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	offset := 0
+	// draw paints one frame and returns the body-window height, clamping offset.
+	draw := func() (win int) {
+		rows, cols := termSize(tty)
+		win = rows - 1 // last row reserved for the status bar
+		if win < 1 {
+			win = 1
 		}
-		fmt.Fprintln(tty, ln)
+		maxOff := len(lines) - win
+		if maxOff < 0 {
+			maxOff = 0
+		}
+		if offset > maxOff {
+			offset = maxOff
+		}
+		if offset < 0 {
+			offset = 0
+		}
+		fmt.Fprint(tty, "\x1b[2J\x1b[H")
+		for i := 0; i < win; i++ {
+			if li := offset + i; li < len(lines) {
+				fmt.Fprintln(tty, lines[li])
+			} else {
+				fmt.Fprintln(tty)
+			}
+		}
+		hint := " q — выход "
+		if len(lines) > win {
+			last := offset + win
+			if last > len(lines) {
+				last = len(lines)
+			}
+			hint = fmt.Sprintf(" q выход · ↑/↓/j/k прокрутка · %d–%d/%d ", offset+1, last, len(lines))
+		}
+		fmt.Fprintf(tty, "\x1b[%d;1H%s", rows, st.bar("└─", hint, "─┘", cols))
+		return win
 	}
 
-	fmt.Fprintf(tty, "\x1b[%d;1H%s", rows, st.bar("└─", " q / Enter — выход ", "─┘", cols))
+	win := draw()
+	for {
+		switch readScreenKey(tty) {
+		case "q":
+			return
+		case "up":
+			offset--
+			win = draw()
+		case "down":
+			offset++
+			win = draw()
+		case "pgup":
+			offset -= win
+			win = draw()
+		case "pgdn":
+			offset += win
+			win = draw()
+		case "top":
+			offset = 0
+			win = draw()
+		case "bottom":
+			offset = len(lines)
+			win = draw()
+		default:
+			// When everything fits, any key dismisses (no scrolling needed).
+			if len(lines) <= win {
+				return
+			}
+		}
+	}
+}
 
-	buf := make([]byte, 1)
-	_, _ = tty.Read(buf)
+// readScreenKey reads one logical key from the tty: q/Esc/Ctrl-C → "q", arrows
+// and j/k/space → scroll, g/G → top/bottom. Arrow escape sequences are read
+// with a short deadline so a lone Esc doesn't block.
+func readScreenKey(tty *os.File) string {
+	b := make([]byte, 1)
+	n, err := tty.Read(b)
+	if err != nil || n == 0 {
+		return ""
+	}
+	switch b[0] {
+	case 'q', 'Q', 3:
+		return "q"
+	case 'j', ' ':
+		return "down"
+	case 'k':
+		return "up"
+	case 'g':
+		return "top"
+	case 'G':
+		return "bottom"
+	case 0x1b:
+		seq := make([]byte, 3)
+		_ = tty.SetReadDeadline(time.Now().Add(40 * time.Millisecond))
+		m, _ := tty.Read(seq)
+		_ = tty.SetReadDeadline(time.Time{})
+		if m >= 2 && seq[0] == '[' {
+			switch seq[1] {
+			case 'A':
+				return "up"
+			case 'B':
+				return "down"
+			case '5':
+				return "pgup"
+			case '6':
+				return "pgdn"
+			}
+		}
+		return "q" // lone Esc
+	}
+	return "other"
 }
 
 // bar builds a full-width rule: left corner + a tinted label + fill + right

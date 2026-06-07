@@ -50,10 +50,10 @@ commands:
   prune  [-cache] [-hot] [-probes] [-before <ISO date>] [-dry-run]
   tail [-from-start] <logfile>
   run  [-from-start] [-config PATH] <logfile>
-  status [-screen]        what ladon is doing: activity, recent decisions, footprint
-  doctor [-config PATH] [-screen]  diagnosis: walks the pipeline, finds the first break
-  why <domain> [-screen]  decision trail for one domain (probes, state, ipset)
-                          (-screen / -f: full-screen view, any key exits)`)
+  status                  what ladon is doing: activity, recent decisions, footprint
+  doctor [-config PATH]   diagnosis: walks the pipeline, finds the first break
+  why <domain>            decision trail for one domain (probes, state, ipset)
+                          (these open full-screen on a terminal — q to exit; piped = plain)`)
 }
 
 func main() {
@@ -196,17 +196,16 @@ func main() {
 		}
 
 	case "status":
-		statusCmd(ctx, store, *dbPath, hasScreenFlag(args[1:]))
+		statusCmd(ctx, store, *dbPath)
 
 	case "doctor":
 		doctorCmd(ctx, store, *configPath, args[1:])
 
 	case "why":
-		domain := firstNonFlag(args[1:])
-		if domain == "" {
+		if len(args) < 2 {
 			fatal("why: missing domain")
 		}
-		whyCmd(ctx, store, domain, hasScreenFlag(args[1:]))
+		whyCmd(ctx, store, args[1])
 
 	default:
 		fatal("unknown command: %s", args[0])
@@ -534,14 +533,17 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 // statusCmd shows what ladon has been doing — activity, recent tunnel
 // decisions, failure-code mix, and the tunnel footprint. Distinct from doctor
 // (which judges health): status is read-only insight, no verdict, no env probe.
-func statusCmd(ctx context.Context, store *storage.Store, dbPath string, screen bool) {
+func statusCmd(ctx context.Context, store *storage.Store, dbPath string) {
 	if err := store.Init(ctx); err != nil {
 		fatal("status: %v", err)
 	}
-	if screen && ui.For(os.Stdout).Term() {
+	// Full-screen on a terminal; plain inline when piped/redirected.
+	if ui.For(os.Stdout).Term() {
 		var b strings.Builder
-		statusBody(ctx, store, ui.Forced(true), &b, dbPath)
-		ui.Screen(ui.Subtitle("status", version), b.String())
+		st := ui.Forced(true)
+		st.Banner(&b, ui.Subtitle("status", version))
+		statusBody(ctx, store, st, &b, dbPath)
+		ui.Screen(b.String())
 		return
 	}
 	st := ui.For(os.Stdout)
@@ -718,9 +720,6 @@ func doctorCmd(ctx context.Context, store *storage.Store, configPath string, res
 	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
 	cfgFlag := fs.String("config", "", "path to YAML config (for ipset names)")
 	jsonOut := fs.Bool("json", false, "emit JSON instead of the human report")
-	var screen bool
-	fs.BoolVar(&screen, "screen", false, "show full-screen (alternate buffer), wait for a key")
-	fs.BoolVar(&screen, "f", false, "alias for -screen")
 	_ = fs.Parse(rest)
 	if *cfgFlag != "" {
 		configPath = *cfgFlag
@@ -750,8 +749,8 @@ func doctorCmd(ctx context.Context, store *storage.Store, configPath string, res
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(rep)
-	case screen && ui.For(os.Stdout).Term():
-		ui.Screen(ui.Subtitle("doctor", version), rep.ScreenBody())
+	case ui.For(os.Stdout).Term():
+		ui.Screen(rep.ScreenContent())
 	default:
 		rep.Render(os.Stdout)
 	}
@@ -761,14 +760,16 @@ func doctorCmd(ctx context.Context, store *storage.Store, configPath string, res
 // whyCmd prints the decision trail for one domain: current state, backing tier,
 // observed IPs, and the recent probe history — answering "why is X (not)
 // tunneled?" from the durable record.
-func whyCmd(ctx context.Context, store *storage.Store, domain string, screen bool) {
+func whyCmd(ctx context.Context, store *storage.Store, domain string) {
 	if err := store.Init(ctx); err != nil {
 		fatal("why: %v", err)
 	}
-	if screen && ui.For(os.Stdout).Term() {
+	if ui.For(os.Stdout).Term() {
 		var b strings.Builder
-		whyBody(ctx, store, ui.Forced(true), &b, domain)
-		ui.Screen(ui.Subtitle("why · "+domain, version), b.String())
+		st := ui.Forced(true)
+		st.Banner(&b, ui.Subtitle("why", version))
+		whyBody(ctx, store, st, &b, domain)
+		ui.Screen(b.String())
 		return
 	}
 	st := ui.For(os.Stdout)
@@ -871,27 +872,6 @@ func dash(s string) string {
 		return "-"
 	}
 	return s
-}
-
-// hasScreenFlag reports whether the args request full-screen output.
-func hasScreenFlag(args []string) bool {
-	for _, a := range args {
-		switch a {
-		case "--screen", "-screen", "-f", "--full":
-			return true
-		}
-	}
-	return false
-}
-
-// firstNonFlag returns the first positional (non-dash) argument, or "".
-func firstNonFlag(args []string) string {
-	for _, a := range args {
-		if !strings.HasPrefix(a, "-") {
-			return a
-		}
-	}
-	return ""
 }
 
 // colorState tints a padded domain-state token by what it means for the domain:

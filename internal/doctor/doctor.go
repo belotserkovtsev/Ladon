@@ -416,11 +416,13 @@ func (r Report) Render(w io.Writer) {
 	r.body(w, st)
 }
 
-// ScreenBody renders the report without the banner, color forced on, for the
-// full-screen view (the title bar there carries the identity instead).
-func (r Report) ScreenBody() string {
+// ScreenContent renders the full report (big banner + body) with color forced
+// on, for the full-screen view.
+func (r Report) ScreenContent() string {
 	var b strings.Builder
-	r.body(&b, ui.Forced(true))
+	st := ui.Forced(true)
+	st.Banner(&b, ui.Subtitle("doctor", r.Version))
+	r.body(&b, st)
 	return b.String()
 }
 
