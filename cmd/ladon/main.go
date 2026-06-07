@@ -14,10 +14,10 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -195,7 +195,7 @@ func main() {
 		}
 
 	case "status":
-		statusCmd(ctx, store)
+		statusCmd(ctx, store, *dbPath)
 
 	case "doctor":
 		doctorCmd(ctx, store, *configPath, args[1:])
@@ -529,71 +529,152 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 	cfg.RemoteProber = f.BuildRemoteProber()
 }
 
-// statusCmd prints a one-glance health snapshot: engine identity/liveness from
-// runtime_meta, pipeline freshness (derived), and domain counts. Read-only and
-// fast — no environment probing (that's `doctor`).
-func statusCmd(ctx context.Context, store *storage.Store) {
+// statusCmd shows what ladon has been doing — activity, recent tunnel
+// decisions, failure-code mix, and the tunnel footprint. Distinct from doctor
+// (which judges health): status is read-only insight, no verdict, no env probe.
+func statusCmd(ctx context.Context, store *storage.Store, dbPath string) {
 	if err := store.Init(ctx); err != nil {
 		fatal("status: %v", err)
 	}
-	now := time.Now().UTC()
-	meta, _ := store.AllMeta(ctx)
-	counts, _ := store.CountDomainsByState(ctx)
-
 	st := ui.For(os.Stdout)
 	st.Banner(os.Stdout, ui.Subtitle("status", version))
+	statusBody(ctx, store, st, os.Stdout, dbPath)
+}
 
-	st.Section(os.Stdout, "ДВИЖОК")
-	if r, ok := meta["version"]; ok {
-		st.Info(os.Stdout, "версия", r.Value)
+func statusBody(ctx context.Context, store *storage.Store, st ui.Style, w io.Writer, dbPath string) {
+	now := time.Now().UTC()
+	meta, _ := store.AllMeta(ctx)
+
+	// --- движок: identity + uptime ---
+	st.Section(w, "ДВИЖОК")
+	ver := version
+	if m, ok := meta["version"]; ok {
+		ver = m.Value
 	}
-	if r, ok := meta["pid"]; ok {
-		st.Info(os.Stdout, "pid", r.Value)
+	up := "—"
+	if m, ok := meta["started_at"]; ok {
+		if t, valid, err := storage.ParseTime(m.Value); err == nil && valid {
+			up = uptime(now.Sub(t))
+		}
 	}
-	if r, ok := meta["started_at"]; ok {
-		st.Info(os.Stdout, "запущен", r.Value)
+	pid := "—"
+	if m, ok := meta["pid"]; ok {
+		pid = m.Value
 	}
-	if r, ok := meta["last_tick_at"]; ok {
-		st.Info(os.Stdout, "последний тик", metaAgo(r.Value, now)+" назад")
+	st.Info(w, "версия", ver+"  ·  аптайм "+up+"  ·  pid "+pid)
+	if m, ok := meta["last_tick_at"]; ok {
+		st.Info(w, "последний тик", metaAgo(m.Value, now)+" назад")
 	} else {
-		st.Info(os.Stdout, "последний тик", "нет heartbeat — `ladon run` не запускался?")
+		st.Info(w, "последний тик", "нет heartbeat — демон не запущен?")
 	}
-	fmt.Println()
+	fmt.Fprintln(w)
 
-	st.Section(os.Stdout, "КОНВЕЙЕР")
-	if t, ok, _ := store.LatestObservationAt(ctx); ok {
-		st.Info(os.Stdout, "последний DNS", ago(now.Sub(t))+" назад")
+	// --- активность за час ---
+	st.Section(w, "АКТИВНОСТЬ · за час")
+	since := now.Add(-time.Hour)
+	if n, err := store.CountObservationsSince(ctx, since); err == nil {
+		st.Info(w, "наблюдений", fmt.Sprintf("%d доменов", n))
 	}
-	if t, ok, _ := store.LatestProbeAt(ctx); ok {
-		st.Info(os.Stdout, "последняя проба", ago(now.Sub(t))+" назад")
+	if total, blocked, clear, err := store.RecentProbeStats(ctx, since); err == nil {
+		st.Info(w, "проб", fmt.Sprintf("%d  (заблокировано %d · чисто %d)", total, blocked, clear))
 	}
-	if r, ok := meta["last_reconcile_at"]; ok {
-		v := metaAgo(r.Value, now) + " назад"
-		if s, ok := meta["ipset_engine_size"]; ok {
-			v += " · в наборе " + s.Value + " IP"
+	if codes, err := store.TopFailureCodes(ctx, since, 5); err == nil && len(codes) > 0 {
+		parts := make([]string, 0, len(codes))
+		for _, c := range codes {
+			parts = append(parts, fmt.Sprintf("%s %d", c.Code, c.N))
 		}
-		st.Info(os.Stdout, "reconcile", v)
+		st.Info(w, "топ-коды", strings.Join(parts, " · "))
 	}
-	fmt.Println()
+	fmt.Fprintln(w)
 
-	st.Section(os.Stdout, "ДОМЕНЫ")
-	known := []string{"new", "hot", "cache", "ignore", "covered"}
-	seen := map[string]bool{}
-	for _, s := range known {
-		st.Info(os.Stdout, s, strconv.Itoa(counts[s]))
-		seen[s] = true
-	}
-	var extra []string
-	for s := range counts {
-		if !seen[s] {
-			extra = append(extra, s)
+	// --- свежие решения ---
+	st.Section(w, "СВЕЖИЕ РЕШЕНИЯ · ушли в туннель")
+	if decs, err := store.RecentDecisions(ctx, 6); err == nil && len(decs) > 0 {
+		for _, d := range decs {
+			tier := st.Green(ui.Pad(d.Tier, 6))
+			if d.Tier == "hot" {
+				tier = st.Yellow(ui.Pad(d.Tier, 6))
+			}
+			fmt.Fprintf(w, "   %s %s %s  %s\n",
+				st.Dim(hhmm(d.At)), tier, ui.Pad(d.Domain, 30), st.Dim(d.Reason))
 		}
+	} else {
+		st.Info(w, "—", "пока ничего не туннелировалось")
 	}
-	sort.Strings(extra)
-	for _, s := range extra {
-		st.Info(os.Stdout, s, strconv.Itoa(counts[s]))
+	fmt.Fprintln(w)
+
+	// --- туннель: footprint ---
+	st.Section(w, "ТУННЕЛЬ · footprint")
+	counts, _ := store.CountDomainsByState(ctx)
+	st.Info(w, "домены", fmt.Sprintf("hot %d · cache %d · covered %d · ignore %d · new %d",
+		counts["hot"], counts["cache"], counts["covered"], counts["ignore"], counts["new"]))
+	if m, ok := meta["ipset_engine_size"]; ok {
+		st.Info(w, "набор engine", m.Value+" IP")
 	}
-	fmt.Println()
+	if fams, err := store.TopFamilies(ctx, 5); err == nil && len(fams) > 0 {
+		parts := make([]string, 0, len(fams))
+		for _, f := range fams {
+			parts = append(parts, fmt.Sprintf("%s ×%d", f.Family, f.N))
+		}
+		st.Info(w, "топ-семьи", strings.Join(parts, " · "))
+	}
+	if sz := dbSize(dbPath); sz != "" {
+		st.Info(w, "база", sz)
+	}
+	fmt.Fprintln(w)
+}
+
+// uptime renders a duration as a coarse "Xд Yч" / "Yч Zм" / "Zм".
+func uptime(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	days := int(d.Hours()) / 24
+	hrs := int(d.Hours()) % 24
+	mins := int(d.Minutes()) % 60
+	switch {
+	case days > 0:
+		return fmt.Sprintf("%dд %dч", days, hrs)
+	case hrs > 0:
+		return fmt.Sprintf("%dч %dм", hrs, mins)
+	default:
+		return fmt.Sprintf("%dм", mins)
+	}
+}
+
+// hhmm extracts HH:MM from a storage-layout timestamp.
+func hhmm(ts string) string {
+	if len(ts) >= 16 {
+		return ts[11:16]
+	}
+	return ts
+}
+
+// dbSize reports the engine.db (and WAL) size, or "" if it can't stat them.
+func dbSize(dbPath string) string {
+	if dbPath == "" {
+		return ""
+	}
+	fi, err := os.Stat(dbPath)
+	if err != nil {
+		return ""
+	}
+	out := filepath.Base(dbPath) + " " + humanBytes(fi.Size())
+	if wfi, err := os.Stat(dbPath + "-wal"); err == nil && wfi.Size() > 0 {
+		out += " (WAL " + humanBytes(wfi.Size()) + ")"
+	}
+	return out
+}
+
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<20:
+		return fmt.Sprintf("%d МБ", n/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%d КБ", n/(1<<10))
+	default:
+		return fmt.Sprintf("%d Б", n)
+	}
 }
 
 // doctorCmd runs the full pipeline diagnosis and exits with the report's code

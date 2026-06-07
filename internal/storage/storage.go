@@ -976,6 +976,103 @@ func (s *Store) CountObservationsSince(ctx context.Context, since time.Time) (in
 	return n, err
 }
 
+// --- activity & insight reads for `ladon status` ---
+
+// CodeCount is a failure-code tally.
+type CodeCount struct {
+	Code string
+	N    int
+}
+
+// TopFailureCodes returns the most common failure codes (the prefix of
+// failure_reason before ':') among probes since `since`, largest first.
+func (s *Store) TopFailureCodes(ctx context.Context, since time.Time, limit int) ([]CodeCount, error) {
+	rows, err := s.rdb.QueryContext(ctx, `
+		SELECT CASE WHEN instr(failure_reason, ':') > 0
+		            THEN substr(failure_reason, 1, instr(failure_reason, ':') - 1)
+		            ELSE failure_reason END AS code,
+		       COUNT(*) AS n
+		FROM probes
+		WHERE created_at >= ? AND failure_reason IS NOT NULL AND failure_reason != ''
+		GROUP BY code ORDER BY n DESC, code LIMIT ?
+	`, formatTime(since), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CodeCount
+	for rows.Next() {
+		var c CodeCount
+		if err := rows.Scan(&c.Code, &c.N); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// Decision is a recent entry into the tunnel (hot or cache promotion).
+type Decision struct {
+	Domain string
+	Tier   string // "hot" | "cache"
+	At     string
+	Reason string
+}
+
+// RecentDecisions returns the most recently tunneled domains across both tiers,
+// newest first — the "what did ladon just decide to route" feed.
+func (s *Store) RecentDecisions(ctx context.Context, limit int) ([]Decision, error) {
+	rows, err := s.rdb.QueryContext(ctx, `
+		SELECT domain, 'cache' AS tier, promoted_at AS at, COALESCE(reason, '') FROM cache_entries
+		UNION ALL
+		SELECT domain, 'hot' AS tier, created_at AS at, COALESCE(reason, '') FROM hot_entries
+		ORDER BY at DESC LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Decision
+	for rows.Next() {
+		var d Decision
+		if err := rows.Scan(&d.Domain, &d.Tier, &d.At, &d.Reason); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// FamilyCount is an eTLD+1 family with its tunneled-member count.
+type FamilyCount struct {
+	Family string
+	N      int
+}
+
+// TopFamilies returns eTLD+1 families with the most tunneled members
+// (hot/cache/covered), largest first — where the routed traffic concentrates.
+func (s *Store) TopFamilies(ctx context.Context, limit int) ([]FamilyCount, error) {
+	rows, err := s.rdb.QueryContext(ctx, `
+		SELECT etld_plus_one, COUNT(*) AS n FROM domains
+		WHERE state IN ('hot', 'cache', 'covered')
+		  AND etld_plus_one IS NOT NULL AND etld_plus_one != ''
+		GROUP BY etld_plus_one ORDER BY n DESC, etld_plus_one LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FamilyCount
+	for rows.Next() {
+		var f FamilyCount
+		if err := rows.Scan(&f.Family, &f.N); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
 // --- single-domain forensics for `ladon why` ---
 
 // GetDomain returns one domains row. ok=false if the domain is unknown.
