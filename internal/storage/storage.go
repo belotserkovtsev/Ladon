@@ -167,8 +167,31 @@ func (s *Store) BackfillETLDPlusOne(ctx context.Context) (int, error) {
 	return updated, nil
 }
 
+// TimeLayout is the textual form every timestamp column (and runtime_meta time
+// value) is stored in: UTC, second precision. Exported so out-of-package
+// readers (doctor/status) parse the same shape the engine writes.
+const TimeLayout = "2006-01-02 15:04:05"
+
+// FormatTime renders a time in the storage layout (UTC).
+func FormatTime(t time.Time) string {
+	return t.UTC().Format(TimeLayout)
+}
+
+// ParseTime parses a storage-layout timestamp as UTC. The boolean is false for
+// empty input (a NULL/absent value), distinct from a parse error.
+func ParseTime(s string) (time.Time, bool, error) {
+	if s == "" {
+		return time.Time{}, false, nil
+	}
+	t, err := time.ParseInLocation(TimeLayout, s, time.UTC)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	return t, true, nil
+}
+
 func formatTime(t time.Time) string {
-	return t.UTC().Format("2006-01-02 15:04:05")
+	return FormatTime(t)
 }
 
 // UpsertDomain records a domain observation. If the row exists, it bumps
@@ -786,6 +809,388 @@ func (s *Store) ListRecentDomains(ctx context.Context, limit int) ([]Domain, err
 			return nil, err
 		}
 		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// --- runtime_meta: cross-process heartbeat read/written for doctor & status ---
+
+// MetaRow is one runtime_meta entry: a value and when the daemon last wrote it.
+type MetaRow struct {
+	Value     string
+	UpdatedAt string
+}
+
+// SetMeta upserts a key/value into runtime_meta, stamping updated_at = now.
+// Cheap enough to call on the daemon's slow heartbeat ticks; goes through the
+// single-writer pool like every other write.
+func (s *Store) SetMeta(ctx context.Context, key, value string) error {
+	_, err := s.wdb.ExecContext(ctx, `
+		INSERT INTO runtime_meta (key, value, updated_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+	`, key, value, formatTime(time.Now().UTC()))
+	return err
+}
+
+// SetMetaTime is SetMeta for a timestamp value, rendered in the storage layout.
+func (s *Store) SetMetaTime(ctx context.Context, key string, t time.Time) error {
+	return s.SetMeta(ctx, key, formatTime(t))
+}
+
+// GetMeta returns one runtime_meta value. ok=false when the key is absent.
+func (s *Store) GetMeta(ctx context.Context, key string) (MetaRow, bool, error) {
+	var r MetaRow
+	err := s.rdb.QueryRowContext(ctx,
+		`SELECT value, updated_at FROM runtime_meta WHERE key = ?`, key).Scan(&r.Value, &r.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return MetaRow{}, false, nil
+	}
+	if err != nil {
+		return MetaRow{}, false, err
+	}
+	return r, true, nil
+}
+
+// AllMeta returns the whole runtime_meta table keyed by key.
+func (s *Store) AllMeta(ctx context.Context) (map[string]MetaRow, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT key, value, updated_at FROM runtime_meta`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]MetaRow{}
+	for rows.Next() {
+		var k string
+		var r MetaRow
+		if err := rows.Scan(&k, &r.Value, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out[k] = r
+	}
+	return out, rows.Err()
+}
+
+// --- aggregate reads for doctor & status ---
+
+// CountDomainsByState returns a state→count map over the domains table.
+func (s *Store) CountDomainsByState(ctx context.Context) (map[string]int, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT state, COUNT(*) FROM domains GROUP BY state`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var st string
+		var n int
+		if err := rows.Scan(&st, &n); err != nil {
+			return nil, err
+		}
+		out[st] = n
+	}
+	return out, rows.Err()
+}
+
+// CountActiveHot counts hot_entries that have not yet expired (expires_at > now).
+func (s *Store) CountActiveHot(ctx context.Context, now time.Time) (int, error) {
+	var n int
+	err := s.rdb.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM hot_entries WHERE expires_at > ?`, formatTime(now)).Scan(&n)
+	return n, err
+}
+
+// CountExpiredHot counts hot_entries past their TTL but not yet swept.
+func (s *Store) CountExpiredHot(ctx context.Context, now time.Time) (int, error) {
+	var n int
+	err := s.rdb.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM hot_entries WHERE expires_at <= ?`, formatTime(now)).Scan(&n)
+	return n, err
+}
+
+// CountCacheRows counts cache_entries.
+func (s *Store) CountCacheRows(ctx context.Context) (int, error) {
+	var n int
+	err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(*) FROM cache_entries`).Scan(&n)
+	return n, err
+}
+
+// CountOrphanedDomains counts domains in a tunneled tier (hot/cache) with no
+// backing hot_entries/cache_entries row — the drift the atomic-transition gap
+// can leave behind. Note it deliberately excludes 'ignore': an ignore domain
+// has no backing row by design and is not orphaned.
+func (s *Store) CountOrphanedDomains(ctx context.Context) (int, error) {
+	var n int
+	err := s.rdb.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM domains
+		WHERE state IN ('hot', 'cache')
+		  AND domain NOT IN (SELECT domain FROM hot_entries)
+		  AND domain NOT IN (SELECT domain FROM cache_entries)
+	`).Scan(&n)
+	return n, err
+}
+
+// LatestObservationAt returns the most recent domains.last_seen_at — the proxy
+// for "when did ladon last see DNS traffic". ok=false on an empty table.
+func (s *Store) LatestObservationAt(ctx context.Context) (time.Time, bool, error) {
+	return s.maxTime(ctx, `SELECT MAX(last_seen_at) FROM domains`)
+}
+
+// LatestProbeAt returns the most recent probes.created_at.
+func (s *Store) LatestProbeAt(ctx context.Context) (time.Time, bool, error) {
+	return s.maxTime(ctx, `SELECT MAX(created_at) FROM probes`)
+}
+
+func (s *Store) maxTime(ctx context.Context, query string) (time.Time, bool, error) {
+	var v sql.NullString
+	if err := s.rdb.QueryRowContext(ctx, query).Scan(&v); err != nil {
+		return time.Time{}, false, err
+	}
+	if !v.Valid {
+		return time.Time{}, false, nil
+	}
+	return ParseTime(v.String)
+}
+
+// RecentProbeStats counts probe rows created since `since`, split into the
+// authoritative blocked/clear verdicts. total includes provisional (NULL
+// verdict) inline-path rows, so total >= blocked+clear.
+func (s *Store) RecentProbeStats(ctx context.Context, since time.Time) (total, blocked, clear int, err error) {
+	ts := formatTime(since)
+	err = s.rdb.QueryRowContext(ctx, `
+		SELECT
+			COUNT(*),
+			COALESCE(SUM(CASE WHEN verdict = 'blocked' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN verdict = 'clear'   THEN 1 ELSE 0 END), 0)
+		FROM probes WHERE created_at >= ?
+	`, ts).Scan(&total, &blocked, &clear)
+	return total, blocked, clear, err
+}
+
+// CountObservationsSince counts domains observed (last_seen_at) at or after
+// `since` — a cheap "is fresh DNS flowing" signal for doctor/status.
+func (s *Store) CountObservationsSince(ctx context.Context, since time.Time) (int, error) {
+	var n int
+	err := s.rdb.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM domains WHERE last_seen_at >= ?`, formatTime(since)).Scan(&n)
+	return n, err
+}
+
+// --- activity & insight reads for `ladon status` ---
+
+// CodeCount is a failure-code tally.
+type CodeCount struct {
+	Code string
+	N    int
+}
+
+// TopFailureCodes returns the most common failure codes (the prefix of
+// failure_reason before ':') among probes since `since`, largest first.
+func (s *Store) TopFailureCodes(ctx context.Context, since time.Time, limit int) ([]CodeCount, error) {
+	rows, err := s.rdb.QueryContext(ctx, `
+		SELECT CASE WHEN instr(failure_reason, ':') > 0
+		            THEN substr(failure_reason, 1, instr(failure_reason, ':') - 1)
+		            ELSE failure_reason END AS code,
+		       COUNT(*) AS n
+		FROM probes
+		WHERE created_at >= ? AND failure_reason IS NOT NULL AND failure_reason != ''
+		GROUP BY code ORDER BY n DESC, code LIMIT ?
+	`, formatTime(since), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CodeCount
+	for rows.Next() {
+		var c CodeCount
+		if err := rows.Scan(&c.Code, &c.N); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// Decision is a recent entry into the tunnel (hot or cache promotion).
+type Decision struct {
+	Domain string
+	Tier   string // "hot" | "cache"
+	At     string
+	Reason string
+}
+
+// RecentDecisions returns the most recently tunneled domains across both tiers,
+// newest first — the "what did ladon just decide to route" feed.
+func (s *Store) RecentDecisions(ctx context.Context, limit int) ([]Decision, error) {
+	rows, err := s.rdb.QueryContext(ctx, `
+		SELECT domain, 'cache' AS tier, promoted_at AS at, COALESCE(reason, '') FROM cache_entries
+		UNION ALL
+		SELECT domain, 'hot' AS tier, created_at AS at, COALESCE(reason, '') FROM hot_entries
+		ORDER BY at DESC LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Decision
+	for rows.Next() {
+		var d Decision
+		if err := rows.Scan(&d.Domain, &d.Tier, &d.At, &d.Reason); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// FamilyCount is an eTLD+1 family with its tunneled-member count.
+type FamilyCount struct {
+	Family string
+	N      int
+}
+
+// TopFamilies returns eTLD+1 families with the most tunneled members
+// (hot/cache/covered), largest first — where the routed traffic concentrates.
+func (s *Store) TopFamilies(ctx context.Context, limit int) ([]FamilyCount, error) {
+	rows, err := s.rdb.QueryContext(ctx, `
+		SELECT etld_plus_one, COUNT(*) AS n FROM domains
+		WHERE state IN ('hot', 'cache', 'covered')
+		  AND etld_plus_one IS NOT NULL AND etld_plus_one != ''
+		GROUP BY etld_plus_one ORDER BY n DESC, etld_plus_one LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FamilyCount
+	for rows.Next() {
+		var f FamilyCount
+		if err := rows.Scan(&f.Family, &f.N); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// --- single-domain forensics for `ladon why` ---
+
+// GetDomain returns one domains row. ok=false if the domain is unknown.
+func (s *Store) GetDomain(ctx context.Context, domain string) (Domain, bool, error) {
+	var d Domain
+	err := s.rdb.QueryRowContext(ctx, `
+		SELECT domain, COALESCE(etld_plus_one, ''), COALESCE(first_seen_at, ''),
+		       COALESCE(last_seen_at, ''), hit_count, state, COALESCE(cooldown_until, '')
+		FROM domains WHERE domain = ?
+	`, domain).Scan(&d.Domain, &d.ETLDPlusOne, &d.FirstSeenAt, &d.LastSeenAt,
+		&d.HitCount, &d.State, &d.CooldownUntil)
+	if err == sql.ErrNoRows {
+		return Domain{}, false, nil
+	}
+	if err != nil {
+		return Domain{}, false, err
+	}
+	return d, true, nil
+}
+
+// ProbeRow is one probes row rendered for forensic display. The OK flags are
+// tri-state (NULL = that stage didn't run); verdict is empty for provisional
+// inline-path rows.
+type ProbeRow struct {
+	DNS, TCP, TLS, HTTP sql.NullInt64
+	FailureReason       string
+	Verdict             string
+	CreatedAt           string
+}
+
+// Flags renders the four tri-state stage outcomes for display: "ok" (1),
+// "x" (0), or "-" (NULL = stage didn't run). Keeps database/sql out of callers.
+func (p ProbeRow) Flags() (dns, tcp, tls, http string) {
+	return flagStr(p.DNS), flagStr(p.TCP), flagStr(p.TLS), flagStr(p.HTTP)
+}
+
+func flagStr(n sql.NullInt64) string {
+	if !n.Valid {
+		return "-"
+	}
+	if n.Int64 != 0 {
+		return "ok"
+	}
+	return "x"
+}
+
+// RecentProbesForDomain returns the most recent `limit` probe rows for a domain,
+// newest first.
+func (s *Store) RecentProbesForDomain(ctx context.Context, domain string, limit int) ([]ProbeRow, error) {
+	rows, err := s.rdb.QueryContext(ctx, `
+		SELECT dns_ok, tcp_ok, tls_ok, http_ok,
+		       COALESCE(failure_reason, ''), COALESCE(verdict, ''), created_at
+		FROM probes WHERE domain = ?
+		ORDER BY created_at DESC, id DESC
+		LIMIT ?
+	`, domain, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ProbeRow
+	for rows.Next() {
+		var p ProbeRow
+		if err := rows.Scan(&p.DNS, &p.TCP, &p.TLS, &p.HTTP,
+			&p.FailureReason, &p.Verdict, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// HotEntryFor returns the hot_entries row backing a domain, if any.
+func (s *Store) HotEntryFor(ctx context.Context, domain string) (expiresAt, reason string, ok bool, err error) {
+	var r sql.NullString
+	err = s.rdb.QueryRowContext(ctx,
+		`SELECT expires_at, COALESCE(reason, '') FROM hot_entries WHERE domain = ?`, domain).
+		Scan(&expiresAt, &r)
+	if err == sql.ErrNoRows {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	return expiresAt, r.String, true, nil
+}
+
+// CacheEntryFor returns the cache_entries row backing a domain, if any.
+func (s *Store) CacheEntryFor(ctx context.Context, domain string) (promotedAt, reason string, ok bool, err error) {
+	var r sql.NullString
+	err = s.rdb.QueryRowContext(ctx,
+		`SELECT promoted_at, COALESCE(reason, '') FROM cache_entries WHERE domain = ?`, domain).
+		Scan(&promotedAt, &r)
+	if err == sql.ErrNoRows {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	return promotedAt, r.String, true, nil
+}
+
+// LookupAllIPs returns every IP ever observed for a domain (no freshness
+// filter), freshest first — for forensic display, not routing.
+func (s *Store) LookupAllIPs(ctx context.Context, domain string) ([]string, error) {
+	rows, err := s.rdb.QueryContext(ctx,
+		`SELECT ip FROM dns_cache WHERE domain = ? ORDER BY last_seen_at DESC`, domain)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var ip string
+		if err := rows.Scan(&ip); err != nil {
+			return nil, err
+		}
+		out = append(out, ip)
 	}
 	return out, rows.Err()
 }

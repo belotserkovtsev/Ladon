@@ -1,216 +1,352 @@
 #!/usr/bin/env bash
 # ladon installer — Debian/Ubuntu only.
 #
+# Interactive when run on a terminal (даже через `curl | sudo bash` — ввод
+# читается из /dev/tty): спрашивает расширения и режим проверки, показывает
+# сводку и просит подтверждение перед изменениями. Без терминала (cron, пайп)
+# тихо ставит с дефолтами.
+#
 # Scope: ladon's job is to keep three kernel ipsets populated:
 #   ladon_engine — IPs of probe-discovered blocked domains (hot/cache)
 #   ladon_manual — IPs of domains in manual-allow + extensions (via dnsmasq)
-#   ladon_cidr   — CIDR blocks from manual-allow + extensions (hash:net) for
-#                  services that bypass DNS (Telegram MTProto, BitTorrent, etc.)
+#   ladon_cidr   — CIDR blocks from manual-allow + extensions (hash:net)
 #
-# Wiring those ipsets into actual routing (iptables MARK + ip rule fwmark
-# + custom routing table → tunnel interface) is the OPERATOR'S responsibility:
-# only you know your tunnel interface, peer subnet, fwmark scheme, etc.
-# This script DOES NOT touch iptables — it prints an example at the end so
-# you can copy-paste-adjust.
+# Wiring those ipsets into routing (iptables MARK + ip rule + table → tunnel)
+# is the OPERATOR'S job — this script does NOT touch iptables/routing; it prints
+# a copy-paste example at the end.
 #
-# Re-running this script upgrades to the latest version: existing config
-# files are preserved (manual-allow.txt, manual-deny.txt, config.yaml),
-# binary + unit + extensions are replaced, ladon is restarted.
+# Re-running upgrades in place: config files (config.yaml, manual-*.txt) are
+# preserved, binary/unit/extensions replaced, ladon restarted. On an upgrade the
+# interactive wizard is skipped (your config stays as-is).
 #
 # Usage:
 #   sudo bash install.sh
-#
-# Or:
-#   curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/install.sh \
-#     | sudo bash
+#   curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/install.sh | sudo bash
 #
 # Optional env:
-#   TAG=v0.4.0-rc1          install a specific release tag instead of latest
-#                           (useful for testing pre-releases — `releases/latest`
-#                           in the GH API skips prereleases by default)
-#   IPSET_ENGINE=ladon_engine, IPSET_MANUAL=ladon_manual, IPSET_CIDR=ladon_cidr
-#   LADON_PREFIX=/opt/ladon, LADON_CONFIG_DIR=/etc/ladon
+#   TAG=v1.4.0              install a specific tag (default: latest stable)
+#   LADON_DRY_RUN=1         run the wizard, change nothing (for testing)
+#   NO_COLOR=1              disable color
+#   IPSET_ENGINE / IPSET_MANUAL / IPSET_CIDR / LADON_PREFIX / LADON_CONFIG_DIR
 
 set -euo pipefail
 
-# --- pretty logging ---
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
-log()  { printf "%b==>%b %s\n" "$GREEN" "$NC" "$*"; }
-warn() { printf "%b==>%b %s\n" "$YELLOW" "$NC" "$*"; }
-die()  { printf "%b==>%b %s\n" "$RED" "$NC" "$*" >&2; exit 1; }
-
-# --- env ---
+# --- env / defaults ---
 IPSET_ENGINE="${IPSET_ENGINE:-ladon_engine}"
 IPSET_MANUAL="${IPSET_MANUAL:-ladon_manual}"
 IPSET_CIDR="${IPSET_CIDR:-ladon_cidr}"
 LADON_PREFIX="${LADON_PREFIX:-/opt/ladon}"
 LADON_CONFIG_DIR="${LADON_CONFIG_DIR:-/etc/ladon}"
+DRY_RUN="${LADON_DRY_RUN:-0}"
 GH_REPO="belotserkovtsev/ladon"
 
+# --- style (color only on a terminal) ---
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  CYAN=$'\033[36m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; RED=$'\033[31m'
+  DIM=$'\033[90m'; BOLD=$'\033[1m'; NC=$'\033[0m'
+else
+  CYAN=; GREEN=; YELLOW=; RED=; DIM=; BOLD=; NC=
+fi
+
+step() { printf "\n  ${BOLD}${CYAN}%s${NC}\n" "$1"; }
+ok()   { printf "   ${GREEN}✔${NC} %s\n" "$*"; }
+info() { printf "   ${DIM}·${NC} %s\n" "$*"; }
+warn() { printf "   ${YELLOW}▲${NC} %s\n" "$*"; }
+die()  { printf "   ${RED}✖${NC} %s\n" "$*" >&2; exit 1; }
+
+banner() {
+  printf '%s' "$CYAN"
+  cat <<'ART'
+  ██╗      █████╗ ██████╗  ██████╗ ███╗   ██╗
+  ██║     ██╔══██╗██╔══██╗██╔═══██╗████╗  ██║
+  ██║     ███████║██║  ██║██║   ██║██╔██╗ ██║
+  ██║     ██╔══██║██║  ██║██║   ██║██║╚██╗██║
+  ███████╗██║  ██║██████╔╝╚██████╔╝██║ ╚████║
+  ╚══════╝╚═╝  ╚═╝╚═════╝  ╚═════╝ ╚═╝  ╚═══╝
+ART
+  printf '%s' "$NC"
+  printf "  ${DIM}anti-dpi engine · установка${NC}\n\n"
+}
+
+# --- controlling terminal for interactive input (works under curl|bash) ---
+HAS_TTY=0
+if { exec 3</dev/tty; } 2>/dev/null; then HAS_TTY=1; fi
+
+# read_key: one keypress from the tty, expanding arrow escape sequences.
+read_key() {
+  local k k2 k3
+  IFS= read -rsn1 -u 3 k || true
+  if [[ $k == $'\033' ]]; then
+    IFS= read -rsn1 -u 3 -t 0.01 k2 || true
+    IFS= read -rsn1 -u 3 -t 0.01 k3 || true
+    k+="$k2$k3"
+  fi
+  printf '%s' "$k"
+}
+
+join_by() { local d="$1"; shift; [[ $# -eq 0 ]] && return; local out="$1"; shift; printf '%s' "$out"; for x in "$@"; do printf '%s%s' "$d" "$x"; done; }
+
+# --- arrow-key menus (draw to stdout, read from fd 3) ---
+# select_extensions: multi-select over $EXT_NAMES → sets CHOICE_MULTI[]
+CHOICE_MULTI=()
+select_extensions() {
+  local n=${#EXT_NAMES[@]} cur=0 i key
+  local -a chk; for ((i=0;i<n;i++)); do chk[i]=0; done
+  printf "  ${CYAN}?${NC} Какие расширения включить?  ${DIM}↑/↓ · Space отметить · Enter дальше${NC}\n"
+  _draw() {
+    for ((i=0;i<n;i++)); do
+      local box="[ ]"; [[ ${chk[i]} == 1 ]] && box="[${GREEN}x${NC}]"
+      local ptr="  "; [[ $i == "$cur" ]] && ptr="${CYAN}▸${NC} "
+      printf "    %s%s %s\033[K\n" "$ptr" "$box" "${EXT_NAMES[i]}"
+    done
+  }
+  printf '\033[?25l'   # hide cursor
+  _draw
+  while true; do
+    key=$(read_key)
+    case "$key" in
+      $'\033[A'|$'\033OA'|k) ((cur=(cur-1+n)%n)) ;;
+      $'\033[B'|$'\033OB'|j) ((cur=(cur+1)%n)) ;;
+      ' ') chk[cur]=$((1-chk[cur])) ;;
+      ''|$'\n'|$'\r') break ;;
+      q|Q) printf '\033[?25h'; die "установка отменена" ;;
+    esac
+    printf "\033[%dA" "$n"; _draw
+  done
+  printf '\033[?25h'   # show cursor
+  CHOICE_MULTI=()
+  for ((i=0;i<n;i++)); do [[ ${chk[i]} == 1 ]] && CHOICE_MULTI+=("${EXT_NAMES[i]}"); done
+  return 0
+}
+
+# select_probe_mode: single-select → sets PROBE_MODE (+ REMOTE_URL/REMOTE_TOKEN)
+PROBE_MODE="local"; REMOTE_URL=""; REMOTE_TOKEN=""
+select_probe_mode() {
+  local opts=("local" "exit-compare")
+  local desc=("только со шлюза (по умолчанию)" "сверять с выходным сервером (точнее)")
+  local n=2 cur=0 i key
+  printf "  ${CYAN}?${NC} Режим проверки доменов?  ${DIM}↑/↓ · Enter${NC}\n"
+  _draw() {
+    for ((i=0;i<n;i++)); do
+      local dot="${DIM}○${NC}"; [[ $i == "$cur" ]] && dot="${GREEN}●${NC}"
+      local ptr="  "; [[ $i == "$cur" ]] && ptr="${CYAN}▸${NC} "
+      printf "    %s%s %-13s ${DIM}%s${NC}\033[K\n" "$ptr" "$dot" "${opts[i]}" "${desc[i]}"
+    done
+  }
+  printf '\033[?25l'; _draw
+  while true; do
+    key=$(read_key)
+    case "$key" in
+      $'\033[A'|$'\033OA'|k) ((cur=(cur-1+n)%n)) ;;
+      $'\033[B'|$'\033OB'|j) ((cur=(cur+1)%n)) ;;
+      ''|$'\n'|$'\r') break ;;
+    esac
+    printf "\033[%dA" "$n"; _draw
+  done
+  printf '\033[?25h'
+  PROBE_MODE="${opts[cur]}"
+  if [[ $PROBE_MODE == exit-compare ]]; then
+    printf "    URL probe-сервера: "; IFS= read -r -u 3 REMOTE_URL || true
+    printf "    Токен (Authorization, Enter — пусто): "; IFS= read -r -u 3 REMOTE_TOKEN || true
+    [[ -n "$REMOTE_URL" ]] || { warn "URL пуст — откатываюсь на local"; PROBE_MODE="local"; }
+  fi
+  return 0
+}
+
+confirm() {
+  local ans
+  printf "\n  ${BOLD}Устанавливаем с этими настройками?${NC} ${DIM}[Y/n]${NC} "
+  IFS= read -r -u 3 ans || ans=""
+  case "$ans" in n|N|no|NO|нет|Нет) return 1 ;; *) return 0 ;; esac
+}
+
+write_config() {
+  local cfg="$LADON_CONFIG_DIR/config.yaml"
+  {
+    echo "# ladon config — создан установщиком."
+    echo "# Полный список опций: $LADON_CONFIG_DIR/config.yaml.example"
+    echo
+    echo "log:"
+    echo "  level: info"
+    echo
+    if [[ ${#CHOICE_MULTI[@]} -gt 0 ]]; then
+      echo "allow_extensions: [$(join_by ', ' "${CHOICE_MULTI[@]}")]"
+      echo
+    fi
+    echo "probe:"
+    echo "  mode: $PROBE_MODE"
+    if [[ $PROBE_MODE == exit-compare ]]; then
+      echo "  remote:"
+      echo "    url: $REMOTE_URL"
+      if [[ -n "$REMOTE_TOKEN" ]]; then
+        echo "    auth_header: Authorization"
+        echo "    auth_value: $REMOTE_TOKEN"
+      fi
+    fi
+  } > "$cfg"
+}
+
+# ============================ flow ============================
+
+# Clean start: clear screen + scrollback so the banner sits at the top (only on
+# a real terminal — never emit escapes into a pipe/log).
+[[ -t 1 ]] && printf '\033[H\033[2J\033[3J'
+banner
+
 # --- preflight ---
-[[ $EUID -eq 0 ]] || die "must run as root (sudo)"
-[[ -f /etc/os-release ]] || die "no /etc/os-release — only Debian/Ubuntu supported"
+[[ $EUID -eq 0 ]] || die "запусти через sudo (нужен root)"
+[[ -f /etc/os-release ]] || die "нет /etc/os-release — поддерживается только Debian/Ubuntu"
 . /etc/os-release
 case "${ID:-}${ID_LIKE:-}" in
   *debian*|*ubuntu*) ;;
-  *) die "only Debian/Ubuntu supported (got ID=${ID:-?})" ;;
+  *) die "поддерживается только Debian/Ubuntu (ID=${ID:-?})" ;;
 esac
-command -v systemctl >/dev/null || die "systemd required"
-command -v curl       >/dev/null || die "curl required"
-
-# --- arch detection ---
+command -v systemctl >/dev/null || die "нужен systemd"
+command -v curl       >/dev/null || die "нужен curl"
 case "$(uname -m)" in
   x86_64|amd64) ARCH=amd64 ;;
   aarch64|arm64) ARCH=arm64 ;;
-  *) die "unsupported architecture: $(uname -m)" ;;
+  *) die "архитектура не поддерживается: $(uname -m)" ;;
 esac
-log "architecture: $ARCH"
 
-# --- step 1: deps ---
-log "installing deps (apt)"
+step "Окружение"
+ok "архитектура: $ARCH (${PRETTY_NAME:-$ID})"
+
+# --- fetch + verify release (read-only, into tmp) ---
+TAG="${TAG:-}"
+if [[ -z "$TAG" ]]; then
+  TAG=$(curl -fsSL "https://api.github.com/repos/${GH_REPO}/releases/latest" \
+    | grep '"tag_name":' | head -1 | cut -d'"' -f4)
+  [[ -n "$TAG" ]] || die "не удалось узнать последнюю версию с GitHub"
+fi
+ok "версия: $TAG"
+
+WORKDIR=$(mktemp -d); trap 'rm -rf "$WORKDIR"' EXIT; cd "$WORKDIR"
+URL="https://github.com/${GH_REPO}/releases/download/${TAG}/ladon-linux-${ARCH}.tar.gz"
+curl -fsSL -O "$URL"
+curl -fsSL -O "${URL}.sha256"
+sha256sum -c "ladon-linux-${ARCH}.tar.gz.sha256" >/dev/null 2>&1 || die "sha256 не сошёлся — скачивание битое"
+tar xzf "ladon-linux-${ARCH}.tar.gz"
+SRC="ladon-linux-${ARCH}-${TAG}"
+ok "загружено и проверено"
+
+# available extensions from the tarball
+EXT_NAMES=()
+for f in "$SRC"/extensions/*.txt; do [[ -e "$f" ]] && EXT_NAMES+=("$(basename "$f" .txt)"); done
+
+FRESH=1; [[ -f "$LADON_CONFIG_DIR/config.yaml" ]] && FRESH=0
+
+# --- interactive wizard (fresh install on a terminal only) ---
+if [[ $FRESH == 1 && $HAS_TTY == 1 ]]; then
+  step "Настройка"
+  if [[ ${#EXT_NAMES[@]} -gt 0 ]]; then select_extensions; fi
+  select_probe_mode
+
+  step "Сводка"
+  if [[ ${#CHOICE_MULTI[@]} -gt 0 ]]; then info "расширения:  $(join_by ', ' "${CHOICE_MULTI[@]}")"; else info "расширения:  нет"; fi
+  info "режим:       $PROBE_MODE"
+  [[ $PROBE_MODE == exit-compare ]] && info "probe-сервер: $REMOTE_URL"
+  info "путь:        $LADON_PREFIX  ·  конфиг: $LADON_CONFIG_DIR/config.yaml"
+  confirm || { printf "\n  ${DIM}отменено — ничего не менял.${NC}\n\n"; exit 0; }
+else
+  [[ $FRESH == 0 ]] && info "обновление: существующий config.yaml сохраняю, мастер пропускаю"
+  [[ $HAS_TTY == 0 ]] && info "неинтерактивный режим: ставлю с дефолтами (расширения — нет, режим — local)"
+fi
+
+if [[ $DRY_RUN == 1 ]]; then
+  step "Установка (dry-run)"
+  info "пропущено: apt, файлы, ipset, служба — это пробный прогон"
+  printf "\n  ${GREEN}╭────────────────────────────────╮${NC}\n"
+  printf "  ${GREEN}│${NC}  ${GREEN}●${NC}  ${BOLD}DRY-RUN · ничего не менял${NC}  ${GREEN}│${NC}\n"
+  printf "  ${GREEN}╰────────────────────────────────╯${NC}\n\n"
+  exit 0
+fi
+
+# ============================ apply ============================
+step "Установка"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq ipset sqlite3 dnsmasq >/dev/null
+ok "зависимости (ipset, sqlite3, dnsmasq)"
 
-# --- step 2: fetch release tag ---
-TAG="${TAG:-}"
-if [[ -z "$TAG" ]]; then
-  log "querying latest stable release"
-  TAG=$(curl -fsSL "https://api.github.com/repos/${GH_REPO}/releases/latest" \
-    | grep '"tag_name":' | head -1 | cut -d'"' -f4)
-  [[ -n "$TAG" ]] || die "couldn't determine latest tag from GitHub API"
-  log "latest version: $TAG"
+install -d "$LADON_PREFIX/state" "$LADON_CONFIG_DIR" "$LADON_PREFIX/extensions"
+install -m 0755 "$SRC/ladon"         "$LADON_PREFIX/ladon"
+install -m 0644 "$SRC/ladon.service" /etc/systemd/system/ladon.service
+install -m 0644 "$SRC/config.yaml.example" "$LADON_CONFIG_DIR/config.yaml.example"
+[[ ! -f "$LADON_CONFIG_DIR/manual-allow.txt" ]] && install -m 0644 "$SRC/manual-allow.txt.example" "$LADON_CONFIG_DIR/manual-allow.txt"
+[[ ! -f "$LADON_CONFIG_DIR/manual-deny.txt"  ]] && install -m 0644 "$SRC/manual-deny.txt.example"  "$LADON_CONFIG_DIR/manual-deny.txt"
+install -m 0644 "$SRC/extensions/"*.txt "$LADON_PREFIX/extensions/"
+ok "бинарь → $LADON_PREFIX/ladon"
+
+# CLI wrapper on PATH so `ladon doctor` / `status` / `why` work from anywhere
+# against the installed db/config. systemd calls the binary directly; this is
+# only for interactive operator use.
+cat > /usr/local/bin/ladon <<EOF
+#!/bin/sh
+# ladon CLI wrapper (installed by install.sh) — points operator commands at the
+# installed database and config. The systemd unit calls the binary directly.
+exec ${LADON_PREFIX}/ladon -db ${LADON_PREFIX}/state/engine.db -config ${LADON_CONFIG_DIR}/config.yaml "\$@"
+EOF
+chmod +x /usr/local/bin/ladon
+ok "команда ladon → /usr/local/bin/ladon"
+
+if [[ $FRESH == 1 ]]; then
+  write_config
+  ok "конфиг → $LADON_CONFIG_DIR/config.yaml"
 else
-  log "using TAG override: $TAG"
+  ok "конфиг сохранён (без изменений)"
 fi
 
-WORKDIR=$(mktemp -d)
-trap "rm -rf '$WORKDIR'" EXIT
-cd "$WORKDIR"
+ipset list "$IPSET_ENGINE" -t >/dev/null 2>&1 || ipset create "$IPSET_ENGINE" hash:ip  family inet maxelem 65536
+ipset list "$IPSET_MANUAL" -t >/dev/null 2>&1 || ipset create "$IPSET_MANUAL" hash:ip  family inet maxelem 65536 timeout 86400
+ipset list "$IPSET_CIDR"   -t >/dev/null 2>&1 || ipset create "$IPSET_CIDR"   hash:net family inet maxelem 65536
+mkdir -p /etc/iptables && ipset save > /etc/iptables/ipsets
+ok "наборы ipset: $IPSET_ENGINE, $IPSET_MANUAL, $IPSET_CIDR"
 
-URL="https://github.com/${GH_REPO}/releases/download/${TAG}/ladon-linux-${ARCH}.tar.gz"
-log "downloading ${URL##*/}"
-curl -fsSL -O "$URL"
-curl -fsSL -O "${URL}.sha256"
-log "verifying sha256"
-sha256sum -c "ladon-linux-${ARCH}.tar.gz.sha256"
-
-tar xzf "ladon-linux-${ARCH}.tar.gz"
-SRC="ladon-linux-${ARCH}-${TAG}"
-
-# --- step 3: install binary + units + extensions ---
-log "installing files into $LADON_PREFIX"
-install -d "$LADON_PREFIX/state" "$LADON_CONFIG_DIR" "$LADON_PREFIX/extensions"
-install -m 0755 "$SRC/ladon"             "$LADON_PREFIX/ladon"
-install -m 0644 "$SRC/ladon.service"     /etc/systemd/system/ladon.service
-[[ ! -f "$LADON_CONFIG_DIR/manual-allow.txt" ]] && \
-  install -m 0644 "$SRC/manual-allow.txt.example" "$LADON_CONFIG_DIR/manual-allow.txt"
-[[ ! -f "$LADON_CONFIG_DIR/manual-deny.txt" ]] && \
-  install -m 0644 "$SRC/manual-deny.txt.example"  "$LADON_CONFIG_DIR/manual-deny.txt"
-[[ ! -f "$LADON_CONFIG_DIR/config.yaml" ]] && \
-  install -m 0644 "$SRC/config.yaml.example"      "$LADON_CONFIG_DIR/config.yaml"
-install -m 0644 "$SRC/extensions/"*.txt  "$LADON_PREFIX/extensions/"
-
-# --- step 4: ipsets (idempotent) ---
-log "creating ipsets ($IPSET_ENGINE, $IPSET_MANUAL, $IPSET_CIDR)"
-ipset list "$IPSET_ENGINE" -t >/dev/null 2>&1 || \
-  ipset create "$IPSET_ENGINE" hash:ip family inet maxelem 65536
-ipset list "$IPSET_MANUAL" -t >/dev/null 2>&1 || \
-  ipset create "$IPSET_MANUAL" hash:ip family inet maxelem 65536 timeout 86400
-# hash:net for CIDR blocks (Telegram MTProto, BitTorrent peer subnets, etc.).
-# No timeout: these are operator-curated, not probe-discovered.
-ipset list "$IPSET_CIDR" -t >/dev/null 2>&1 || \
-  ipset create "$IPSET_CIDR" hash:net family inet maxelem 65536
-
-# Persist ipsets across reboot. iptables-persistent's `ipsets` file is the
-# Debian/Ubuntu standard location; works whether or not netfilter-persistent
-# is installed (operator's choice).
-mkdir -p /etc/iptables
-ipset save > /etc/iptables/ipsets
-
-# --- step 6: dnsmasq CAP_NET_ADMIN drop-in ---
-log "granting dnsmasq CAP_NET_ADMIN (needed for ipset= directives)"
 install -d /etc/systemd/system/dnsmasq.service.d
 cat > /etc/systemd/system/dnsmasq.service.d/ladon-ipset.conf <<EOF
-# Installed by ladon: dnsmasq drops privileges to user 'dnsmasq', it needs
-# CAP_NET_ADMIN to manipulate kernel ipsets via the ipset= directive
-# ladon writes into /etc/dnsmasq.d/ladon-manual.conf.
+# Installed by ladon: dnsmasq needs CAP_NET_ADMIN to fill kernel ipsets via the
+# ipset= directive ladon writes into /etc/dnsmasq.d/ladon-manual.conf.
 [Service]
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETFCAP CAP_SETPCAP CAP_SYS_CHROOT CAP_KILL
 EOF
+ok "dnsmasq: выдан CAP_NET_ADMIN"
 
-# --- step 7: ladon systemd unit — point at config.yaml ---
 if ! grep -q -- '-config' /etc/systemd/system/ladon.service; then
-  log "wiring -config /etc/ladon/config.yaml into ladon.service"
   sed -i "s|^  -db ${LADON_PREFIX//\//\\/}/state/engine.db|  -db ${LADON_PREFIX}/state/engine.db -config ${LADON_CONFIG_DIR}/config.yaml|" \
     /etc/systemd/system/ladon.service
 fi
 
-# --- step 8: init db ---
-log "initializing database"
 "$LADON_PREFIX/ladon" -db "$LADON_PREFIX/state/engine.db" init-db >/dev/null
+ok "база инициализирована"
 
-# --- step 9: reload + start ---
-# `restart` instead of `start` so re-running this script serves as an
-# upgrade: a fresh install starts, an existing one is replaced — picking
-# up the new binary and any unit / drop-in changes in one shot.
-log "reloading systemd, restarting dnsmasq, starting/restarting ladon"
 systemctl daemon-reload
 systemctl restart dnsmasq
-systemctl enable ladon >/dev/null
+systemctl enable ladon >/dev/null 2>&1
 systemctl restart ladon
-
 sleep 1
-if ! systemctl is-active --quiet ladon; then
-  warn "ladon failed to start — check: journalctl -u ladon -n 50 --no-pager"
-  exit 1
+if systemctl is-active --quiet ladon; then
+  ok "служба ladon запущена"
+else
+  die "ladon не стартанул — смотри: journalctl -u ladon -n 50 --no-pager"
 fi
 
-# --- post-install message ---
-cat <<EOF
+# --- done badge ---
+printf "\n  ${GREEN}╭──────────────────────────────────╮${NC}\n"
+printf "  ${GREEN}│${NC}  ${GREEN}●${NC}  ${BOLD}ГОТОВО · ladon %s работает${NC}\n" "$TAG"
+printf "  ${GREEN}╰──────────────────────────────────╯${NC}\n"
 
-${GREEN}==> ladon $TAG installed${NC}
+step "Что дальше"
+info "проверить:  ${BOLD}sudo ladon doctor${NC}"
+info "логи:       journalctl -u ladon -f"
+info "конфиг:     $LADON_CONFIG_DIR/config.yaml"
 
-What's running:
-  service:  systemctl status ladon
-  logs:     journalctl -u ladon -f
-  config:   $LADON_CONFIG_DIR/config.yaml
-  ipsets:   $IPSET_ENGINE (probe-driven), $IPSET_MANUAL (dnsmasq-driven),
-            $IPSET_CIDR (extension CIDR blocks, hash:net)
-
-${YELLOW}==> ROUTING IS YOUR JOB${NC}
-
-ladon only fills the ipsets — wiring traffic from peers through your tunnel
-when the destination IP matches one of those sets is up to you. A typical
-WireGuard split-tunnel setup looks like (adjust subnet/fwmark/iface):
-
-  iptables -t mangle -A WG_ROUTE -s 10.10.0.0/16 \\
-    -m set --match-set $IPSET_ENGINE dst -j MARK --set-mark 0x1
-  iptables -t mangle -A WG_ROUTE -s 10.10.0.0/16 \\
-    -m set --match-set $IPSET_MANUAL dst -j MARK --set-mark 0x1
-  iptables -t mangle -A WG_ROUTE -s 10.10.0.0/16 \\
-    -m set --match-set $IPSET_CIDR dst -j MARK --set-mark 0x1
-
-  ip rule add fwmark 0x1 table ladon priority 1000
-  echo '666 ladon' >> /etc/iproute2/rt_tables
-  ip route replace default dev tun0 table ladon
-
-  iptables-save > /etc/iptables/rules.v4   # persist across reboot
-
-Next steps:
-  1. Wire the iptables / ip rule above (or whatever your routing setup needs).
-  2. Add domains to $LADON_CONFIG_DIR/manual-allow.txt or
-     $LADON_CONFIG_DIR/manual-deny.txt and restart ladon.
-  3. Or enable bundled allow presets in $LADON_CONFIG_DIR/config.yaml:
-       allow_extensions: [ai, twitch, tiktok]
-     No deny presets ship — edit $LADON_CONFIG_DIR/manual-deny.txt or
-     write a custom one and reference it in deny_extensions: [...].
-     Full catalogue + semantics:
-       https://github.com/belotserkovtsev/ladon/blob/main/docs/extensions.md
-  4. (Optional) For exit-compare validator, set probe.mode: exit-compare
-     in config.yaml. See:
-       https://github.com/belotserkovtsev/ladon/blob/main/docs/probe-api.md
-
-To uninstall: download and run release/uninstall.sh from the same release.
-EOF
+printf "\n  ${YELLOW}Маршрутизация — за тобой.${NC} ladon только наполняет ipset; направить\n"
+printf "  трафик в твой туннель по совпадению с набором нужно самому. Пример\n"
+printf "  (подставь свой fwmark / таблицу / интерфейс):\n\n"
+printf "${DIM}    iptables -t mangle -A PREROUTING -m set --match-set %s dst -j MARK --set-mark 0x1\n" "$IPSET_ENGINE"
+printf "    ip rule add fwmark 0x1 table 100 priority 1000\n"
+printf "    ip route replace default dev <tunnel> table 100\n"
+printf "    iptables-save > /etc/iptables/rules.v4${NC}\n\n"
+printf "  Удалить:  release/uninstall.sh из того же релиза.\n\n"

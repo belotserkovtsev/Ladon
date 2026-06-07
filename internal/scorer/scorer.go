@@ -6,9 +6,10 @@ package scorer
 
 import (
 	"context"
-	"log"
+	"strconv"
 	"time"
 
+	"github.com/belotserkovtsev/ladon/internal/obs"
 	"github.com/belotserkovtsev/ladon/internal/storage"
 )
 
@@ -45,6 +46,8 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 		cfg.Interval = 10 * time.Minute
 	}
 
+	lg := obs.Logger("scorer")
+
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 
@@ -52,30 +55,36 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 		now := time.Now().UTC()
 		since := now.Add(-cfg.Window)
 
+		// Heartbeat: record that the scorer ran, so doctor/status can tell a
+		// stalled scorer from a quiet one.
+		_ = store.SetMetaTime(ctx, "last_scorer_run_at", now)
+
 		hots, err := store.ListHotEntries(ctx, now)
 		if err != nil {
-			log.Printf("scorer: list hot: %v", err)
+			lg.Error("list hot failed", "err", err)
 			return
 		}
 		promoted := 0
 		for _, d := range hots {
 			blocks, err := store.CountBlockedVerdicts(ctx, d, since)
 			if err != nil {
-				log.Printf("scorer: count verdicts %q: %v", d, err)
+				lg.Error("count verdicts failed", "domain", d, "err", err)
 				continue
 			}
 			if blocks < cfg.PromoteThreshold {
 				continue
 			}
 			if err := store.PromoteCache(ctx, d, "repeated_block", now); err != nil {
-				log.Printf("scorer: promote %q: %v", d, err)
+				lg.Error("promote failed", "domain", d, "err", err)
 				continue
 			}
 			promoted++
 		}
 		if promoted > 0 {
-			log.Printf("scorer: promoted %d hot → cache (window=%s threshold=%d)",
-				promoted, cfg.Window, cfg.PromoteThreshold)
+			lg.Info("promoted hot → cache",
+				"count", promoted, "window", cfg.Window.String(), "threshold", cfg.PromoteThreshold)
+			_ = store.SetMetaTime(ctx, "last_promote_at", now)
+			_ = store.SetMeta(ctx, "last_promote_count", strconv.Itoa(promoted))
 		}
 	}
 
