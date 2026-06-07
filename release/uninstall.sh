@@ -46,6 +46,9 @@ ipset save > /etc/iptables/ipsets 2>/dev/null || true
 log "removing ladon-manual.conf"
 rm -f /etc/dnsmasq.d/ladon-manual.conf
 
+log "removing CLI wrapper"
+rm -f /usr/local/bin/ladon
+
 log "removing $LADON_PREFIX and $LADON_CONFIG_DIR"
 rm -rf "$LADON_PREFIX" "$LADON_CONFIG_DIR"
 

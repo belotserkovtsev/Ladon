@@ -275,6 +275,18 @@ install -m 0644 "$SRC/config.yaml.example" "$LADON_CONFIG_DIR/config.yaml.exampl
 install -m 0644 "$SRC/extensions/"*.txt "$LADON_PREFIX/extensions/"
 ok "бинарь → $LADON_PREFIX/ladon"
 
+# CLI wrapper on PATH so `ladon doctor` / `status` / `why` work from anywhere
+# against the installed db/config. systemd calls the binary directly; this is
+# only for interactive operator use.
+cat > /usr/local/bin/ladon <<EOF
+#!/bin/sh
+# ladon CLI wrapper (installed by install.sh) — points operator commands at the
+# installed database and config. The systemd unit calls the binary directly.
+exec ${LADON_PREFIX}/ladon -db ${LADON_PREFIX}/state/engine.db -config ${LADON_CONFIG_DIR}/config.yaml "\$@"
+EOF
+chmod +x /usr/local/bin/ladon
+ok "команда ladon → /usr/local/bin/ladon"
+
 if [[ $FRESH == 1 ]]; then
   write_config
   ok "конфиг → $LADON_CONFIG_DIR/config.yaml"
