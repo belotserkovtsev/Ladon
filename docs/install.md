@@ -203,16 +203,18 @@ ipset ladon_engine: +5 -0 (total 5, etlds expanded 1)
 
 ### 5. Проверить, что работает
 
-Быстрее всего — встроенная диагностика (сама ходит по всему конвейеру и
-говорит, где первое порванное звено):
+Быстрее всего это встроенная диагностика: она сама проходит по всему конвейеру
+и показывает, где первое порванное звено.
 
 ```bash
-sudo ladon -db /opt/ladon/state/engine.db doctor   # health одной командой; код выхода 0/1/2
-ladon -db /opt/ladon/state/engine.db status        # снимок без прав
-ladon -db /opt/ladon/state/engine.db why rutracker.org   # почему домен (не) в туннеле
+sudo ladon -db /opt/ladon/state/engine.db doctor         # полная проверка; код выхода 0/1/2
+ladon -db /opt/ladon/state/engine.db status              # снимок состояния, без прав
+ladon -db /opt/ladon/state/engine.db why rutracker.org   # почему домен идёт (или не идёт) в туннель
 ```
 
-Вручную, если нужно копнуть в БД:
+Что значат эти команды и их вывод, подробнее в [конфигурации](configuration.md#диагностика).
+
+Если хочешь копнуть в базу руками:
 
 ```bash
 # Сколько доменов и в каком состоянии
