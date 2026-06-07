@@ -455,9 +455,8 @@ func (r Report) Render(w io.Writer) {
 	// Footer / headline.
 	switch r.Verdict {
 	case StatusOK:
-		fmt.Fprintln(w, "Ладон в порядке. Если сайты всё равно не работают — причина НИЖЕ ладона")
-		fmt.Fprintln(w, "(туннель / exit-нода / DPI), это вне зоны ладона. Проверь: `wg show`, что туннель")
-		fmt.Fprintln(w, "поднят и есть свежий handshake, и что exit-нода доступна.")
+		fmt.Fprintln(w, "Ладон в порядке: свою часть он отработал. Если сайты всё равно не")
+		fmt.Fprintln(w, "открываются, причина не в ладоне.")
 	case StatusFail:
 		if fb := r.firstBroken(); fb != nil {
 			fmt.Fprintf(w, "ПЕРВОЕ ПОРВАННОЕ ЗВЕНО: %s — %s.\n", fb.Stage, fb.Title)

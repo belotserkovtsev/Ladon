@@ -44,8 +44,8 @@ func TestRenderHealthyFooter(t *testing.T) {
 	if !strings.Contains(out, "🟢 ЗДОРОВ") {
 		t.Errorf("missing healthy headline: %q", out)
 	}
-	if !strings.Contains(out, "НИЖЕ ладона") {
-		t.Errorf("healthy report should point downstream: %q", out)
+	if !strings.Contains(out, "причина не в ладоне") {
+		t.Errorf("healthy report should say the cause is outside ladon: %q", out)
 	}
 }
 
