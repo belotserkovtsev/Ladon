@@ -591,12 +591,16 @@ func statusBody(ctx context.Context, store *storage.Store, st ui.Style, w io.Wri
 	st.Section(w, "СВЕЖИЕ РЕШЕНИЯ · ушли в туннель")
 	if decs, err := store.RecentDecisions(ctx, 6); err == nil && len(decs) > 0 {
 		for _, d := range decs {
+			age := d.At
+			if t, valid, perr := storage.ParseTime(d.At); perr == nil && valid {
+				age = ago(now.Sub(t))
+			}
 			tier := st.Green(ui.Pad(d.Tier, 6))
 			if d.Tier == "hot" {
 				tier = st.Yellow(ui.Pad(d.Tier, 6))
 			}
 			fmt.Fprintf(w, "   %s %s %s  %s\n",
-				st.Dim(hhmm(d.At)), tier, ui.Pad(d.Domain, 30), st.Dim(d.Reason))
+				st.Dim(ui.Pad(age, 5)), tier, ui.Pad(d.Domain, 30), st.Dim(shortReason(d.Reason)))
 		}
 	} else {
 		st.Info(w, "—", "пока ничего не туннелировалось")
@@ -642,12 +646,35 @@ func uptime(d time.Duration) string {
 	}
 }
 
-// hhmm extracts HH:MM from a storage-layout timestamp.
-func hhmm(ts string) string {
-	if len(ts) >= 16 {
-		return ts[11:16]
+// shortReason condenses a verbose hot/cache reason into a readable token: the
+// failure code (and "repeated_block" for scorer promotions), dropping the raw
+// error text and IPs that bloat the reason string.
+func shortReason(r string) string {
+	code := ""
+	if i := strings.Index(r, "local:"); i >= 0 {
+		rest := r[i+len("local:"):]
+		end := len(rest)
+		for j, ch := range rest {
+			if ch == ':' || ch == '|' || ch == ' ' {
+				end = j
+				break
+			}
+		}
+		code = rest[:end]
 	}
-	return ts
+	switch {
+	case strings.HasPrefix(r, "repeated_block"):
+		if code != "" {
+			return "repeated_block · " + code
+		}
+		return "repeated_block"
+	case code != "":
+		return code
+	case len([]rune(r)) > 44:
+		return string([]rune(r)[:44]) + "…"
+	default:
+		return r
+	}
 }
 
 // dbSize reports the engine.db (and WAL) size, or "" if it can't stat them.
