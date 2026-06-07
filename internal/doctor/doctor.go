@@ -411,7 +411,7 @@ func ipsetCheck(ctx context.Context, name, label string, expected int, haveExpec
 // verdict badge, then every check grouped by pipeline stage.
 func (r Report) Render(w io.Writer) {
 	st := ui.For(w)
-	st.Banner(w, "split-tunnel engine · doctor · "+orDash(r.Version))
+	st.Banner(w, ui.Subtitle("doctor", r.Version))
 
 	switch r.Verdict {
 	case StatusOK:

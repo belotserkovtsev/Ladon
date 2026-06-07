@@ -86,7 +86,12 @@ func main() {
 		if err := store.Init(ctx); err != nil {
 			fatal("init: %v", err)
 		}
-		fmt.Println("initialized:", *dbPath)
+		if st := ui.For(os.Stdout); st.Term() {
+			st.Banner(os.Stdout, ui.Subtitle("init-db", version))
+			fmt.Println("   " + st.Green("✔") + " база инициализирована: " + st.Dim(*dbPath))
+		} else {
+			fmt.Println("initialized:", *dbPath)
+		}
 
 	case "probe":
 		if len(args) < 2 {
@@ -119,9 +124,15 @@ func main() {
 		if err != nil {
 			fatal("observe: %v", err)
 		}
-		if obs == nil {
+		st := ui.For(os.Stdout)
+		switch {
+		case obs == nil && st.Term():
+			fmt.Println("   " + st.Dim("· пустой домен — пропущено"))
+		case obs == nil:
 			fmt.Println("(empty domain — skipped)")
-		} else {
+		case st.Term():
+			fmt.Println("   " + st.Green("✔") + " наблюдение записано: " + obs.Domain + st.Dim(" (peer="+obs.Peer+")"))
+		default:
 			fmt.Printf("observed %s (peer=%s)\n", obs.Domain, obs.Peer)
 		}
 
@@ -134,9 +145,23 @@ func main() {
 		if err != nil {
 			fatal("list: %v", err)
 		}
+		st := ui.For(os.Stdout)
+		term := st.Term()
+		if term {
+			st.Banner(os.Stdout, ui.Subtitle("list", version))
+		}
+		if term && len(doms) == 0 {
+			fmt.Println("   " + st.Dim("пусто"))
+		}
 		for _, d := range doms {
-			fmt.Printf("%-40s state=%-6s hits=%d last=%s\n",
-				d.Domain, d.State, d.HitCount, d.LastSeenAt)
+			if !term {
+				fmt.Printf("%-40s state=%-6s hits=%d last=%s\n",
+					d.Domain, d.State, d.HitCount, d.LastSeenAt)
+				continue
+			}
+			fmt.Printf("   %s %s  %s\n",
+				ui.Pad(d.Domain, 34), colorState(st, d.State),
+				st.Dim(fmt.Sprintf("×%d  %s", d.HitCount, d.LastSeenAt)))
 		}
 
 	case "tail":
@@ -153,8 +178,20 @@ func main() {
 		if err != nil {
 			fatal("hot: %v", err)
 		}
+		st := ui.For(os.Stdout)
+		term := st.Term()
+		if term {
+			st.Banner(os.Stdout, ui.Subtitle("hot", version))
+		}
+		if term && len(hots) == 0 {
+			fmt.Println("   " + st.Dim("hot-доменов нет"))
+		}
 		for _, h := range hots {
-			fmt.Println(h)
+			if term {
+				fmt.Println("   " + st.Green("✔") + " " + h)
+			} else {
+				fmt.Println(h)
+			}
 		}
 
 	case "status":
@@ -264,6 +301,29 @@ func pruneCmd(ctx context.Context, store *storage.Store, rest []string) {
 		before = t.UTC()
 	}
 
+	st := ui.For(os.Stdout)
+	if st.Term() {
+		st.Banner(os.Stdout, ui.Subtitle("prune", version))
+	}
+	// say marks a completed deletion, plan a dry-run preview line; both fall
+	// back to plain text when not on a terminal.
+	say := func(format string, a ...any) {
+		msg := fmt.Sprintf(format, a...)
+		if st.Term() {
+			fmt.Println("   " + st.Green("✔") + " " + msg)
+		} else {
+			fmt.Println(msg)
+		}
+	}
+	plan := func(format string, a ...any) {
+		msg := fmt.Sprintf(format, a...)
+		if st.Term() {
+			fmt.Println("   " + st.Dim("· "+msg))
+		} else {
+			fmt.Println(msg)
+		}
+	}
+
 	// Dry-run uses Count* helpers with the same WHERE shape as the prune,
 	// so the preview matches the real action exactly.
 	if *dryRun {
@@ -272,21 +332,21 @@ func pruneCmd(ctx context.Context, store *storage.Store, rest []string) {
 			if err != nil {
 				fatal("count cache: %v", err)
 			}
-			fmt.Printf("would delete %d row(s) from cache_entries\n", n)
+			plan("dry-run: удалилось бы %d из cache_entries", n)
 		}
 		if *hot {
 			n, err := store.CountHot(ctx, before)
 			if err != nil {
 				fatal("count hot: %v", err)
 			}
-			fmt.Printf("would delete %d row(s) from hot_entries\n", n)
+			plan("dry-run: удалилось бы %d из hot_entries", n)
 		}
 		if *probes {
 			n, err := store.CountProbes(ctx, before)
 			if err != nil {
 				fatal("count probes: %v", err)
 			}
-			fmt.Printf("would delete %d row(s) from probes\n", n)
+			plan("dry-run: удалилось бы %d из probes", n)
 		}
 		return
 	}
@@ -296,21 +356,21 @@ func pruneCmd(ctx context.Context, store *storage.Store, rest []string) {
 		if err != nil {
 			fatal("prune cache: %v", err)
 		}
-		fmt.Printf("deleted %d row(s) from cache_entries\n", n)
+		say("удалено %d из cache_entries", n)
 	}
 	if *hot {
 		n, err := store.PruneHot(ctx, before)
 		if err != nil {
 			fatal("prune hot: %v", err)
 		}
-		fmt.Printf("deleted %d row(s) from hot_entries\n", n)
+		say("удалено %d из hot_entries", n)
 	}
 	if *probes {
 		n, err := store.PruneProbes(ctx, before)
 		if err != nil {
 			fatal("prune probes: %v", err)
 		}
-		fmt.Printf("deleted %d row(s) from probes\n", n)
+		say("удалено %d из probes", n)
 	}
 	// Scrub domains rows whose exact domain or eTLD+1 matches a deny entry.
 	// These shouldn't be tracked at all (tailer skips future events for them
@@ -319,7 +379,7 @@ func pruneCmd(ctx context.Context, store *storage.Store, rest []string) {
 	if n, err := store.DeleteDeniedDomains(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "warn: delete denied domains: %v\n", err)
 	} else if n > 0 {
-		fmt.Printf("deleted %d denied domain row(s) from domains\n", n)
+		say("удалено %d denied-доменов из domains", n)
 	}
 	// After prune, domains stuck in hot/cache/ignore without a backing row are
 	// orphaned — flip them to 'new' so the engine re-probes from scratch on
@@ -327,7 +387,7 @@ func pruneCmd(ctx context.Context, store *storage.Store, rest []string) {
 	if n, err := store.ResetOrphanedDomains(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "warn: reset orphaned domains: %v\n", err)
 	} else if n > 0 {
-		fmt.Printf("reset %d orphaned domain(s) to state='new'\n", n)
+		say("сброшено %d orphaned-доменов в state=new", n)
 	}
 }
 
@@ -481,7 +541,7 @@ func statusCmd(ctx context.Context, store *storage.Store) {
 	counts, _ := store.CountDomainsByState(ctx)
 
 	st := ui.For(os.Stdout)
-	st.Banner(os.Stdout, "split-tunnel engine · status · "+version)
+	st.Banner(os.Stdout, ui.Subtitle("status", version))
 
 	st.Section(os.Stdout, "ДВИЖОК")
 	if r, ok := meta["version"]; ok {
@@ -588,7 +648,7 @@ func whyCmd(ctx context.Context, store *storage.Store, domain string) {
 	if err != nil {
 		fatal("why: %v", err)
 	}
-	st.Banner(os.Stdout, "split-tunnel engine · why · "+domain)
+	st.Banner(os.Stdout, ui.Subtitle("why", version))
 	if !ok {
 		fmt.Println("  " + st.Dim(domain+" не отслеживается (нет в базе)."))
 		return
@@ -679,6 +739,22 @@ func dash(s string) string {
 		return "-"
 	}
 	return s
+}
+
+// colorState tints a padded domain-state token by what it means for the domain:
+// tunneled tiers (cache/hot/covered) green, ignore dim, new yellow.
+func colorState(st ui.Style, state string) string {
+	pad := ui.Pad(state, 8)
+	switch state {
+	case "cache", "hot", "covered":
+		return st.Green(pad)
+	case "ignore":
+		return st.Dim(pad)
+	case "new":
+		return st.Yellow(pad)
+	default:
+		return pad
+	}
 }
 
 func toStorageResult(r prober.Result) storage.ProbeResult {

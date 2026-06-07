@@ -45,12 +45,32 @@ const bannerArt = `██╗      █████╗ ██████╗  █�
 ███████╗██║  ██║██████╔╝╚██████╔╝██║ ╚████║
 ╚══════╝╚═╝  ╚═╝╚═════╝  ╚═════╝ ╚═╝  ╚═══╝`
 
+// Tagline is ladon's one-line descriptor shown under the wordmark.
+const Tagline = "anti-dpi engine"
+
+// Subtitle builds the dim line under the banner:
+// "anti-dpi engine · <cmd> · <version>".
+func Subtitle(cmd, version string) string {
+	if version == "" {
+		version = "dev"
+	}
+	return Tagline + " · " + cmd + " · " + version
+}
+
 // Style carries whether color is enabled for a particular writer.
 type Style struct{ color bool }
 
 // For returns a Style for w. Color is on only when w is a character device
 // (a terminal) and NO_COLOR is unset.
 func For(w io.Writer) Style { return Style{color: colorEnabled(w)} }
+
+// Term reports whether decorated output (color, banner) is active — i.e. we're
+// writing to a real terminal. Data commands gate their banner on this so pipes
+// and greps stay clean.
+func (s Style) Term() bool { return s.color }
+
+// Pad right-pads s to n display columns (rune-aware; our glyphs are width 1).
+func Pad(s string, n int) string { return padRight(s, n) }
 
 func colorEnabled(w io.Writer) bool {
 	if os.Getenv("NO_COLOR") != "" {
