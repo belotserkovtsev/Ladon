@@ -9,7 +9,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"os/signal"
 	"strings"
+	"syscall"
 	"unicode/utf8"
 )
 
@@ -63,6 +66,11 @@ type Style struct{ color bool }
 // For returns a Style for w. Color is on only when w is a character device
 // (a terminal) and NO_COLOR is unset.
 func For(w io.Writer) Style { return Style{color: colorEnabled(w)} }
+
+// Forced returns a Style with color explicitly set — used to render a report
+// body into a buffer for the full-screen view, where the eventual destination
+// is a terminal even though the buffer isn't.
+func Forced(color bool) Style { return Style{color: color} }
 
 // Term reports whether decorated output (color, banner) is active — i.e. we're
 // writing to a real terminal. Data commands gate their banner on this so pipes
@@ -182,4 +190,98 @@ func padRight(s string, n int) string {
 		return s + " "
 	}
 	return s + strings.Repeat(" ", n-r)
+}
+
+// Screen shows body on the alternate screen buffer, framed to fill the
+// terminal: a full-width title bar on top, the body below, a status bar pinned
+// to the bottom row; it waits for one keypress, then restores the previous
+// screen with no scrollback clutter. Terminal/Linux only — if /dev/tty can't be
+// opened (piped, non-tty, Windows) it just prints the body inline and returns.
+func Screen(title, body string) {
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		fmt.Print(body)
+		return
+	}
+	defer tty.Close()
+
+	st := Style{color: true}
+	rows, cols := termSize(tty)
+
+	// Single-keypress input: no echo, no line buffering.
+	saved, _ := sttyOut(tty, "-g")
+	if saved != "" {
+		_ = sttyRun(tty, "-echo", "-icanon", "min", "1", "time", "0")
+	}
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		fmt.Fprint(tty, "\x1b[?25h\x1b[?1049l") // show cursor, leave alt screen
+		if saved != "" {
+			_ = sttyRun(tty, saved)
+		}
+	}
+	// Restore on Ctrl-C / SIGTERM too, not just normal return.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	go func() { <-sigs; restore(); os.Exit(130) }()
+	defer func() { signal.Stop(sigs); restore() }()
+
+	fmt.Fprint(tty, "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H") // enter alt, hide cursor, clear, home
+	fmt.Fprintln(tty, st.bar("┌─", " LADON · "+title+" ", "─┐", cols))
+
+	lines := strings.Split(strings.TrimRight(body, "\n"), "\n")
+	maxBody := rows - 2
+	for i, ln := range lines {
+		if i >= maxBody {
+			break
+		}
+		fmt.Fprintln(tty, ln)
+	}
+
+	fmt.Fprintf(tty, "\x1b[%d;1H%s", rows, st.bar("└─", " q / Enter — выход ", "─┘", cols))
+
+	buf := make([]byte, 1)
+	_, _ = tty.Read(buf)
+}
+
+// bar builds a full-width rule: left corner + a tinted label + fill + right
+// corner, padded to cols columns.
+func (s Style) bar(left, label, right string, cols int) string {
+	fillN := cols - utf8.RuneCountInString(left+label+right)
+	if fillN < 0 {
+		fillN = 0
+	}
+	return s.Cyan(left) + s.head(label) + s.Cyan(strings.Repeat("─", fillN)+right)
+}
+
+// termSize asks the tty for its size via stty, defaulting to 24x80.
+func termSize(tty *os.File) (rows, cols int) {
+	rows, cols = 24, 80
+	if out, err := sttyOut(tty, "size"); err == nil {
+		fmt.Sscanf(out, "%d %d", &rows, &cols)
+	}
+	if rows < 5 {
+		rows = 24
+	}
+	if cols < 20 {
+		cols = 80
+	}
+	return rows, cols
+}
+
+func sttyOut(tty *os.File, args ...string) (string, error) {
+	cmd := exec.Command("stty", args...)
+	cmd.Stdin = tty
+	out, err := cmd.Output()
+	return strings.TrimSpace(string(out)), err
+}
+
+func sttyRun(tty *os.File, args ...string) error {
+	cmd := exec.Command("stty", args...)
+	cmd.Stdin = tty
+	return cmd.Run()
 }

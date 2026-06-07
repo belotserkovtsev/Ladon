@@ -50,9 +50,10 @@ commands:
   prune  [-cache] [-hot] [-probes] [-before <ISO date>] [-dry-run]
   tail [-from-start] <logfile>
   run  [-from-start] [-config PATH] <logfile>
-  status                  one-glance health snapshot (engine + counts)
-  doctor [-config PATH]   full diagnosis: walks the pipeline, finds the first break
-  why <domain>            decision trail for one domain (probes, state, ipset)`)
+  status [-screen]        what ladon is doing: activity, recent decisions, footprint
+  doctor [-config PATH] [-screen]  diagnosis: walks the pipeline, finds the first break
+  why <domain> [-screen]  decision trail for one domain (probes, state, ipset)
+                          (-screen / -f: full-screen view, any key exits)`)
 }
 
 func main() {
@@ -195,16 +196,17 @@ func main() {
 		}
 
 	case "status":
-		statusCmd(ctx, store, *dbPath)
+		statusCmd(ctx, store, *dbPath, hasScreenFlag(args[1:]))
 
 	case "doctor":
 		doctorCmd(ctx, store, *configPath, args[1:])
 
 	case "why":
-		if len(args) < 2 {
+		domain := firstNonFlag(args[1:])
+		if domain == "" {
 			fatal("why: missing domain")
 		}
-		whyCmd(ctx, store, args[1])
+		whyCmd(ctx, store, domain, hasScreenFlag(args[1:]))
 
 	default:
 		fatal("unknown command: %s", args[0])
@@ -532,9 +534,15 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 // statusCmd shows what ladon has been doing — activity, recent tunnel
 // decisions, failure-code mix, and the tunnel footprint. Distinct from doctor
 // (which judges health): status is read-only insight, no verdict, no env probe.
-func statusCmd(ctx context.Context, store *storage.Store, dbPath string) {
+func statusCmd(ctx context.Context, store *storage.Store, dbPath string, screen bool) {
 	if err := store.Init(ctx); err != nil {
 		fatal("status: %v", err)
+	}
+	if screen && ui.For(os.Stdout).Term() {
+		var b strings.Builder
+		statusBody(ctx, store, ui.Forced(true), &b, dbPath)
+		ui.Screen(ui.Subtitle("status", version), b.String())
+		return
 	}
 	st := ui.For(os.Stdout)
 	st.Banner(os.Stdout, ui.Subtitle("status", version))
@@ -710,6 +718,9 @@ func doctorCmd(ctx context.Context, store *storage.Store, configPath string, res
 	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
 	cfgFlag := fs.String("config", "", "path to YAML config (for ipset names)")
 	jsonOut := fs.Bool("json", false, "emit JSON instead of the human report")
+	var screen bool
+	fs.BoolVar(&screen, "screen", false, "show full-screen (alternate buffer), wait for a key")
+	fs.BoolVar(&screen, "f", false, "alias for -screen")
 	_ = fs.Parse(rest)
 	if *cfgFlag != "" {
 		configPath = *cfgFlag
@@ -734,11 +745,14 @@ func doctorCmd(ctx context.Context, store *storage.Store, configPath string, res
 		ProbeService:    true,
 		ProbeIpset:      true,
 	})
-	if *jsonOut {
+	switch {
+	case *jsonOut:
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(rep)
-	} else {
+	case screen && ui.For(os.Stdout).Term():
+		ui.Screen(ui.Subtitle("doctor", version), rep.ScreenBody())
+	default:
 		rep.Render(os.Stdout)
 	}
 	os.Exit(rep.Exit)
@@ -747,44 +761,54 @@ func doctorCmd(ctx context.Context, store *storage.Store, configPath string, res
 // whyCmd prints the decision trail for one domain: current state, backing tier,
 // observed IPs, and the recent probe history — answering "why is X (not)
 // tunneled?" from the durable record.
-func whyCmd(ctx context.Context, store *storage.Store, domain string) {
+func whyCmd(ctx context.Context, store *storage.Store, domain string, screen bool) {
 	if err := store.Init(ctx); err != nil {
 		fatal("why: %v", err)
 	}
+	if screen && ui.For(os.Stdout).Term() {
+		var b strings.Builder
+		whyBody(ctx, store, ui.Forced(true), &b, domain)
+		ui.Screen(ui.Subtitle("why · "+domain, version), b.String())
+		return
+	}
 	st := ui.For(os.Stdout)
+	st.Banner(os.Stdout, ui.Subtitle("why", version))
+	whyBody(ctx, store, st, os.Stdout, domain)
+}
+
+func whyBody(ctx context.Context, store *storage.Store, st ui.Style, w io.Writer, domain string) {
 	d, ok, err := store.GetDomain(ctx, domain)
 	if err != nil {
 		fatal("why: %v", err)
 	}
-	st.Banner(os.Stdout, ui.Subtitle("why", version))
 	if !ok {
-		fmt.Println("  " + st.Dim(domain+" не отслеживается (нет в базе)."))
+		fmt.Fprintln(w, "  "+st.Dim(domain+" не отслеживается (нет в базе)."))
 		return
 	}
 
-	st.Section(os.Stdout, "ДОМЕН")
-	st.Info(os.Stdout, "домен", d.Domain)
-	st.Info(os.Stdout, "eTLD+1", dash(d.ETLDPlusOne))
-	st.Info(os.Stdout, "состояние", d.State)
-	st.Info(os.Stdout, "замечен", dash(d.FirstSeenAt)+" … "+dash(d.LastSeenAt)+" (×"+strconv.Itoa(d.HitCount)+")")
+	st.Section(w, "ДОМЕН")
+	st.Info(w, "домен", d.Domain)
+	st.Info(w, "eTLD+1", dash(d.ETLDPlusOne))
+	st.Info(w, "состояние", d.State)
+	st.Info(w, "замечен", dash(d.FirstSeenAt)+" … "+dash(d.LastSeenAt)+" (×"+strconv.Itoa(d.HitCount)+")")
 	if d.CooldownUntil != "" {
-		st.Info(os.Stdout, "cooldown", "до "+d.CooldownUntil)
+		st.Info(w, "cooldown", "до "+d.CooldownUntil)
 	}
 	if exp, reason, ok, _ := store.HotEntryFor(ctx, domain); ok {
-		st.Info(os.Stdout, "hot", "до "+exp+" — "+dash(reason))
+		st.Info(w, "hot", "до "+exp+" — "+dash(reason))
 	}
 	if at, reason, ok, _ := store.CacheEntryFor(ctx, domain); ok {
-		st.Info(os.Stdout, "cache", "с "+at+" — "+dash(reason))
+		st.Info(w, "cache", "с "+at+" — "+dash(reason))
 	}
 	if ips, _ := store.LookupAllIPs(ctx, domain); len(ips) > 0 {
-		st.Info(os.Stdout, "IP ("+strconv.Itoa(len(ips))+")", strings.Join(ips, ", "))
+		st.Info(w, "IP ("+strconv.Itoa(len(ips))+")", strings.Join(ips, ", "))
 	}
-	fmt.Println()
+	fmt.Fprintln(w)
 
-	st.Section(os.Stdout, "ПОСЛЕДНИЕ ПРОБЫ")
+	st.Section(w, "ПОСЛЕДНИЕ ПРОБЫ")
 	probes, _ := store.RecentProbesForDomain(ctx, domain, 10)
 	if len(probes) == 0 {
-		st.Info(os.Stdout, "—", "проб ещё не было")
+		st.Info(w, "—", "проб ещё не было")
 	} else {
 		for _, p := range probes {
 			dns, tcp, tls, http := p.Flags()
@@ -792,26 +816,26 @@ func whyCmd(ctx context.Context, store *storage.Store, domain string) {
 				p.CreatedAt, dns, tcp, tls, http, dash(p.FailureReason))
 			switch p.Verdict {
 			case "blocked":
-				fmt.Println("   " + st.Red("✖") + " " + line + "  " + st.Red("blocked"))
+				fmt.Fprintln(w, "   "+st.Red("✖")+" "+line+"  "+st.Red("blocked"))
 			case "clear":
-				fmt.Println("   " + st.Green("✔") + " " + line + "  " + st.Green("clear"))
+				fmt.Fprintln(w, "   "+st.Green("✔")+" "+line+"  "+st.Green("clear"))
 			default:
-				fmt.Println("   " + st.Dim("·") + " " + line)
+				fmt.Fprintln(w, "   "+st.Dim("·")+" "+line)
 			}
 		}
 	}
-	fmt.Println()
+	fmt.Fprintln(w)
 
 	switch d.State {
 	case "hot", "cache":
-		fmt.Println("  " + st.Green("▸ туннелируется") + st.Dim(" (входит в ladon_engine)."))
+		fmt.Fprintln(w, "  "+st.Green("▸ туннелируется")+st.Dim(" (входит в ladon_engine)."))
 	case "covered":
-		fmt.Println("  " + st.Green("▸ туннелируется") + st.Dim(" через семью "+dash(d.ETLDPlusOne)+" (covered — отдельно не пробится)."))
+		fmt.Fprintln(w, "  "+st.Green("▸ туннелируется")+st.Dim(" через семью "+dash(d.ETLDPlusOne)+" (covered — отдельно не пробится)."))
 	case "ignore":
-		fmt.Println("  " + st.Yellow("▸ не туннелируется") + st.Dim(" — последняя проба сочла путь рабочим (clear)."))
-		fmt.Println("    " + st.Dim("если сайт реально не открывается — возможна L7/cert-слепота; добавь в manual-allow."))
+		fmt.Fprintln(w, "  "+st.Yellow("▸ не туннелируется")+st.Dim(" — последняя проба сочла путь рабочим (clear)."))
+		fmt.Fprintln(w, "    "+st.Dim("если сайт реально не открывается — возможна L7/cert-слепота; добавь в manual-allow."))
 	case "new":
-		fmt.Println("  " + st.Dim("▸ ещё не классифицирован (ждёт пробы)."))
+		fmt.Fprintln(w, "  "+st.Dim("▸ ещё не классифицирован (ждёт пробы)."))
 	}
 }
 
@@ -847,6 +871,27 @@ func dash(s string) string {
 		return "-"
 	}
 	return s
+}
+
+// hasScreenFlag reports whether the args request full-screen output.
+func hasScreenFlag(args []string) bool {
+	for _, a := range args {
+		switch a {
+		case "--screen", "-screen", "-f", "--full":
+			return true
+		}
+	}
+	return false
+}
+
+// firstNonFlag returns the first positional (non-dash) argument, or "".
+func firstNonFlag(args []string) string {
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			return a
+		}
+	}
+	return ""
 }
 
 // colorState tints a padded domain-state token by what it means for the domain:

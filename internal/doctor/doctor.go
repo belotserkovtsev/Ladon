@@ -16,6 +16,7 @@ import (
 	"io"
 	"os/exec"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/belotserkovtsev/ladon/internal/ipset"
@@ -412,7 +413,20 @@ func ipsetCheck(ctx context.Context, name, label string, expected int, haveExpec
 func (r Report) Render(w io.Writer) {
 	st := ui.For(w)
 	st.Banner(w, ui.Subtitle("doctor", r.Version))
+	r.body(w, st)
+}
 
+// ScreenBody renders the report without the banner, color forced on, for the
+// full-screen view (the title bar there carries the identity instead).
+func (r Report) ScreenBody() string {
+	var b strings.Builder
+	r.body(&b, ui.Forced(true))
+	return b.String()
+}
+
+// body renders the badge, the per-stage checks, and the footer with the given
+// style — shared by the inline and full-screen renderers.
+func (r Report) body(w io.Writer, st ui.Style) {
 	switch r.Verdict {
 	case StatusOK:
 		st.Badge(w, ui.LevelOK, "ЗДОРОВ · ладон работает штатно")
