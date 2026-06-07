@@ -1,72 +1,83 @@
-# Установка ladon
+# Установка
 
 ← [README](../README.md) · [конфигурация](configuration.md) · [extensions](extensions.md)
 
-## TL;DR — установка одной командой (Debian/Ubuntu)
+Ладон ставится одной командой. Дальше он сам находит заблокированные домены и
+складывает их адреса в списки в ядре (`ipset`). Одно ты делаешь сам: связываешь
+эти списки со своей маршрутизацией, чтобы помеченный трафик уходил в туннель.
+Ладон в чужую маршрутизацию не лезет, только наполняет списки.
+
+## Быстрая установка (Debian/Ubuntu)
 
 ```bash
 curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/install.sh \
   | sudo bash
 ```
 
-Скрипт сам:
-- определит архитектуру (amd64/arm64) и скачает последнюю версию + проверит sha256;
-- поставит зависимости (`ipset`, `sqlite3`, `dnsmasq`);
-- разложит бинарь, systemd-unit, конфиги и extensions в `/opt/ladon` и `/etc/ladon`;
-- создаст ipset'ы `ladon_engine` + `ladon_manual` + `ladon_cidr` с правильными опциями + сохранит ipset state в `/etc/iptables/ipsets`;
-- установит CAP_NET_ADMIN drop-in для dnsmasq (нужно для нативных `ipset=` директив);
-- инициализирует БД, перезапустит dnsmasq и запустит ladon;
-- напечатает example iptables/routing-сетапа который **тебе нужно сделать руками**.
+Скрипт всё делает сам:
 
-**Что скрипт НЕ делает:** не трогает iptables / ip rule / routing tables.
-Это зона ответственности оператора — только ты знаешь какой у тебя tunnel-интерфейс, fwmark-схема, peer-subnet и т.д. Ладон просто наполняет ipset'ы; куда направлять трафик при попадании destination IP в эти ipset'ы — твой выбор. Скрипт в конце печатает example для типичного WireGuard split-tunnel сетапа.
+- определяет архитектуру (amd64/arm64), скачивает последнюю версию и сверяет sha256;
+- ставит зависимости (`ipset`, `sqlite3`, `dnsmasq`);
+- раскладывает бинарь, systemd-юнит, конфиги и подборки доменов по `/opt/ladon` и `/etc/ladon`;
+- создаёт списки `ladon_engine`, `ladon_manual`, `ladon_cidr` и сохраняет их, чтобы пережили перезагрузку;
+- выдаёт dnsmasq право добавлять адреса в списки (capability `CAP_NET_ADMIN`);
+- создаёт базу, перезапускает dnsmasq и запускает ладон;
+- печатает пример правил маршрутизации, которые **тебе нужно дописать руками**.
 
-**Обновление:** тот же `install.sh` повторно. Скрипт идемпотентен: подтянет latest-версию с GitHub, перезапишет бинарь / systemd-unit / extensions, **сохранит** `config.yaml` и `manual-{allow,deny}.txt`, перезапустит ladon. Подходит и для первой установки и для апгрейда. Схему БД мигрировать руками не нужно — `run` сам прогоняет миграции на старте (идемпотентно, по `PRAGMA user_version`): старая БД доводится до актуальной формы автоматически.
+Чего скрипт **не** делает: не трогает `iptables`, `ip rule` и таблицы
+маршрутизации. Это твоя зона: только ты знаешь, как называется твой туннельный
+интерфейс и как у тебя устроены метки и маршруты. Ладон лишь наполняет списки;
+куда направить трафик, попавший в эти списки, решаешь ты. Пример для типичного
+WireGuard-туннеля скрипт печатает в конце.
 
-Удаление:
+**Обновление.** Запусти тот же `install.sh` ещё раз. Он идемпотентен: подтянет
+свежую версию, перезапишет бинарь, юнит и подборки, но **сохранит** твой
+`config.yaml` и `manual-allow/deny.txt`, и перезапустит ладон. Схему базы руками
+мигрировать не нужно: `run` сам догоняет её на старте.
+
+**Удаление:**
 
 ```bash
 curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/uninstall.sh \
   | sudo bash
 ```
 
-Опциональные env-переменные (для нестандартных сетапов): `IPSET_ENGINE`,
-`IPSET_MANUAL`, `LADON_PREFIX`, `LADON_CONFIG_DIR` — см. дефолты в
+Для нестандартных путей есть переменные окружения: `IPSET_ENGINE`, `IPSET_MANUAL`,
+`LADON_PREFIX`, `LADON_CONFIG_DIR`; дефолты смотри в
 [`release/install.sh`](../release/install.sh).
 
 ---
 
 ## Установка вручную
 
-Если хочешь понимать что происходит, или у тебя нестандартный сетап — ниже
-пошаговая версия того же что делает `install.sh`. Поддерживается Debian/Ubuntu
-с WireGuard, dnsmasq и fwmark-based routing через туннель наружу
-(stun0 / wg1 / hysteria / etc.).
+Если хочешь понимать, что происходит под капотом, или у тебя нестандартная сеть,
+ниже те же шаги вручную. Расчёт на Debian/Ubuntu, где уже есть туннель наружу,
+dnsmasq и маршрутизация по меткам.
 
-## 1. Зависимости
+### 1. Зависимости
 
 ```bash
 apt update
 apt install ipset iptables-persistent sqlite3
 ```
 
-Убедись что dnsmasq настроен с детальным логом. В `/etc/dnsmasq.d/gateway.conf`
-должно быть что-то вроде:
+Дальше нужен подробный лог dnsmasq: из него ладон и узнаёт, какие домены
+запрашивали. В `/etc/dnsmasq.d/gateway.conf` добавь:
 
 ```
 log-queries=extra
 log-facility=/var/log/dnsmasq.log
 ```
 
-После изменения — `systemctl restart dnsmasq`, проверь `tail -f /var/log/dnsmasq.log`:
-должны появляться строки вида `query[A] domain from peer_ip` и `reply domain is ip`.
+После правки запусти `systemctl restart dnsmasq`. Проверь
+`tail -f /var/log/dnsmasq.log`: там должны идти строки вида
+`query[A] domain from ...` и `reply domain is ...`.
 
-## 2. Установка бинаря
+### 2. Бинарь
 
 ```bash
-ARCH=amd64    # или arm64 для Raspberry Pi / ARM-серверов
-# Возьмём последнюю опубликованную версию.
-# Можно зафиксировать конкретную — например, TAG=v0.2.0
+ARCH=amd64    # или arm64 для Raspberry Pi и ARM-серверов
+# Берём последнюю версию (или закрепи свою через TAG=v1.4.0)
 TAG=$(curl -sSL "https://api.github.com/repos/belotserkovtsev/ladon/releases/latest" \
   | grep '"tag_name":' | head -1 | cut -d'"' -f4)
 echo "installing $TAG for $ARCH"
@@ -75,61 +86,64 @@ mkdir -p /opt/ladon/state /etc/ladon
 cd /tmp
 curl -L -O "https://github.com/belotserkovtsev/ladon/releases/download/${TAG}/ladon-linux-${ARCH}.tar.gz"
 tar xzf ladon-linux-${ARCH}.tar.gz
-
-# Распаковался каталог ladon-linux-${ARCH}-${TAG}/
 cd ladon-linux-${ARCH}-${TAG}
 
-install -m 0755 ladon             /opt/ladon/ladon
-install -m 0644 ladon.service     /etc/systemd/system/
-install -m 0644 manual-allow.txt.example /etc/ladon/manual-allow.txt
-install -m 0644 manual-deny.txt.example  /etc/ladon/manual-deny.txt
+install -m 0755 ladon                     /opt/ladon/ladon
+install -m 0644 ladon.service             /etc/systemd/system/
+install -m 0644 manual-allow.txt.example  /etc/ladon/manual-allow.txt
+install -m 0644 manual-deny.txt.example   /etc/ladon/manual-deny.txt
 
-# Extensions — преднастроенные allow-списки (ai, twitch, ...). Опциональны,
-# подключаются по имени через config.yaml. Полный справочник: docs/extensions.md.
+# Подборки доменов (ai, twitch, ...). Необязательны, включаются по имени
+# в config.yaml. Подробнее в docs/extensions.md.
 install -d /opt/ladon/extensions
 install -m 0644 extensions/*.txt /opt/ladon/extensions/
 ```
 
-## 3. Подготовка netfilter
+### 3. Три списка в ядре
 
 ```bash
-# Три ipset'а с разной ответственностью:
-#   ladon_engine — управляется ладоном из probe-driven discovery (hot/cache)
-#   ladon_manual — populates dnsmasq из ladon-manual.conf (manual-allow + extensions)
-#   ladon_cidr   — статический hash:net для CIDR-блоков из extensions
-#                  (Telegram MTProto, Discord voice, etc.) — нужен только если
-#                  включаете extensions, объявляющие CIDR-диапазоны
+# У каждого списка своя роль:
+#   ladon_engine: то, что ладон нашёл пробами (hot/cache)
+#   ladon_manual: то, что наполняет dnsmasq (manual-allow + allow-подборки)
+#   ladon_cidr:   диапазоны адресов из подборок (Telegram, голос Discord);
+#                 нужен, только если включаешь подборки с диапазонами
 ipset create ladon_engine hash:ip  family inet maxelem 65536
 ipset create ladon_manual hash:ip  family inet maxelem 65536 timeout 86400
 ipset create ladon_cidr   hash:net family inet maxelem 65536
+```
 
-# Три iptables-правила в WG_ROUTE — все три ведут в один и тот же fwmark 0x1.
-# Пример для pipeline, где peer 10.10.0.2 → fwmark 0x1 → tunnel:
+Теперь надо помечать трафик, который идёт на адреса из этих списков, чтобы
+маршрутизация увела его в туннель. Метка `0x1` ниже это пример:
+
+```bash
 for SET in ladon_engine ladon_manual ladon_cidr; do
-  iptables -t mangle -A WG_ROUTE \
-    -s 10.10.0.2/32 \
+  iptables -t mangle -A PREROUTING \
     -m set --match-set "$SET" dst \
     -j MARK --set-mark 0x1
 done
 
-# Сохранить для переживания ребута
+# Сохранить, чтобы пережило перезагрузку
 mkdir -p /etc/iptables
 iptables-save > /etc/iptables/rules.v4
 ipset save    > /etc/iptables/ipsets
 systemctl enable netfilter-persistent
 ```
 
-**Почему разные ipset'ы:**
+(Хочешь гнать в туннель только часть клиентов: добавь к правилу
+`-s <подсеть-клиента>`.)
 
-- `ladon_engine` — динамический, ладон периодически пересоздаёт его на основе hot/cache → reconcile удаляет лишнее.
-- `ladon_manual` — populated dnsmasq'ом синхронно при резолве через `ipset=/domain/ladon_manual` директивы, которые ладон записывает в `/etc/dnsmasq.d/ladon-manual.conf`. Если бы он был одним ipset'ом с `ladon_engine`, ладон при reconcile удалял бы IP-шки которые добавил dnsmasq и про которые ладон не знает. Timeout=86400 — естественная эвикция стейл-IP'шек, dnsmasq refresh'ит timeout при каждом резолве.
-- `ladon_cidr` — `hash:net` для CIDR-диапазонов из extensions (например, Telegram MTProto data-plane на `91.108.0.0/16`). Заполняется ладоном при старте из extension-файлов; матчится iptables на уровне dst IP, минуя DNS.
+**Почему три списка, а не один:**
 
-### Capability для dnsmasq (обязательно)
+- `ladon_engine` ладон периодически пересобирает сам по своим находкам, лишнее из него вычищается.
+- `ladon_manual` наполняет dnsmasq прямо в момент резолва, через директивы `ipset=/домен/ladon_manual`, которые ладон пишет в `/etc/dnsmasq.d/ladon-manual.conf`. Будь это один список с `ladon_engine`, ладон при пересборке выкидывал бы адреса, добавленные dnsmasq, про которые он не знает. `timeout 86400` сам убирает протухшие адреса, а при каждом новом резолве таймер обновляется.
+- `ladon_cidr`: диапазоны адресов из подборок (например, MTProto Telegram на `91.108.0.0/16`). Ладон заливает их на старте, и совпадение идёт прямо по адресу, мимо DNS.
 
-Стандартный пакетный dnsmasq запускается под пользователем `dnsmasq` (а не root) и **по умолчанию не имеет `CAP_NET_ADMIN`** — без этой capability он не может добавлять записи в kernel ipset, даже если `ipset=/domain/set` директивы прописаны. Симптом: dnsmasq резолвит, отвечает клиенту, но `ladon_manual` остаётся пустым, и трафик идёт direct.
+#### Право dnsmasq добавлять адреса (обязательно)
 
-Лечится systemd drop-in'ом:
+Пакетный dnsmasq работает под своим пользователем, а не под root, и по умолчанию
+**не может** добавлять адреса в списки ядра, даже если директивы `ipset=` прописаны.
+Выглядит это так: dnsmasq домен резолвит, клиенту отвечает, а `ladon_manual`
+остаётся пустым, и трафик идёт напрямую. Лечится дропином для systemd:
 
 ```bash
 sudo install -d /etc/systemd/system/dnsmasq.service.d
@@ -142,56 +156,52 @@ sudo systemctl daemon-reload
 sudo systemctl restart dnsmasq
 ```
 
-Проверить что заработало:
+Проверка:
+
 ```bash
 dig @127.0.0.1 +short openai.com
 sudo ipset list ladon_manual | tail -10
-# ↳ должны появиться IP-шки CloudFlare с timeout
+# ↳ должны появиться адреса с таймаутом
 ```
 
-Подробная схема iptables/ip-rule для cascading gateway (замени `tun0` на
-имя твоего upstream-интерфейса):
+#### Метка в туннель
 
-```
-ip rule add fwmark 0x1 table ladon priority 1000
-echo '666 ladon' >> /etc/iproute2/rt_tables
-ip route replace default dev tun0 table ladon
-```
-
-Эта часть обычно настраивается на стороне твоего VPN-стека — ladon
-предполагает что routing-таблица и fwmark → интерфейс уже готовы, и просто
-наполняет ipset'ы `ladon_engine` / `ladon_manual` / `ladon_cidr`.
-
-## 4. Инициализация и запуск
-
-> **`run` сам разворачивает и мигрирует схему на старте** (`store.Init`,
-> идемпотентно по `PRAGMA user_version`): на пустой БД создаст таблицы, на
-> существующей догонит до актуальной. `init-db` ниже — явный шаг создать БД
-> заранее (рекомендуется в установке, чтобы поймать ошибки до запуска сервиса).
+Связку «метка → таблица маршрутизации → туннельный интерфейс» обычно уже задаёт
+твой VPN-стек. Если нет, вот минимум (замени `wg0` на имя своего туннеля):
 
 ```bash
-# Создать схему БД
-/opt/ladon/ladon \
-  -db /opt/ladon/state/engine.db \
-  init-db
+echo '666 ladon' >> /etc/iproute2/rt_tables
+ip rule add fwmark 0x1 table ladon priority 1000
+ip route replace default dev wg0 table ladon
+```
 
-# Включить сервис
+Ладон считает, что таблица и связка «метка → интерфейс» уже готовы, и просто
+наполняет списки `ladon_engine`, `ladon_manual`, `ladon_cidr`.
+
+### 4. Создать базу и запустить
+
+> `run` сам создаёт и догоняет схему базы на старте (идемпотентно): на пустой
+> базе создаст таблицы, на старой обновит. `init-db` ниже это явный шаг создать
+> базу заранее, чтобы поймать ошибки до старта сервиса.
+
+```bash
+/opt/ladon/ladon -db /opt/ladon/state/engine.db init-db
+
 systemctl daemon-reload
 systemctl enable --now ladon
 
-# Проверить
 systemctl status ladon
 journalctl -u ladon -f
 ```
 
-Через минуту в логе должны начать появляться строки вида:
+Через минуту в логе пойдут строки вроде:
 
 ```
-probe example.com → HOT (tcp_connect_failed, 800ms)
+probe example.com → HOT (tcp_timeout, 812ms)
 ipset ladon_engine: +5 -0 (total 5, etlds expanded 1)
 ```
 
-## 5. Проверка работы
+### 5. Проверить, что работает
 
 Быстрее всего — встроенная диагностика (сама ходит по всему конвейеру и
 говорит, где первое порванное звено):
@@ -205,98 +215,72 @@ ladon -db /opt/ladon/state/engine.db why rutracker.org   # почему доме
 Вручную, если нужно копнуть в БД:
 
 ```bash
-# Сколько доменов собрал
+# Сколько доменов и в каком состоянии
 sqlite3 /opt/ladon/state/engine.db \
   "SELECT state, COUNT(*) FROM domains GROUP BY state"
 
-# Сколько IP в каждом ipset
+# Сколько адресов в каждом списке
 for SET in ladon_engine ladon_manual ladon_cidr; do
   echo -n "$SET: "; ipset list "$SET" -t 2>/dev/null | grep '^Number'
 done
 
-# Последние 10 blocked-вердиктов. verdict штампуется только на batch-пути;
-# inline-проба оставляет verdict NULL, поэтому WHERE verdict='blocked' их не
-# покажет — пустой результат на свежей БД это нормально.
+# Последние блокировки. Вердикт ставится на фоновой перепроверке, поэтому
+# на свежей базе пустой результат это нормально.
 sqlite3 -column /opt/ladon/state/engine.db \
   "SELECT domain, verdict, failure_reason, created_at
-   FROM probes
-   WHERE verdict = 'blocked'
+   FROM probes WHERE verdict = 'blocked'
    ORDER BY created_at DESC LIMIT 10"
 ```
 
-## 6. Обновление manual-списков
+### 6. Править ручные списки
 
 ```bash
-# Добавить домен в always-tunnel list
-echo "myblocked.com" >> /etc/ladon/manual-allow.txt
+echo "myblocked.com" >> /etc/ladon/manual-allow.txt   # всегда в туннель
+echo "mybank.ru"     >> /etc/ladon/manual-deny.txt     # не трогать
 
-# Добавить в never-touch list
-echo "mybank.ru" >> /etc/ladon/manual-deny.txt
-
-# Перечитать (engine читает только при старте)
-systemctl restart ladon
+systemctl restart ladon   # списки читаются на старте
 ```
 
-## 7. Удаление
+### 7. Снести вручную
 
 ```bash
 systemctl disable --now ladon
 rm /etc/systemd/system/ladon.service
 rm -rf /opt/ladon /etc/ladon
 
-# Снести iptables-правила и ipset'ы (зеркало Step 3)
+# Убрать правила и списки (зеркало шага 3)
 for SET in ladon_engine ladon_manual ladon_cidr; do
-  iptables -t mangle -D WG_ROUTE -s 10.10.0.2/32 \
-    -m set --match-set "$SET" dst -j MARK --set-mark 0x1
+  iptables -t mangle -D PREROUTING -m set --match-set "$SET" dst -j MARK --set-mark 0x1
   ipset destroy "$SET"
 done
 iptables-save > /etc/iptables/rules.v4
 ipset save    > /etc/iptables/ipsets
 ```
 
-## Troubleshooting
+## Если что-то не так
 
-**Engine запустился, но ipset пустой после часа**
+**Ладон запустился, но через час список пустой.** Проверь, что dnsmasq реально
+пишет лог: `tail -f /var/log/dnsmasq.log`. Если тихо, значит `log-queries=extra`
+не применился, перезапусти dnsmasq.
 
-Проверь что dnsmasq реально пишет лог:
+**В логе `ipset "ladon_engine" not found — skipping`.** Список не создан до старта
+ладона (или не пережил перезагрузку, не включён `netfilter-persistent`, см. шаг 3).
+Создай списки заново и перезапусти сервис.
+
+**Все домены уходят в `hot`, хотя напрямую всё работает.** Скорее всего на шлюзе
+выключен IPv6, а в кэше осели адреса IPv6. Ладон отсеивает их на входе, но если
+обновлялся со старой версии, почисти и перезапусти:
+
 ```bash
-tail -f /var/log/dnsmasq.log
-```
-Если молчит — убедись что `log-queries=extra` применён, `systemctl restart dnsmasq`.
-
-**Логи показывают `ipset "ladon_engine" not found — skipping`**
-
-Ты не создал ipset до старта engine (или они не пережили ребут — `netfilter-persistent` не включён, см. Step 3). Создай и перезапусти сервис:
-```bash
-ipset create ladon_engine hash:ip  family inet maxelem 65536
-ipset create ladon_manual hash:ip  family inet maxelem 65536 timeout 86400
-ipset create ladon_cidr   hash:net family inet maxelem 65536
+sqlite3 /opt/ladon/state/engine.db "DELETE FROM dns_cache WHERE ip LIKE '%:%'"
 systemctl restart ladon
 ```
 
-**Все домены уходят в `hot` хотя direct работает**
+**Ладон ест много CPU.** Подними `ProbeCooldown` в `engine.Defaults()`: домены
+будут перепробоваться реже (нужна пересборка бинаря).
 
-Скорее всего на гейте отключён IPv6, но dns_cache забит v6-адресами. Engine в v0.1.0+
-сам фильтрует v6 на ingest, но если апгрейдишься со старой версии — почисти:
-```bash
-sqlite3 /opt/ladon/state/engine.db \
-  "DELETE FROM dns_cache WHERE ip LIKE '%:%'"
-systemctl restart ladon
-```
-
-**Сервис потребляет слишком много CPU**
-
-Уменьши `ProbeBatch` или подними `ProbeInterval` в `engine.Defaults()` (требует
-пересборки бинаря). Либо подними `ProbeCooldown` — домены будут пере-пробоваться
-реже.
-
-**Рост файла БД / `*.db-wal`**
-
-Ladon сам подрезает БД фоновой стадией maintenance (`MaintenanceInterval`,
-дефолт 1ч) — ручной уборки не нужно. На каждом тике: WAL checkpoint в режиме
-TRUNCATE (схлопывает `*.db-wal` в основной файл — long-lived read-пул блокирует
-пассивный auto-checkpoint, поэтому явно), прунинг `probes` старше `2 ×
-Scorer.Window` и `dns_cache` старше `max(DNSFreshness, 7 суток)`. Это только
-реклейм места, на корректность не влияет. Сам файл БД при этом не ужимается
-(свободные страницы переиспользуются) — для разового сжатия `VACUUM` вручную в
-окно обслуживания.
+**Растёт файл базы или `*.db-wal`.** Ладон подрезает базу сам, раз в час:
+сворачивает `*.db-wal` в основной файл и чистит старые записи проб и DNS-кэша. Это
+только освобождение места, на работу не влияет. Сам файл при этом не ужимается
+(страницы переиспользуются); для разового сжатия запусти `VACUUM` вручную в
+спокойное время.
