@@ -236,13 +236,8 @@ func Screen(content string) {
 	// → arrow keys so it scrolls the pager instead of garbling the screen).
 	fmt.Fprint(tty, "\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1007h")
 
-	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
-	blockW := 0
-	for _, ln := range lines {
-		if w := visibleLen(ln); w > blockW {
-			blockW = w
-		}
-	}
+	// One blank line of top margin; body stays left-aligned with a small indent.
+	lines := append([]string{""}, strings.Split(strings.TrimRight(content, "\n"), "\n")...)
 	offset := 0
 	// draw paints one frame and returns the body-window height, clamping offset.
 	draw := func() (win int) {
@@ -261,11 +256,7 @@ func Screen(content string) {
 		if offset < 0 {
 			offset = 0
 		}
-		pad := (cols - blockW) / 2
-		if pad < 0 {
-			pad = 0
-		}
-		indent := strings.Repeat(" ", pad)
+		const indent = "  " // left margin
 		fmt.Fprint(tty, "\x1b[2J\x1b[H")
 		for i := 0; i < win; i++ {
 			if li := offset + i; li < len(lines) && lines[li] != "" {
@@ -384,25 +375,6 @@ func readCSI(tty *os.File) string {
 		}
 	}
 	return sb.String()
-}
-
-// visibleLen counts display columns in s, ignoring ANSI escape sequences.
-func visibleLen(s string) int {
-	n, inEsc := 0, false
-	for _, r := range s {
-		if inEsc {
-			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
-				inEsc = false
-			}
-			continue
-		}
-		if r == 0x1b {
-			inEsc = true
-			continue
-		}
-		n++
-	}
-	return n
 }
 
 // bar builds a full-width rule: left corner + a tinted label + fill + right
