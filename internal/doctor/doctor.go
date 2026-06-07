@@ -20,6 +20,7 @@ import (
 
 	"github.com/belotserkovtsev/ladon/internal/ipset"
 	"github.com/belotserkovtsev/ladon/internal/storage"
+	"github.com/belotserkovtsev/ladon/internal/ui"
 )
 
 // Status is a single check's outcome.
@@ -30,17 +31,6 @@ const (
 	StatusWarn
 	StatusFail
 )
-
-func (s Status) glyph() string {
-	switch s {
-	case StatusFail:
-		return "✗"
-	case StatusWarn:
-		return "⚠"
-	default:
-		return "✓"
-	}
-}
 
 // Pipeline stages, listed in the order traffic flows through them. The "first
 // broken link" headline picks the earliest stage holding a failing check.
@@ -208,7 +198,7 @@ func engineChecks(ctx context.Context, store *storage.Store, p Params, now time.
 			Fix: "journalctl -u ladon -n 50 --no-pager ; systemctl restart ladon"})
 	} else {
 		out = append(out, Check{Stage: StageEngine, Status: StatusOK,
-			Title: "живой тик " + humanAge(now.Sub(tick)) + " назад"})
+			Title: "живой тик", Detail: humanAge(now.Sub(tick)) + " назад"})
 	}
 
 	// Version (informational): what the running daemon recorded vs this binary.
@@ -325,7 +315,7 @@ func accumChecks(ctx context.Context, store *storage.Store, now time.Time) []Che
 				Title: "orphaned домены", Detail: fmt.Sprintf("%d в hot/cache без backing-строки", orphans),
 				Fix: "перезапуск чинит (ResetOrphanedDomains), либо `ladon prune -probes -dry-run`"})
 		} else {
-			out = append(out, Check{Stage: StageAccum, Status: StatusOK, Title: "orphaned: 0"})
+			out = append(out, Check{Stage: StageAccum, Status: StatusOK, Title: "orphaned", Detail: "0"})
 		}
 	}
 	return out
@@ -417,53 +407,62 @@ func ipsetCheck(ctx context.Context, name, label string, expected int, haveExpec
 
 // --- render ---
 
-// Render writes the human report to w.
+// Render writes the human report to w in ladon's terminal style: wordmark,
+// verdict badge, then every check grouped by pipeline stage.
 func (r Report) Render(w io.Writer) {
-	fmt.Fprintf(w, "ladon doctor — %s\n\n", orDash(r.Version))
+	st := ui.For(w)
+	st.Banner(w, "split-tunnel engine · doctor · "+orDash(r.Version))
 
-	// Top-line verdict.
 	switch r.Verdict {
 	case StatusOK:
-		fmt.Fprintln(w, "🟢 ЗДОРОВ — ладон работает штатно")
+		st.Badge(w, ui.LevelOK, "ЗДОРОВ · ладон работает штатно")
 	case StatusWarn:
-		fmt.Fprintf(w, "🟡 ЧАСТИЧНО — ладон работает, есть замечания (%d)\n", countWarn(r.Checks))
+		st.Badge(w, ui.LevelWarn, fmt.Sprintf("ЕСТЬ ЗАМЕЧАНИЯ · %d", countWarn(r.Checks)))
 	case StatusFail:
-		fmt.Fprintln(w, "🔴 СЛОМАН — нашлась проблема в работе ладона")
+		st.Badge(w, ui.LevelFail, "СЛОМАН · нужно вмешательство")
 	}
 	fmt.Fprintln(w)
 
-	// Checks grouped by stage, in pipeline order.
 	for _, stage := range stageOrder {
 		group := r.stage(stage)
 		if len(group) == 0 {
 			continue
 		}
-		fmt.Fprintln(w, stage)
+		st.Section(w, stage)
 		for _, c := range group {
-			line := "  " + c.Status.glyph() + " " + c.Title
-			if c.Detail != "" {
-				line += " — " + c.Detail
-			}
-			fmt.Fprintln(w, line)
+			st.Row(w, uiLevel(c.Status), c.Title, c.Detail)
 			if c.Status != StatusOK && c.Fix != "" {
-				fmt.Fprintln(w, "     fix: "+c.Fix)
+				st.FixLine(w, c.Fix)
 			}
 		}
 		fmt.Fprintln(w)
 	}
 
-	// Footer / headline.
 	switch r.Verdict {
 	case StatusOK:
-		fmt.Fprintln(w, "Ладон в порядке: свою часть он отработал. Если сайты всё равно не")
-		fmt.Fprintln(w, "открываются, причина не в ладоне.")
+		fmt.Fprintln(w, "  "+st.Dim("Ладон работает нормально. Если сайты всё равно не открываются,"))
+		fmt.Fprintln(w, "  "+st.Dim("причина не в нём."))
+	case StatusWarn:
+		fmt.Fprintln(w, "  "+st.Dim("Работает, но на пункты с ▲ стоит взглянуть."))
 	case StatusFail:
 		if fb := r.firstBroken(); fb != nil {
-			fmt.Fprintf(w, "ПЕРВОЕ ПОРВАННОЕ ЗВЕНО: %s — %s.\n", fb.Stage, fb.Title)
+			fmt.Fprintln(w, "  "+st.Red("▸ первое порванное звено: ")+st.Bold(fb.Stage+" · "+fb.Title))
 			if fb.Detail != "" {
-				fmt.Fprintf(w, "%s.\n", fb.Detail)
+				fmt.Fprintln(w, "    "+st.Dim(fb.Detail))
 			}
 		}
+	}
+}
+
+// uiLevel maps a doctor Status onto a ui.Level.
+func uiLevel(s Status) ui.Level {
+	switch s {
+	case StatusWarn:
+		return ui.LevelWarn
+	case StatusFail:
+		return ui.LevelFail
+	default:
+		return ui.LevelOK
 	}
 }
 

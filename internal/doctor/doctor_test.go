@@ -41,10 +41,10 @@ func TestRenderHealthyFooter(t *testing.T) {
 	var buf bytes.Buffer
 	build("v1.4.0", []Check{{Stage: StageEngine, Status: StatusOK, Title: "живой"}}).Render(&buf)
 	out := buf.String()
-	if !strings.Contains(out, "🟢 ЗДОРОВ") {
-		t.Errorf("missing healthy headline: %q", out)
+	if !strings.Contains(out, "ЗДОРОВ") {
+		t.Errorf("missing healthy verdict badge: %q", out)
 	}
-	if !strings.Contains(out, "причина не в ладоне") {
+	if !strings.Contains(out, "причина не в нём") {
 		t.Errorf("healthy report should say the cause is outside ladon: %q", out)
 	}
 }
@@ -56,10 +56,10 @@ func TestRenderBrokenHeadlineAndFix(t *testing.T) {
 			Detail: "в наборе 0", Fix: "systemctl restart ladon"},
 	}).Render(&buf)
 	out := buf.String()
-	if !strings.Contains(out, "🔴 СЛОМАН") {
-		t.Errorf("missing broken headline: %q", out)
+	if !strings.Contains(out, "СЛОМАН") {
+		t.Errorf("missing broken verdict badge: %q", out)
 	}
-	if !strings.Contains(out, "ПЕРВОЕ ПОРВАННОЕ ЗВЕНО") {
+	if !strings.Contains(out, "первое порванное звено") {
 		t.Errorf("missing first-broken-link line: %q", out)
 	}
 	if !strings.Contains(out, "fix: systemctl restart ladon") {

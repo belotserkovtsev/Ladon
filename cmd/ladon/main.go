@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -30,6 +31,7 @@ import (
 	"github.com/belotserkovtsev/ladon/internal/prober"
 	"github.com/belotserkovtsev/ladon/internal/storage"
 	"github.com/belotserkovtsev/ladon/internal/tail"
+	"github.com/belotserkovtsev/ladon/internal/ui"
 	"github.com/belotserkovtsev/ladon/internal/watcher"
 )
 
@@ -478,44 +480,47 @@ func statusCmd(ctx context.Context, store *storage.Store) {
 	meta, _ := store.AllMeta(ctx)
 	counts, _ := store.CountDomainsByState(ctx)
 
-	fmt.Printf("ladon status — %s\n\n", version)
+	st := ui.For(os.Stdout)
+	st.Banner(os.Stdout, "split-tunnel engine · status · "+version)
 
-	fmt.Println("движок:")
+	st.Section(os.Stdout, "ДВИЖОК")
 	if r, ok := meta["version"]; ok {
-		fmt.Printf("  %-16s %s\n", "версия", r.Value)
+		st.Info(os.Stdout, "версия", r.Value)
 	}
 	if r, ok := meta["pid"]; ok {
-		fmt.Printf("  %-16s %s\n", "pid", r.Value)
+		st.Info(os.Stdout, "pid", r.Value)
 	}
 	if r, ok := meta["started_at"]; ok {
-		fmt.Printf("  %-16s %s\n", "запущен", r.Value)
+		st.Info(os.Stdout, "запущен", r.Value)
 	}
 	if r, ok := meta["last_tick_at"]; ok {
-		fmt.Printf("  %-16s %s назад\n", "последний тик", metaAgo(r.Value, now))
+		st.Info(os.Stdout, "последний тик", metaAgo(r.Value, now)+" назад")
 	} else {
-		fmt.Printf("  %-16s %s\n", "последний тик", "нет heartbeat — `ladon run` не запускался?")
+		st.Info(os.Stdout, "последний тик", "нет heartbeat — `ladon run` не запускался?")
 	}
+	fmt.Println()
 
-	fmt.Println("\nконвейер:")
+	st.Section(os.Stdout, "КОНВЕЙЕР")
 	if t, ok, _ := store.LatestObservationAt(ctx); ok {
-		fmt.Printf("  %-16s %s назад\n", "последний DNS", ago(now.Sub(t)))
+		st.Info(os.Stdout, "последний DNS", ago(now.Sub(t))+" назад")
 	}
 	if t, ok, _ := store.LatestProbeAt(ctx); ok {
-		fmt.Printf("  %-16s %s назад\n", "последняя проба", ago(now.Sub(t)))
+		st.Info(os.Stdout, "последняя проба", ago(now.Sub(t))+" назад")
 	}
 	if r, ok := meta["last_reconcile_at"]; ok {
-		size := ""
+		v := metaAgo(r.Value, now) + " назад"
 		if s, ok := meta["ipset_engine_size"]; ok {
-			size = " (в наборе " + s.Value + " IP)"
+			v += " · в наборе " + s.Value + " IP"
 		}
-		fmt.Printf("  %-16s %s назад%s\n", "reconcile", metaAgo(r.Value, now), size)
+		st.Info(os.Stdout, "reconcile", v)
 	}
+	fmt.Println()
 
-	fmt.Println("\nдомены:")
+	st.Section(os.Stdout, "ДОМЕНЫ")
 	known := []string{"new", "hot", "cache", "ignore", "covered"}
 	seen := map[string]bool{}
 	for _, s := range known {
-		fmt.Printf("  %-10s %d\n", s, counts[s])
+		st.Info(os.Stdout, s, strconv.Itoa(counts[s]))
 		seen[s] = true
 	}
 	var extra []string
@@ -526,8 +531,9 @@ func statusCmd(ctx context.Context, store *storage.Store) {
 	}
 	sort.Strings(extra)
 	for _, s := range extra {
-		fmt.Printf("  %-10s %d\n", s, counts[s])
+		st.Info(os.Stdout, s, strconv.Itoa(counts[s]))
 	}
+	fmt.Println()
 }
 
 // doctorCmd runs the full pipeline diagnosis and exits with the report's code
@@ -577,55 +583,67 @@ func whyCmd(ctx context.Context, store *storage.Store, domain string) {
 	if err := store.Init(ctx); err != nil {
 		fatal("why: %v", err)
 	}
+	st := ui.For(os.Stdout)
 	d, ok, err := store.GetDomain(ctx, domain)
 	if err != nil {
 		fatal("why: %v", err)
 	}
+	st.Banner(os.Stdout, "split-tunnel engine · why · "+domain)
 	if !ok {
-		fmt.Printf("%s: не отслеживается (нет в базе)\n", domain)
+		fmt.Println("  " + st.Dim(domain+" не отслеживается (нет в базе)."))
 		return
 	}
 
-	fmt.Printf("домен:     %s\n", d.Domain)
-	fmt.Printf("eTLD+1:    %s\n", dash(d.ETLDPlusOne))
-	fmt.Printf("состояние: %s\n", d.State)
-	fmt.Printf("замечен:   %s … %s (×%d)\n", dash(d.FirstSeenAt), dash(d.LastSeenAt), d.HitCount)
+	st.Section(os.Stdout, "ДОМЕН")
+	st.Info(os.Stdout, "домен", d.Domain)
+	st.Info(os.Stdout, "eTLD+1", dash(d.ETLDPlusOne))
+	st.Info(os.Stdout, "состояние", d.State)
+	st.Info(os.Stdout, "замечен", dash(d.FirstSeenAt)+" … "+dash(d.LastSeenAt)+" (×"+strconv.Itoa(d.HitCount)+")")
 	if d.CooldownUntil != "" {
-		fmt.Printf("cooldown:  до %s\n", d.CooldownUntil)
+		st.Info(os.Stdout, "cooldown", "до "+d.CooldownUntil)
 	}
 	if exp, reason, ok, _ := store.HotEntryFor(ctx, domain); ok {
-		fmt.Printf("hot:       до %s — %s\n", exp, dash(reason))
+		st.Info(os.Stdout, "hot", "до "+exp+" — "+dash(reason))
 	}
 	if at, reason, ok, _ := store.CacheEntryFor(ctx, domain); ok {
-		fmt.Printf("cache:     с %s — %s\n", at, dash(reason))
+		st.Info(os.Stdout, "cache", "с "+at+" — "+dash(reason))
 	}
 	if ips, _ := store.LookupAllIPs(ctx, domain); len(ips) > 0 {
-		fmt.Printf("IP (%d):    %s\n", len(ips), strings.Join(ips, ", "))
+		st.Info(os.Stdout, "IP ("+strconv.Itoa(len(ips))+")", strings.Join(ips, ", "))
 	}
+	fmt.Println()
 
+	st.Section(os.Stdout, "ПОСЛЕДНИЕ ПРОБЫ")
 	probes, _ := store.RecentProbesForDomain(ctx, domain, 10)
 	if len(probes) == 0 {
-		fmt.Println("\nпроб ещё не было.")
+		st.Info(os.Stdout, "—", "проб ещё не было")
 	} else {
-		fmt.Printf("\nпоследние %d проб (новые сверху):\n", len(probes))
 		for _, p := range probes {
 			dns, tcp, tls, http := p.Flags()
-			fmt.Printf("  %s  dns=%-2s tcp=%-2s tls=%-2s http=%-2s  verdict=%-8s %s\n",
-				p.CreatedAt, dns, tcp, tls, http, dash(p.Verdict), p.FailureReason)
+			line := fmt.Sprintf("%s  dns=%-2s tcp=%-2s tls=%-2s http=%-2s  %s",
+				p.CreatedAt, dns, tcp, tls, http, dash(p.FailureReason))
+			switch p.Verdict {
+			case "blocked":
+				fmt.Println("   " + st.Red("✖") + " " + line + "  " + st.Red("blocked"))
+			case "clear":
+				fmt.Println("   " + st.Green("✔") + " " + line + "  " + st.Green("clear"))
+			default:
+				fmt.Println("   " + st.Dim("·") + " " + line)
+			}
 		}
 	}
-
 	fmt.Println()
+
 	switch d.State {
 	case "hot", "cache":
-		fmt.Println("→ туннелируется (входит в ladon_engine).")
+		fmt.Println("  " + st.Green("▸ туннелируется") + st.Dim(" (входит в ladon_engine)."))
 	case "covered":
-		fmt.Printf("→ туннелируется через семью %s (covered — отдельно не пробится).\n", dash(d.ETLDPlusOne))
+		fmt.Println("  " + st.Green("▸ туннелируется") + st.Dim(" через семью "+dash(d.ETLDPlusOne)+" (covered — отдельно не пробится)."))
 	case "ignore":
-		fmt.Println("→ НЕ туннелируется: последняя проба сочла путь рабочим (clear).")
-		fmt.Println("  если сайт реально не открывается — возможна L7/cert-слепота; добавь в manual-allow.")
+		fmt.Println("  " + st.Yellow("▸ не туннелируется") + st.Dim(" — последняя проба сочла путь рабочим (clear)."))
+		fmt.Println("    " + st.Dim("если сайт реально не открывается — возможна L7/cert-слепота; добавь в manual-allow."))
 	case "new":
-		fmt.Println("→ ещё не классифицирован (ждёт пробы).")
+		fmt.Println("  " + st.Dim("▸ ещё не классифицирован (ждёт пробы)."))
 	}
 }
 
