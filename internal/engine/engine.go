@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"github.com/belotserkovtsev/ladon/internal/decision"
-	"github.com/belotserkovtsev/ladon/internal/dnsmasq"
 	"github.com/belotserkovtsev/ladon/internal/dnsmasqcfg"
+	"github.com/belotserkovtsev/ladon/internal/dnssrc"
 	"github.com/belotserkovtsev/ladon/internal/etld"
 	"github.com/belotserkovtsev/ladon/internal/ipset"
 	"github.com/belotserkovtsev/ladon/internal/manual"
@@ -23,7 +23,6 @@ import (
 	"github.com/belotserkovtsev/ladon/internal/prober"
 	"github.com/belotserkovtsev/ladon/internal/scorer"
 	"github.com/belotserkovtsev/ladon/internal/storage"
-	"github.com/belotserkovtsev/ladon/internal/tail"
 	"github.com/belotserkovtsev/ladon/internal/watcher"
 )
 
@@ -128,6 +127,8 @@ func collectManualEntries(cfg Config) (manual.Entries, error) {
 type Config struct {
 	LogPath                string        // dnsmasq log to follow
 	FromStart              bool          // tail from beginning of file
+	DNSSource              string        // ingest source: "auto" (by OS) | "dnsmasq" | "unbound"
+	UnboundSocket          string        // unix socket the unbound module writes observations to
 	ProbeInterval          time.Duration // how often probe worker wakes up
 	ProbeBatch             int           // how many candidates per wake
 	ProbeTimeout           time.Duration // per-stage probe timeout
@@ -181,6 +182,8 @@ type Config struct {
 func Defaults(logPath string) Config {
 	return Config{
 		LogPath:                logPath,
+		DNSSource:              "auto",
+		UnboundSocket:          "/var/run/ladon-dns.sock",
 		ExtensionsPath:         "extensions",
 		ProbeInterval:          2 * time.Second,
 		ProbeBatch:             4,
@@ -249,7 +252,7 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	if err != nil {
 		logEngine.Error("collect manual entries failed", "err", err)
 	}
-	if cfg.ManualIpsetName != "" {
+	if cfg.ManualIpsetName != "" && dnssrc.Resolve(cfg.DNSSource) == "dnsmasq" {
 		if err := dnsmasqcfg.Write(cfg.ManualIpsetName, manualEntries.Domains); err != nil {
 			logEngine.Error("dnsmasq config write failed", "err", err)
 		} else {
@@ -293,7 +296,8 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 		}()
 	}
 
-	launch("tailer", func() error { return runTailer(ctx, store, cfg, sem, ipsetTrigger) })
+	ingestSrc := dnssrc.New(dnssrc.Config{Kind: cfg.DNSSource, LogPath: cfg.LogPath, StartAtEnd: !cfg.FromStart, UnboundSocket: cfg.UnboundSocket})
+	launch("ingest", func() error { return runIngest(ctx, store, cfg, sem, ipsetTrigger, ingestSrc) })
 	launch("probe-worker", func() error { return runProbeWorker(ctx, store, cfg, ipsetTrigger) })
 	launch("expiry-sweeper", func() error { return runExpirySweeper(ctx, store, cfg) })
 	launch("ipset-syncer", func() error { return runIpsetSyncer(ctx, store, cfg, ipsetTrigger) })
@@ -308,8 +312,8 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	}
 }
 
-func runTailer(ctx context.Context, store *storage.Store, cfg Config, sem chan struct{}, ipsetTrigger chan<- struct{}) error {
-	lines, errs := tail.Follow(ctx, cfg.LogPath, tail.Options{StartAtEnd: !cfg.FromStart})
+func runIngest(ctx context.Context, store *storage.Store, cfg Config, sem chan struct{}, ipsetTrigger chan<- struct{}, src dnssrc.Source) error {
+	events, errs := src.Events(ctx)
 	ingested, skipped := 0, 0
 	report := time.NewTicker(30 * time.Second)
 	defer report.Stop()
@@ -331,38 +335,33 @@ func runTailer(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 			return nil
 		case err, ok := <-errs:
 			if ok && err != nil {
-				return fmt.Errorf("tail: %w", err)
+				return fmt.Errorf("ingest: %w", err)
 			}
-		case line, ok := <-lines:
+		case rec, ok := <-events:
 			if !ok {
 				return nil
 			}
-			ev, parsed := dnsmasq.Parse(line)
-			if !parsed {
-				skipped++
-				continue
-			}
-			switch ev.Action {
-			case dnsmasq.Query:
-				if ev.Peer == "" || ev.Peer == cfg.IgnorePeer {
+			switch rec.Kind {
+			case dnssrc.Query:
+				if rec.Client == "" || rec.Client == cfg.IgnorePeer {
 					skipped++
 					continue
 				}
 				// Remember the original queried domain — we'll use it to
 				// re-attribute IP replies that come back through CNAME hops
 				// to a different domain family.
-				if ev.QueryID != "" {
-					chainOrigin[ev.QueryID] = ev.Domain
+				if rec.ChainID != "" {
+					chainOrigin[rec.ChainID] = rec.Domain
 				}
-				if deny, _ := store.IsInDenyList(ctx, ev.Domain, etld.Compute(ev.Domain)); deny {
+				if deny, _ := store.IsInDenyList(ctx, rec.Domain, etld.Compute(rec.Domain)); deny {
 					skipped++
 					continue
 				}
 				if _, err := watcher.Ingest(ctx, store, watcher.Event{
-					Domain: ev.Domain,
-					Peer:   ev.Peer,
+					Domain: rec.Domain,
+					Peer:   rec.Client,
 				}); err != nil {
-					logTail.Error("ingest failed", "domain", ev.Domain, "err", err)
+					logTail.Error("ingest failed", "domain", rec.Domain, "err", err)
 					continue
 				}
 				ingested++
@@ -371,9 +370,9 @@ func runTailer(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 				// sub-second. probeDomain short-circuits to 'covered' for members
 				// of an already-confirmed family, so no probe fires for
 				// established CDN churn (handled once, in probeDomain).
-				tryInlineProbe(ctx, store, cfg, ev.Domain, sem, ipsetTrigger)
-			case dnsmasq.Reply:
-				parsed := net.ParseIP(ev.Target)
+				tryInlineProbe(ctx, store, cfg, rec.Domain, sem, ipsetTrigger)
+			case dnssrc.Reply:
+				parsed := net.ParseIP(rec.IP)
 				// We operate on v4 only — stun0, WG subnet, iptables rules
 				// and the prod ipset are all v4. v6 answers would just create
 				// probe-time "cannot assign" failures and pollute dns_cache.
@@ -385,16 +384,14 @@ func runTailer(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 				// this id, store the IP under THAT domain so eTLD+1 lookups
 				// from manual-allow can find it. Falls back to the raw reply
 				// domain when we don't have a record (log started mid-stream).
-				storeDomain := ev.Domain
-				if origin, ok := chainOrigin[ev.QueryID]; ok && origin != "" {
+				storeDomain := rec.Domain
+				if origin, ok := chainOrigin[rec.ChainID]; ok && origin != "" {
 					storeDomain = origin
 				}
-				if err := store.UpsertDNSObservation(ctx, storeDomain, ev.Target, time.Time{}); err != nil {
-					logTail.Error("dns_cache upsert failed", "domain", storeDomain, "ip", ev.Target, "err", err)
+				if err := store.UpsertDNSObservation(ctx, storeDomain, rec.IP, time.Time{}); err != nil {
+					logTail.Error("dns_cache upsert failed", "domain", storeDomain, "ip", rec.IP, "err", err)
 					continue
 				}
-			default:
-				skipped++
 			}
 		case <-report.C:
 			logTail.Info("tailer progress", "ingested", ingested, "skipped", skipped)
