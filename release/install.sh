@@ -39,6 +39,7 @@ LADON_PREFIX="${LADON_PREFIX:-/opt/ladon}"
 LADON_CONFIG_DIR="${LADON_CONFIG_DIR:-/etc/ladon}"
 DRY_RUN="${LADON_DRY_RUN:-0}"
 GH_REPO="belotserkovtsev/ladon"
+FORCE=0; for _a in "$@"; do case "$_a" in -f|--force) FORCE=1 ;; esac; done
 
 # --- style (color only on a terminal) ---
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -186,6 +187,19 @@ write_config() {
   } > "$cfg"
 }
 
+# detect_topology: gateway vs desktop → DETECT_GUESS
+DETECT_GUESS=""
+detect_topology() {
+  local gw=0 dt=0
+  if [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" == "1" ]]; then gw=$((gw+2)); else dt=$((dt+1)); fi
+  if grep -rqsE '^[[:space:]]*dhcp-range=' /etc/dnsmasq.conf /etc/dnsmasq.d/ 2>/dev/null; then gw=$((gw+2)); fi
+  if { iptables -t nat -S 2>/dev/null; nft list ruleset 2>/dev/null; } | grep -qi 'masquerade'; then gw=$((gw+1)); fi
+  if ip -o link show type bridge 2>/dev/null | grep -q .; then gw=$((gw+1)); fi
+  if systemctl is-active --quiet systemd-resolved 2>/dev/null; then dt=$((dt+1)); fi
+  if [[ "$(systemctl get-default 2>/dev/null)" == "graphical.target" ]] || systemctl is-active --quiet display-manager 2>/dev/null; then dt=$((dt+2)); fi
+  if (( gw > dt )); then DETECT_GUESS="gateway"; else DETECT_GUESS="desktop"; fi
+}
+
 # ============================ flow ============================
 
 # Clean start: clear screen + scrollback so the banner sits at the top (only on
@@ -211,6 +225,12 @@ esac
 
 step "Окружение"
 ok "архитектура: $ARCH (${PRETTY_NAME:-$ID})"
+
+# топология: на десктопе останавливаемся (-f форсит)
+detect_topology
+if [[ "$DETECT_GUESS" == "desktop" && $FORCE != 1 ]]; then
+  die "устройство определено как десктоп — установка остановлена (-f чтобы пропустить)"
+fi
 
 # --- fetch + verify release (read-only, into tmp) ---
 TAG="${TAG:-}"
