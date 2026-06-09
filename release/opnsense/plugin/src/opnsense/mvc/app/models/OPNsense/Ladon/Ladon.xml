@@ -1,0 +1,79 @@
+<model>
+    <mount>//OPNsense/ladon</mount>
+    <version>1.0.0</version>
+    <description>Ladon split-routing engine</description>
+    <items>
+        <general>
+            <enabled type="BooleanField">
+                <Default>0</Default>
+                <Required>Y</Required>
+            </enabled>
+            <probe_mode type="OptionField">
+                <Default>local</Default>
+                <Required>Y</Required>
+                <OptionValues>
+                    <local>local</local>
+                    <exit-compare>exit-compare</exit-compare>
+                </OptionValues>
+            </probe_mode>
+            <remote_url type="TextField">
+                <Mask>/^(https?:\/\/.+)?$/</Mask>
+                <ValidationMessage>Enter a valid http(s) URL.</ValidationMessage>
+            </remote_url>
+            <remote_auth type="TextField"/>
+            <allow_extensions type="OptionField">
+                <Multiple>Y</Multiple>
+                <OptionValues>
+                    <ai>ai</ai>
+                    <brawlstars>brawlstars</brawlstars>
+                    <discord>discord</discord>
+                    <soundcloud>soundcloud</soundcloud>
+                    <telegram>telegram</telegram>
+                    <tiktok>tiktok</tiktok>
+                    <twitch>twitch</twitch>
+                </OptionValues>
+            </allow_extensions>
+            <deny_extensions type="OptionField">
+                <Multiple>Y</Multiple>
+                <OptionValues>
+                    <ai>ai</ai>
+                    <brawlstars>brawlstars</brawlstars>
+                    <discord>discord</discord>
+                    <soundcloud>soundcloud</soundcloud>
+                    <telegram>telegram</telegram>
+                    <tiktok>tiktok</tiktok>
+                    <twitch>twitch</twitch>
+                </OptionValues>
+            </deny_extensions>
+            <promote_threshold type="IntegerField">
+                <Default>50</Default>
+                <MinimumValue>1</MinimumValue>
+                <MaximumValue>100000</MaximumValue>
+            </promote_threshold>
+            <hot_ttl type="TextField">
+                <Mask>/^([0-9]+(s|m|h|d))*$/</Mask>
+                <ValidationMessage>Duration like 24h, 90m, 7d.</ValidationMessage>
+            </hot_ttl>
+            <family_confirm_threshold type="IntegerField">
+                <Default>10</Default>
+                <MinimumValue>1</MinimumValue>
+                <MaximumValue>100000</MaximumValue>
+            </family_confirm_threshold>
+            <ignore_peer type="TextField">
+                <Mask>/^([0-9a-fA-F:.]+)?$/</Mask>
+                <ValidationMessage>An IP address, or empty to auto-use the gateway.</ValidationMessage>
+            </ignore_peer>
+            <manual_allow type="TextField"/>
+            <manual_deny type="TextField"/>
+            <log_level type="OptionField">
+                <Default>info</Default>
+                <OptionValues>
+                    <info>info</info>
+                    <debug>debug</debug>
+                    <warn>warn</warn>
+                    <error>error</error>
+                </OptionValues>
+            </log_level>
+        </general>
+    </items>
+</model>

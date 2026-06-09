@@ -1,0 +1,5 @@
+rc.conf.d:/etc/rc.conf.d/ladon
+ladon-dynlib.conf:/usr/local/etc/unbound.opnsense.d/ladon-dynlib.conf
+config.yaml:/usr/local/etc/ladon/config.yaml
+manual-allow.txt:/usr/local/etc/ladon/manual-allow.txt
+manual-deny.txt:/usr/local/etc/ladon/manual-deny.txt

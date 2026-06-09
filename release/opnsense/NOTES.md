@@ -1,44 +1,59 @@
-# Ladon on OPNsense — status & build notes
+# Ladon on FreeBSD / OPNsense
 
-Work-in-progress port of Ladon to OPNsense (FreeBSD / pf / Unbound). The engine
-core already runs on FreeBSD; this directory holds the OPNsense-specific glue.
+The engine runs on FreeBSD (pf tables via `pfctl`, DNS observed through an Unbound
+dynlib over a unix socket). On OPNsense it ships as the `os-ladon` plugin (GUI,
+service, auto-wiring). On bare FreeBSD it runs headless — see below.
 
-## What works (validated on OPNsense 26.1.6 / unbound 1.24.2, amd64)
+## How it works
 
-- **Engine on FreeBSD**: cross-compiles `CGO_ENABLED=0 GOOS=freebsd` (pure-Go
-  sqlite), runs, `ladon doctor` green.
-- **Set backend** (`internal/ipset`): auto-selects `pfctl` (pf tables) on
-  FreeBSD, `ipset` on Linux. `Manager` API unchanged.
-- **DNS mediator** (`internal/dnssrc`): neutral `Record` protocol; adapters for
-  dnsmasq (tail log) and unbound (unix socket). Engine is source-agnostic.
-- **unbound dynlib module** (`ladon-unbound.c`): observes domain+resolved-IP at
-  reply time, emits to `/var/run/ladon-dns.sock`. **Coexists with the DNSBL
-  python module** via `module-config: "python dynlib iterator"` (both run).
-- Full cycle proven live: query → dynlib → socket → engine → probe → `pfctl`
-  fills `ladon_engine` (e.g. rutracker.org → hot → IPs in the pf table).
+- **Set backend** (`internal/ipset`): auto-selects `pfctl` on FreeBSD, `ipset` on Linux.
+- **DNS mediator** (`internal/dnssrc`): `auto` → unbound (unix socket) on FreeBSD,
+  dnsmasq (log tail) elsewhere. Socket defaults to `/var/unbound/var/run/ladon-dns.sock`
+  (inside the unbound chroot) on FreeBSD — no config needed.
+- **Unbound dynlib** (`ladon-unbound.c`): on each reply emits `domain<TAB>client<TAB>ips`
+  to the socket. Coexists with the DNSBL python module (`module-config: "python dynlib iterator"`).
+- The `.so` is ABI-bound to the unbound version, so it is **built on the box** by
+  `plugin/.../build_unbound_module.sh` (reuses `unbound -V` flags, ~10s, idempotent),
+  not shipped prebuilt. This is what keeps the port working across unbound bumps.
 
-## Routing (operator-side, same boundary as Linux)
+## OPNsense (os-ladon plugin)
 
-Ladon fills the pf tables; the operator wires routing. On OPNsense:
-3 **External (advanced)** aliases `ladon_engine` / `ladon_manual` / `ladon_cidr`,
-then a firewall rule: Destination = alias, Advanced → Gateway = your VPN gw,
-with RFC1918 excluded (Destination invert) so LAN-local traffic isn't tunneled.
+Install the plugin; everything is automatic on enable: builds the `.so`, injects the
+dynlib into unbound (`unbound.opnsense.d/`), declares the three pf tables as
+**External (advanced)** firewall aliases, starts the service. Configure under
+**Services ▸ Ladon ▸ Settings**, observe under **Diagnostics**.
 
-## Building the dynlib `.so`
+## Bare FreeBSD (no GUI)
 
-See the header comment in `ladon-unbound.c`. Summary: fetch the unbound source
-matching the running version, `./configure` with the same ABI flags as
-`unbound -V` (minus `--with-pythonmodule`/swig — they don't affect the structs
-the module touches), drop `ladon-unbound.c` into `dynlibmod/examples/ladon.c`,
-`cc -I../.. -shared -fpic -o ladon.so ladon.c`. The `.so` must be ABI-matched to
-the running unbound.
+Assumes a chrooted unbound at `/var/unbound` (FreeBSD base `local_unbound`). No
+installer — wire it by hand (all pieces are in this repo):
 
-## Not done yet (boilerplate, no technical unknowns left)
+1. **Binary**: `CGO_ENABLED=0 GOOS=freebsd GOARCH=amd64 go build -o ladon ./cmd/ladon`,
+   then `install -m755 ladon /usr/local/bin/ladon`.
+2. **Service**: copy `plugin/src/etc/rc.d/ladon` → `/usr/local/etc/rc.d/ladon`,
+   then `sysrc ladon_enable=YES`.
+3. **Dynlib**: `install -m644 release/opnsense/plugin/src/share/ladon/ladon-unbound.c /usr/local/share/ladon/`,
+   run `plugin/src/opnsense/scripts/OPNsense/Ladon/build_unbound_module.sh`
+   → `/usr/local/lib/ladon_unbound.so`. Copy it into the chroot:
+   `cp /usr/local/lib/ladon_unbound.so /var/unbound/ladon_unbound.so`.
+4. **Unbound**: add to `unbound.conf` (keep your existing modules):
+   ```
+   server:
+       module-config: "dynlib iterator"
+   dynlib:
+       dynlib-file: "/ladon_unbound.so"   # chroot-relative
+   ```
+   then `mkdir -p /var/unbound/var/run` and restart unbound.
+5. **pf** (`/etc/pf.conf`) — ladon creates/fills these tables; declare + route them:
+   ```
+   table <ladon_engine> persist
+   table <ladon_manual> persist
+   table <ladon_cidr>   persist
+   # send matched destinations out the tunnel (adapt iface/gateway):
+   pass out route-to (tun0 <TUNNEL_GW>) from <lan> to <ladon_engine>
+   ```
+6. **Start**: `service ladon start`. It auto-configures (Unbound source + pf backend);
+   `ladon -db /var/db/ladon/engine.db doctor` should be green.
 
-- `os-ladon` OPNsense plugin: rc.d service, configd actions, `config.xml` model,
-  MVC GUI (model after `cloudflared-opnsense`).
-- Inject the dynlib into OPNsense's unbound config (module-config + dynlib-file
-  via unbound custom options) from the plugin.
-- Reproducible `.so` build/delivery per unbound version.
-- Optional: manual-allow enforce inside the dynlib (pf) + real per-client IP.
-- Resolver-aware install (Linux dnsmasq / OPNsense unbound-dynlib).
+Tuning is optional via `/usr/local/etc/ladon/config.yaml` (see `release/config.yaml.example`).
+A non-chrooted unbound is not currently supported (the socket paths won't align).

@@ -1,0 +1,21 @@
+# ladon extension: AI services
+#
+# Подключается через config.yaml:
+#   extensions: [ai]
+#
+# Семантика — то же что manual-allow: домены всегда попадают в ipset prod
+# (т.е. через туннель), минуя probe-пайплайн.
+#
+# Достаточно указать корневой домен — eTLD+1 expansion подтянет в ipset
+# IP-шки всех поддоменов, которые dnsmasq реально резолвил клиенту
+# (cdn.openai.com → Azure-CDN, chat.openai.com → CloudFlare и т.д.).
+
+openai.com
+chatgpt.com
+oaiusercontent.com
+oaistatic.com
+openaicom.imgix.net
+
+anthropic.com
+claude.com
+claude.ai
