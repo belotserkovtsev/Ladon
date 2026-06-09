@@ -70,6 +70,18 @@ func Resolve(kind string) string {
 	return kind
 }
 
+// DefaultUnboundSocket is where the unbound source listens by default. On
+// FreeBSD/OPNsense unbound runs chrooted in /var/unbound and its module
+// connects to /var/run/ladon-dns.sock from inside that chroot, so the socket
+// has to live at /var/unbound/var/run/ladon-dns.sock for the two to meet — no
+// operator config needed.
+func DefaultUnboundSocket() string {
+	if runtime.GOOS == "freebsd" {
+		return "/var/unbound/var/run/ladon-dns.sock"
+	}
+	return "/var/run/ladon-dns.sock"
+}
+
 // --- dnsmasq mediator: tail the query log, map each line to a Record ---
 
 type dnsmasqSource struct {

@@ -31,7 +31,7 @@ import (
 // log somewhere instead of panicking on a nil logger.
 var (
 	logEngine = slog.Default()
-	logTail   = slog.Default()
+	logIngest = slog.Default()
 	logProbe  = slog.Default()
 	logIpset  = slog.Default()
 	logMaint  = slog.Default()
@@ -183,7 +183,7 @@ func Defaults(logPath string) Config {
 	return Config{
 		LogPath:                logPath,
 		DNSSource:              "auto",
-		UnboundSocket:          "/var/run/ladon-dns.sock",
+		UnboundSocket:          dnssrc.DefaultUnboundSocket(),
 		ExtensionsPath:         "extensions",
 		ProbeInterval:          2 * time.Second,
 		ProbeBatch:             4,
@@ -210,7 +210,7 @@ func Defaults(logPath string) Config {
 func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	// Bind component loggers off whatever default the CLI configured.
 	logEngine = obs.Logger("engine")
-	logTail = obs.Logger("tailer")
+	logIngest = obs.Logger("ingest")
 	logProbe = obs.Logger("prober")
 	logIpset = obs.Logger("ipset")
 	logMaint = obs.Logger("maintenance")
@@ -361,7 +361,7 @@ func runIngest(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 					Domain: rec.Domain,
 					Peer:   rec.Client,
 				}); err != nil {
-					logTail.Error("ingest failed", "domain", rec.Domain, "err", err)
+					logIngest.Error("ingest failed", "domain", rec.Domain, "err", err)
 					continue
 				}
 				ingested++
@@ -389,12 +389,12 @@ func runIngest(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 					storeDomain = origin
 				}
 				if err := store.UpsertDNSObservation(ctx, storeDomain, rec.IP, time.Time{}); err != nil {
-					logTail.Error("dns_cache upsert failed", "domain", storeDomain, "ip", rec.IP, "err", err)
+					logIngest.Error("dns_cache upsert failed", "domain", storeDomain, "ip", rec.IP, "err", err)
 					continue
 				}
 			}
 		case <-report.C:
-			logTail.Info("tailer progress", "ingested", ingested, "skipped", skipped)
+			logIngest.Info("ingest progress", "ingested", ingested, "skipped", skipped)
 		}
 	}
 }

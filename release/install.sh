@@ -208,6 +208,11 @@ detect_topology() {
 banner
 
 # --- preflight ---
+# Linux-only installer (dnsmasq + ipset). FreeBSD/OPNsense take a different
+# path, so fail fast with a pointer instead of a confusing error later on.
+if [[ "$(uname -s)" != Linux ]]; then
+  die "это Linux-инсталлятор. OPNsense → ставь плагин os-ladon (System ▸ Firmware ▸ Plugins); голый FreeBSD → release/opnsense/NOTES.md"
+fi
 [[ $EUID -eq 0 ]] || die "запусти через sudo (нужен root)"
 [[ -f /etc/os-release ]] || die "нет /etc/os-release — поддерживается только Debian/Ubuntu"
 . /etc/os-release

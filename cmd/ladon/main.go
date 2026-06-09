@@ -25,6 +25,7 @@ import (
 
 	"github.com/belotserkovtsev/ladon/internal/config"
 	"github.com/belotserkovtsev/ladon/internal/dnsmasq"
+	"github.com/belotserkovtsev/ladon/internal/dnssrc"
 	"github.com/belotserkovtsev/ladon/internal/doctor"
 	"github.com/belotserkovtsev/ladon/internal/engine"
 	"github.com/belotserkovtsev/ladon/internal/obs"
@@ -139,12 +140,31 @@ func main() {
 
 	case "list":
 		n := 20
-		if len(args) >= 2 {
-			fmt.Sscanf(args[1], "%d", &n)
+		jsonOut := false
+		for _, a := range args[1:] {
+			if a == "-json" || a == "--json" {
+				jsonOut = true
+			} else {
+				fmt.Sscanf(a, "%d", &n)
+			}
 		}
 		doms, err := store.ListRecentDomains(ctx, n)
 		if err != nil {
 			fatal("list: %v", err)
+		}
+		if jsonOut {
+			type row struct {
+				Domain   string `json:"domain"`
+				State    string `json:"state"`
+				Hits     int    `json:"hits"`
+				LastSeen string `json:"last_seen"`
+			}
+			out := make([]row, 0, len(doms))
+			for _, d := range doms {
+				out = append(out, row{d.Domain, d.State, d.HitCount, d.LastSeenAt})
+			}
+			_ = json.NewEncoder(os.Stdout).Encode(out)
+			return
 		}
 		st := ui.For(os.Stdout)
 		term := st.Term()
@@ -175,9 +195,22 @@ func main() {
 		runCmd(ctx, store, *configPath, args[1:])
 
 	case "hot":
+		jsonOut := false
+		for _, a := range args[1:] {
+			if a == "-json" || a == "--json" {
+				jsonOut = true
+			}
+		}
 		hots, err := store.ListHotEntries(ctx, time.Now().UTC())
 		if err != nil {
 			fatal("hot: %v", err)
+		}
+		if jsonOut {
+			if hots == nil {
+				hots = []string{}
+			}
+			_ = json.NewEncoder(os.Stdout).Encode(hots)
+			return
 		}
 		st := ui.For(os.Stdout)
 		term := st.Term()
@@ -430,9 +463,6 @@ func runCmd(ctx context.Context, store *storage.Store, configPath string, rest [
 	if file != nil && file.Logfile != "" && logPath == "" {
 		logPath = file.Logfile
 	}
-	if logPath == "" {
-		fatal("run: missing logfile (positional arg or config.logfile)")
-	}
 
 	cfg := engine.Defaults(logPath)
 	cfg.FromStart = *fromStart
@@ -440,6 +470,11 @@ func runCmd(ctx context.Context, store *storage.Store, configPath string, rest [
 	cfg.ManualDenyPath = *deny
 	cfg.Version = version
 	applyConfigFile(&cfg, file)
+	// The logfile is only the dnsmasq tailer's input; the unbound source reads
+	// a socket and ignores it. Require it only when we actually tail dnsmasq.
+	if dnssrc.Resolve(cfg.DNSSource) == "dnsmasq" && cfg.LogPath == "" {
+		fatal("run: missing logfile (positional arg or config.logfile)")
+	}
 	if err := engine.Run(ctx, store, cfg); err != nil {
 		fatal("engine: %v", err)
 	}
@@ -773,7 +808,9 @@ func whyCmd(ctx context.Context, store *storage.Store, domain string) {
 		return
 	}
 	st := ui.For(os.Stdout)
-	st.Banner(os.Stdout, ui.Subtitle("why", version))
+	if st.Term() {
+		st.Banner(os.Stdout, ui.Subtitle("why", version))
+	}
 	whyBody(ctx, store, st, os.Stdout, domain)
 }
 
