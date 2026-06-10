@@ -14,7 +14,7 @@ mkdir -p /usr/local/etc/ladon /var/db/ladon /var/log/ladon /var/unbound/var/run
 
 configctl template reload OPNsense/Ladon
 
-build_failed=0
+build_failed=0; aliases_failed=0
 if grep -q 'ladon_enable="YES"' /etc/rc.conf.d/ladon 2>/dev/null; then
     # Build the Unbound dynlib against the running unbound (idempotent — only the
     # first enable compiles; later runs skip via the version stamp). The .so is
@@ -39,7 +39,9 @@ if grep -q 'ladon_enable="YES"' /etc/rc.conf.d/ladon 2>/dev/null; then
         rm -f "$DYNLIB_INC" "$CHROOT_SO" "$CHROOT_SO.new"
     fi
     # Declare the pf tables as External firewall aliases (idempotent, create-if-missing).
-    /usr/local/bin/php /usr/local/opnsense/scripts/OPNsense/Ladon/ensure_aliases.php
+    # Not DNS-critical, so we still restart below; just record a failure and surface
+    # it in the final exit so the Apply doesn't read as fully ok with aliases missing.
+    /usr/local/bin/php /usr/local/opnsense/scripts/OPNsense/Ladon/ensure_aliases.php || aliases_failed=1
 else
     # Disabled: the template renders an empty include; drop the staged .so too so
     # nothing dangles in the chroot.
@@ -57,6 +59,10 @@ fi
 if [ "$build_failed" = 1 ]; then
     echo "Unbound-модуль ladon (.so) не собрался — DNS-наблюдение выключено, маршрутизация работать не будет." >&2
     echo "Лог сборки: $BUILD_LOG (нужен выход в интернет к nlnetlabs.nl и базовый cc)." >&2
+    exit 1
+fi
+if [ "$aliases_failed" = 1 ]; then
+    echo "Не удалось завести фаервольные алиасы ladon_engine/ladon_manual/ladon_cidr, повтори Apply." >&2
     exit 1
 fi
 exit 0

@@ -128,7 +128,8 @@ uninstall_opnsense() {
   log "removing unbound dynlib + restarting unbound"
   rm -f /usr/local/etc/unbound.opnsense.d/ladon-dynlib.conf
   configctl unbound restart >/dev/null 2>&1 || warn "unbound restart reported an issue — check 'configctl unbound status'"
-  rm -f /var/unbound/ladon_unbound.so /usr/local/lib/ladon_unbound.so /usr/local/lib/ladon_unbound.so.unbound-version
+  rm -f /var/unbound/ladon_unbound.so /usr/local/lib/ladon_unbound.so \
+        /usr/local/lib/ladon_unbound.so.unbound-version /usr/local/lib/ladon_unbound.so.src-sha
 
   # 3) remove firewall aliases (unreferenced only) + (--purge) the config node
   log "backing out config.xml (aliases + settings)"

@@ -338,6 +338,10 @@ install_opnsense() {
   if [ "$DRY_RUN" = 1 ]; then step "Dry-run"; info "пропущено: копирование, сборка .so, регистрация"; exit 0; fi
 
   step "Установка плагина"
+  # On an upgrade a running daemon holds its own binary busy (ETXTBSY on FreeBSD),
+  # so stop it before overwriting; the GUI Apply restarts it. No-op on a first
+  # install (the plugin ships disabled and isn't running yet).
+  service ladon stop >/dev/null 2>&1 || true
   cp -R "$SRC/plugin/." /usr/local/
   install -m 0755 "$SRC/ladon" /usr/local/bin/ladon
   chmod 0755 /usr/local/etc/rc.d/ladon /usr/local/opnsense/scripts/OPNsense/Ladon/*.sh 2>/dev/null || true
@@ -352,12 +356,17 @@ install_opnsense() {
   fi
 
   step "Регистрация"
-  [ -f /usr/local/etc/rc.d/configd ] && /usr/local/etc/rc.d/configd restart >/dev/null 2>&1 || true
+  reg_ok=1
+  [ -f /usr/local/etc/rc.d/configd ] && { /usr/local/etc/rc.d/configd restart >/dev/null 2>&1 || reg_ok=0; }
   sleep 1
-  [ -f /usr/local/opnsense/mvc/script/run_migrations.php ] && \
-    /usr/local/opnsense/mvc/script/run_migrations.php OPNsense/Ladon >/dev/null 2>&1 || true
-  configctl template reload OPNsense/Ladon >/dev/null 2>&1 || true
-  ok "плагин зарегистрирован (configd + модель + шаблоны)"
+  [ -f /usr/local/opnsense/mvc/script/run_migrations.php ] \
+    && { /usr/local/opnsense/mvc/script/run_migrations.php OPNsense/Ladon >/dev/null 2>&1 || reg_ok=0; }
+  configctl template reload OPNsense/Ladon >/dev/null 2>&1 || reg_ok=0
+  if [ "$reg_ok" = 1 ]; then
+    ok "плагин зарегистрирован (configd + модель + шаблоны)"
+  else
+    warn "регистрация прошла с ошибками, перезапусти install.sh чтобы завершить"
+  fi
 
   printf '\n  %s● ГОТОВО · плагин os-ladon установлен%s\n' "$GREEN" "$NC"
   step "Что дальше"

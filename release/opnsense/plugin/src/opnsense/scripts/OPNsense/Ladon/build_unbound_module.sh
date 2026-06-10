@@ -2,8 +2,9 @@
 # Build the Ladon Unbound dynlib (.so) against the unbound running on THIS box.
 # The .so is ABI-bound to the unbound version, so we build it here rather than
 # shipping a prebuilt one — this is what makes the port survive unbound bumps.
-# Idempotent: skips if already built for
-# the current unbound version.
+# Idempotent: skips the rebuild only when the .so already matches BOTH the running
+# unbound version AND the current module source, so a changed ladon-unbound.c (a
+# new release) forces a rebuild even when unbound's version is unchanged.
 #
 # Usage: build_unbound_module.sh [src.c] [out.so]
 set -e
@@ -11,16 +12,20 @@ set -e
 SRC_C="${1:-/usr/local/share/ladon/ladon-unbound.c}"
 OUT_SO="${2:-/usr/local/lib/ladon_unbound.so}"
 WORK="${TMPDIR:-/tmp}/ladon-unbound-build"
-STAMP="${OUT_SO}.unbound-version"
+STAMP="${OUT_SO}.unbound-version"   # running unbound version (doctor reads this too)
+SRCSTAMP="${OUT_SO}.src-sha"        # sha256 of the source compiled into this .so
 
 [ -f "$SRC_C" ] || { echo "ladon: missing module source $SRC_C" >&2; exit 1; }
 command -v cc >/dev/null 2>&1 || { echo "ladon: cc not found (install the base compiler)" >&2; exit 1; }
 
+SRC_HASH=$(sha256 -q "$SRC_C" 2>/dev/null || sha256sum "$SRC_C" 2>/dev/null | awk '{print $1}')
+
 UVER=$(unbound -V 2>&1 | awk '/^Version/{print $2; exit}')
 [ -n "$UVER" ] || { echo "ladon: cannot determine unbound version" >&2; exit 1; }
 
-if [ -f "$OUT_SO" ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$UVER" ]; then
-    echo "ladon: $OUT_SO already built for unbound $UVER"
+if [ -f "$OUT_SO" ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$UVER" ] \
+   && [ "$(cat "$SRCSTAMP" 2>/dev/null)" = "$SRC_HASH" ]; then
+    echo "ladon: $OUT_SO already built for unbound $UVER (source unchanged)"
     exit 0
 fi
 
@@ -49,5 +54,6 @@ cp "$SRC_C" "$USRC/dynlibmod/examples/ladon.c"
     || { echo "ladon: cc build of dynlib failed" >&2; exit 1; }
 
 echo "$UVER" > "$STAMP"
+echo "$SRC_HASH" > "$SRCSTAMP"
 rm -rf "$WORK"
 echo "ladon: built $OUT_SO for unbound $UVER"
