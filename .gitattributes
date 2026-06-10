@@ -1,4 +1,4 @@
 # These run as-is on FreeBSD/OPNsense — keep LF on every checkout so a Windows
 # working copy never injects CRLF (which breaks sh/php on the target).
 release/opnsense/plugin/** text eol=lf
-release/install.sh text eol=lf
+release/*.sh text eol=lf
