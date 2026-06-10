@@ -94,7 +94,9 @@ try {
         $mdl->aliases->alias->del($node->getAttribute('uuid'));
         $removed[] = $n; $changed = true;
     }
-    if ($changed) { $mdl->serializeToConfig(); }
+    // validateFullModel=false, disable_validation=true — same as ensure_aliases.php,
+    // so an unrelated invalid alias elsewhere can't abort this delete-only teardown.
+    if ($changed) { $mdl->serializeToConfig(false, true); }
     $cfg = Config::getInstance();
     if ($purge) {
         $x = $cfg->object();
@@ -165,7 +167,13 @@ uninstall_opnsense() {
 
   # 6) deregister from the GUI (last)
   log "reloading configd + GUI"
+  # Drop cached model metadata/templates/ACL AND the menu cache, or the dead
+  # "Services ▸ Ladon" entry lingers (TTL ~1h) and errors when clicked. Current
+  # OPNsense caches under /var/lib/php; the old mvc/app/cache path is kept for
+  # older releases. Restrict to *.php so unrelated tempDir files are untouched.
   rm -f /usr/local/opnsense/mvc/app/cache/* 2>/dev/null || true
+  rm -f /var/lib/php/cache/*.php /var/lib/php/tmp/*.php 2>/dev/null || true
+  rm -f /var/lib/php/tmp/opnsense_menu_cache.xml /tmp/opnsense_menu_cache.xml 2>/dev/null || true
   [ -f /usr/local/etc/rc.d/configd ] && /usr/local/etc/rc.d/configd restart >/dev/null 2>&1 || true
   configctl webgui restart >/dev/null 2>&1 || true
 

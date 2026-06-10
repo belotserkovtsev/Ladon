@@ -25,6 +25,11 @@
 
 set -eu
 
+# Temp bundles are cleaned at process exit (after install finishes using $SRC,
+# which points inside one of them — so cleanup must NOT happen any earlier).
+_TMPDIRS=""
+trap 'for _d in $_TMPDIRS; do rm -rf "$_d"; done' EXIT
+
 # ===== env / defaults =====
 GH_REPO="belotserkovtsev/ladon"
 TAG="${TAG:-}"
@@ -49,10 +54,13 @@ if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
 else
   CYAN=; GREEN=; YELLOW=; RED=; DIM=; BOLD=; NC=
 fi
-step() { printf '\n  %s%s%s%s\n' "$BOLD" "$CYAN" "$1" "$NC"; }
-ok()   { printf '   %s✔%s %s\n' "$GREEN" "$NC" "$*"; }
-info() { printf '   %s·%s %s\n' "$DIM" "$NC" "$*"; }
-warn() { printf '   %s▲%s %s\n' "$YELLOW" "$NC" "$*"; }
+# All progress goes to stderr: stdout is reserved for captured values
+# (obtain_bundle prints the source dir there via `SRC=$(obtain_bundle …)`),
+# so a stray ok/info/warn can never pollute what the caller captures.
+step() { printf '\n  %s%s%s%s\n' "$BOLD" "$CYAN" "$1" "$NC" >&2; }
+ok()   { printf '   %s✔%s %s\n' "$GREEN" "$NC" "$*" >&2; }
+info() { printf '   %s·%s %s\n' "$DIM" "$NC" "$*" >&2; }
+warn() { printf '   %s▲%s %s\n' "$YELLOW" "$NC" "$*" >&2; }
 die()  { printf '   %s✖%s %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
 
 banner() {
@@ -100,13 +108,16 @@ resolve_tag() {
 obtain_bundle() {
   if [ -n "$LADON_SRC" ]; then printf '%s' "$LADON_SRC"; return 0; fi
   resolve_tag
-  _work=$(mktemp -d)
+  _work=$(mktemp -d); _TMPDIRS="$_TMPDIRS $_work"
   _base="$1-${TAG}.tar.gz"
   _url="https://github.com/${GH_REPO}/releases/download/${TAG}/${_base}"
   fetch_to "$_work/${_base}" "$_url" || die "не скачал $_url"
   if fetch_to "$_work/${_base}.sha256" "${_url}.sha256" 2>/dev/null; then
-    if sha_verify "$_work/${_base}" "$_work/${_base}.sha256"; then :
-    elif [ $? -eq 1 ]; then die "sha256 не сошёлся — скачивание битое"
+    # Capture sha_verify's status explicitly (0 ok / 1 mismatch / 2 no-tool);
+    # set -e tolerates the failure here because it sits in an if-condition.
+    if sha_verify "$_work/${_base}" "$_work/${_base}.sha256"; then _rc=0; else _rc=$?; fi
+    if   [ "$_rc" = 0 ]; then :
+    elif [ "$_rc" = 1 ]; then die "sha256 не сошёлся — скачивание битое"
     else warn "нет утилиты для проверки sha256 — пропускаю"; fi
   else
     warn "нет .sha256 у релиза — пропускаю проверку"
@@ -143,7 +154,7 @@ ask_extensions() {
     j=1
     for e in $EXT_NAMES; do [ "$j" = "$num" ] && CHOICE_MULTI="$CHOICE_MULTI $e"; j=$((j+1)); done
   done
-  CHOICE_MULTI=$(echo "$CHOICE_MULTI" | sed 's/^ *//')
+  CHOICE_MULTI=$(printf '%s' "$CHOICE_MULTI" | sed 's/^ *//')
 }
 
 PROBE_MODE="local"; REMOTE_URL=""; REMOTE_TOKEN=""
@@ -220,7 +231,7 @@ install_linux() {
 
   EXT_NAMES=""
   for f in "$SRC"/extensions/*.txt; do [ -e "$f" ] && EXT_NAMES="$EXT_NAMES $(basename "$f" .txt)"; done
-  EXT_NAMES=$(echo "$EXT_NAMES" | sed 's/^ *//')
+  EXT_NAMES=$(printf '%s' "$EXT_NAMES" | sed 's/^ *//')
 
   FRESH=1; [ -f "$LADON_CONFIG_DIR/config.yaml" ] && FRESH=0
 
@@ -229,10 +240,16 @@ install_linux() {
   [ -n "$LADON_REMOTE_URL" ] && REMOTE_URL="$LADON_REMOTE_URL"
   [ -n "$LADON_REMOTE_TOKEN" ] && REMOTE_TOKEN="$LADON_REMOTE_TOKEN"
 
-  if [ "$FRESH" = 1 ] && [ -z "$LADON_PROBE_MODE" ] && [ -z "$LADON_EXTENSIONS" ] && { exec 3</dev/tty; } 2>/dev/null; then
+  # Interactive wizard, but only for dimensions not already preset via env.
+  # A bare `exec 3</dev/tty` is FATAL in a non-interactive shell when /dev/tty
+  # can't be opened (the curl|sh path) — `2>/dev/null` can't catch it. So probe
+  # openability in a subshell first (the fatal exit is confined there); only
+  # then commit the real `exec` in this shell.
+  if [ "$FRESH" = 1 ] && { [ -z "$LADON_PROBE_MODE" ] || [ -z "$LADON_EXTENSIONS" ]; } \
+     && ( exec 3</dev/tty ) 2>/dev/null && exec 3</dev/tty; then
     step "Настройка"
-    [ -n "$EXT_NAMES" ] && ask_extensions
-    ask_probe_mode
+    [ -n "$EXT_NAMES" ] && [ -z "$LADON_EXTENSIONS" ] && ask_extensions
+    [ -z "$LADON_PROBE_MODE" ] && ask_probe_mode
     exec 3<&-
   else
     [ "$FRESH" = 0 ] && info "обновление: config.yaml сохраняю, мастер пропускаю"
@@ -252,7 +269,7 @@ install_linux() {
   install -m 0644 "$SRC/config.yaml.example" "$LADON_CONFIG_DIR/config.yaml.example"
   [ ! -f "$LADON_CONFIG_DIR/manual-allow.txt" ] && install -m 0644 "$SRC/manual-allow.txt.example" "$LADON_CONFIG_DIR/manual-allow.txt"
   [ ! -f "$LADON_CONFIG_DIR/manual-deny.txt" ]  && install -m 0644 "$SRC/manual-deny.txt.example"  "$LADON_CONFIG_DIR/manual-deny.txt"
-  install -m 0644 "$SRC/extensions/"*.txt "$LADON_PREFIX/extensions/"
+  for f in "$SRC"/extensions/*.txt; do [ -e "$f" ] && install -m 0644 "$f" "$LADON_PREFIX/extensions/"; done
   ok "бинарь → $LADON_PREFIX/ladon"
 
   cat > /usr/local/bin/ladon <<EOF
