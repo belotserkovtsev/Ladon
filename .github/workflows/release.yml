@@ -62,15 +62,8 @@ jobs:
           retention-days: 7
 
   build-freebsd:
-    name: 🏗 build freebsd ${{ matrix.arch }} (engine + os-ladon plugin)
+    name: 🏗 build freebsd (engine + os-ladon plugin)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # amd64 = OPNsense + bare FreeBSD; arm64 = bare FreeBSD (Pi / ARM server).
-        # The .so is built on the target box, so the plugin tree is arch-neutral —
-        # only the Go engine binary differs by GOARCH.
-        arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -79,35 +72,36 @@ jobs:
           cache: true
 
       - name: build freebsd bundle
+        # amd64 only — OPNsense is amd64. The .so is built on the target box, so
+        # the plugin tree is arch-neutral; just the Go engine binary is GOARCH-set.
         env:
-          ARCH: ${{ matrix.arch }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          STAGE="dist/ladon-freebsd-${ARCH}-${TAG}"
+          STAGE="dist/ladon-freebsd-amd64-${TAG}"
           mkdir -p "${STAGE}/plugin"
-          CGO_ENABLED=0 GOOS=freebsd GOARCH="${ARCH}" \
+          CGO_ENABLED=0 GOOS=freebsd GOARCH=amd64 \
             go build -trimpath -ldflags="-s -w -X main.version=${TAG}" \
             -o "${STAGE}/ladon" ./cmd/ladon
 
           # plugin/ mirrors the OPNsense hier with the src/ level stripped:
           #   plugin/{etc,opnsense,share} → /usr/local/{etc,opnsense,share}
           # which is exactly what install.sh `cp -R "$SRC/plugin/." /usr/local/`
-          # (and install_bsd_bare's per-file reads) expect. .gitattributes keeps
-          # these scripts LF, so the checkout carries no CRLF into the tarball.
+          # expects. .gitattributes keeps these scripts LF, so the checkout
+          # carries no CRLF into the tarball.
           cp -R release/opnsense/plugin/src/. "${STAGE}/plugin/"
 
-          tar -czf "dist/ladon-freebsd-${ARCH}.tar.gz" -C dist "ladon-freebsd-${ARCH}-${TAG}"
-          (cd dist && sha256sum "ladon-freebsd-${ARCH}.tar.gz" \
-            > "ladon-freebsd-${ARCH}.tar.gz.sha256")
+          tar -czf "dist/ladon-freebsd-amd64.tar.gz" -C dist "ladon-freebsd-amd64-${TAG}"
+          (cd dist && sha256sum "ladon-freebsd-amd64.tar.gz" \
+            > "ladon-freebsd-amd64.tar.gz.sha256")
 
       - name: upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ladon-freebsd-${{ matrix.arch }}
+          name: ladon-freebsd-amd64
           path: |
-            dist/ladon-freebsd-${{ matrix.arch }}.tar.gz
-            dist/ladon-freebsd-${{ matrix.arch }}.tar.gz.sha256
+            dist/ladon-freebsd-amd64.tar.gz
+            dist/ladon-freebsd-amd64.tar.gz.sha256
           retention-days: 7
 
   publish:

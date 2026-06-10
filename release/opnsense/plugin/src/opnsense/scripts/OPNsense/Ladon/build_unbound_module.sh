@@ -2,7 +2,7 @@
 # Build the Ladon Unbound dynlib (.so) against the unbound running on THIS box.
 # The .so is ABI-bound to the unbound version, so we build it here rather than
 # shipping a prebuilt one — this is what makes the port survive unbound bumps.
-# Reusable on OPNsense and bare FreeBSD. Idempotent: skips if already built for
+# Idempotent: skips if already built for
 # the current unbound version.
 #
 # Usage: build_unbound_module.sh [src.c] [out.so]

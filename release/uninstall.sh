@@ -181,21 +181,8 @@ uninstall_opnsense() {
   warn "NOT removed: firewall rules YOU added referencing the ladon aliases"
 }
 
-uninstall_bsd_bare() {
-  log "stopping ladon"
-  service ladon stop 2>/dev/null || true
-  sysrc -x ladon_enable 2>/dev/null || true
-  log "removing files"
-  rm -f /usr/local/bin/ladon /usr/local/etc/rc.d/ladon
-  rm -f /usr/local/lib/ladon_unbound.so /usr/local/lib/ladon_unbound.so.unbound-version /var/unbound/ladon_unbound.so
-  rm -rf /usr/local/share/ladon
-  if [ "$PURGE" = 1 ]; then rm -rf /var/db/ladon /var/log/ladon; log "purged state"; fi
-  warn "NOT removed: the dynlib block you added to unbound.conf, and your pf tables/rules — undo those by hand"
-  log "ladon uninstalled (FreeBSD)"
-}
-
 case "$(uname -s)" in
   Linux)   uninstall_linux ;;
-  FreeBSD) if is_opnsense; then uninstall_opnsense; else uninstall_bsd_bare; fi ;;
+  FreeBSD) if is_opnsense; then uninstall_opnsense; else die "на FreeBSD поддерживается только OPNsense"; fi ;;
   *) die "unsupported OS: $(uname -s)" ;;
 esac

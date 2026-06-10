@@ -4,7 +4,6 @@
 #
 #   Linux            — dnsmasq + ipset + systemd unit (Debian/Ubuntu gateway).
 #   OPNsense         — the os-ladon plugin (GUI/service/configd); Unbound + pf.
-#   bare FreeBSD     — headless engine (binary + rc.d), wire Unbound/pf by hand.
 #
 # Re-running upgrades in place (config/state/aliases preserved). Routing is the
 # operator's job — the script never touches firewall rules, only prints a hint.
@@ -327,25 +326,13 @@ EOF
 # ============================================================
 is_opnsense() { [ -x /usr/local/sbin/opnsense-version ] || [ -d /usr/local/opnsense/mvc ]; }
 
-# FreeBSD release arch → FBARCH (amd64|arm64). Run as a statement, not in $(…),
-# so `die` exits the real shell. The bundle ships both and the .so builds on-box,
-# so either arch is fully supported (arm64 is for bare FreeBSD — OPNsense is amd64).
-FBARCH=""
-resolve_freebsd_arch() {
-  case "$(uname -m)" in
-    amd64|x86_64)  FBARCH=amd64 ;;
-    arm64|aarch64) FBARCH=arm64 ;;
-    *) die "архитектура FreeBSD не поддерживается: $(uname -m) (нужен amd64 или arm64)" ;;
-  esac
-}
-
 install_opnsense() {
-  resolve_freebsd_arch
+  [ "$(uname -m)" = amd64 ] || die "поддерживается только amd64 (OPNsense)"
   step "Окружение"
-  ok "OPNsense $(/usr/local/sbin/opnsense-version 2>/dev/null || echo '') · $FBARCH"
+  ok "OPNsense $(/usr/local/sbin/opnsense-version 2>/dev/null || echo '')"
 
   step "Загрузка"
-  SRC=$(obtain_bundle "ladon-freebsd-${FBARCH}")
+  SRC=$(obtain_bundle "ladon-freebsd-amd64")
   ok "версия: ${TAG:-$LADON_SRC}"
 
   if [ "$DRY_RUN" = 1 ]; then step "Dry-run"; info "пропущено: копирование, сборка .so, регистрация"; exit 0; fi
@@ -380,31 +367,6 @@ install_opnsense() {
   printf '\n'
 }
 
-install_bsd_bare() {
-  resolve_freebsd_arch
-  step "Окружение"; ok "bare FreeBSD/$(uname -r) $FBARCH — без GUI"
-  step "Загрузка"; SRC=$(obtain_bundle "ladon-freebsd-${FBARCH}"); ok "версия: ${TAG:-$LADON_SRC}"
-  if [ "$DRY_RUN" = 1 ]; then step "Dry-run"; exit 0; fi
-
-  step "Установка"
-  install -m 0755 "$SRC/ladon" /usr/local/bin/ladon
-  install -m 0755 "$SRC/plugin/etc/rc.d/ladon" /usr/local/etc/rc.d/ladon
-  install -d /usr/local/share/ladon /var/db/ladon /var/log/ladon
-  install -m 0644 "$SRC/plugin/share/ladon/ladon-unbound.c" /usr/local/share/ladon/ladon-unbound.c
-  install -m 0755 "$SRC/plugin/opnsense/scripts/OPNsense/Ladon/build_unbound_module.sh" /usr/local/share/ladon/build_unbound_module.sh
-  sysrc ladon_enable=YES >/dev/null
-  ok "бинарь + rc.d"
-
-  step "Сборка Unbound-модуля"
-  if sh /usr/local/share/ladon/build_unbound_module.sh; then ok "ladon_unbound.so собран"; else warn "не собрал .so (нужен интернет + cc)"; fi
-
-  printf '\n  %s● движок установлен%s — обвязку Unbound/pf сделать вручную:\n' "$GREEN" "$NC"
-  printf '%s    unbound: server { module-config: "dynlib iterator" }  dynlib { dynlib-file: "/ladon_unbound.so" }\n' "$DIM"
-  printf '             cp /usr/local/lib/ladon_unbound.so /var/unbound/ladon_unbound.so ; service unbound restart\n'
-  printf '    pf:      table <ladon_engine> persist ; pass out route-to (<if> <gw>) from <lan> to <ladon_engine>\n'
-  printf '    start:   service ladon start%s\n\n' "$NC"
-}
-
 # ============================================================
 #  main
 # ============================================================
@@ -413,6 +375,6 @@ banner
 need_root
 case "$(uname -s)" in
   Linux)   install_linux ;;
-  FreeBSD) if is_opnsense; then install_opnsense; else install_bsd_bare; fi ;;
+  FreeBSD) if is_opnsense; then install_opnsense; else die "на FreeBSD поддерживается только OPNsense"; fi ;;
   *) die "неподдерживаемая ОС: $(uname -s)" ;;
 esac
