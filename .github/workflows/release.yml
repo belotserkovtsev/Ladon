@@ -127,12 +127,21 @@ jobs:
         run: ls -la dist/
 
       - name: stage standalone install scripts
-        # Publish install.sh / uninstall.sh as separate release assets too,
-        # so the recommended curl one-liner can fetch them via the predictable
-        # /releases/latest/download/install.sh URL without unpacking a tarball.
+        # Publish install.sh / uninstall.sh as separate release assets too. Bake
+        # THIS release's tag into the published install.sh as the default TAG, so a
+        # tester who runs it without TAG= installs THIS release's bundles — not
+        # whatever /releases/latest resolves to (a prerelease beta is never
+        # "latest", and an older stable tag predates the freebsd bundles). The
+        # in-repo install.sh keeps TAG="${TAG:-}" = follow-latest for local use.
+        env:
+          TAG_NAME: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           cp release/install.sh   dist/install.sh
           cp release/uninstall.sh dist/uninstall.sh
+          sed -i "s|^TAG=\"\${TAG:-}\"|TAG=\"\${TAG:-${TAG_NAME}}\"|" dist/install.sh
+          grep -q "^TAG=\"\${TAG:-${TAG_NAME}}\"\$" dist/install.sh \
+            || { echo "could not bake TAG into install.sh — the TAG= line format changed"; exit 1; }
           chmod +x dist/install.sh dist/uninstall.sh
 
       - name: release notes from the merged PR description
