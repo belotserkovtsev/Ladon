@@ -327,13 +327,25 @@ EOF
 # ============================================================
 is_opnsense() { [ -x /usr/local/sbin/opnsense-version ] || [ -d /usr/local/opnsense/mvc ]; }
 
+# FreeBSD release arch → FBARCH (amd64|arm64). Run as a statement, not in $(…),
+# so `die` exits the real shell. The bundle ships both and the .so builds on-box,
+# so either arch is fully supported (arm64 is for bare FreeBSD — OPNsense is amd64).
+FBARCH=""
+resolve_freebsd_arch() {
+  case "$(uname -m)" in
+    amd64|x86_64)  FBARCH=amd64 ;;
+    arm64|aarch64) FBARCH=arm64 ;;
+    *) die "архитектура FreeBSD не поддерживается: $(uname -m) (нужен amd64 или arm64)" ;;
+  esac
+}
+
 install_opnsense() {
-  [ "$(uname -m)" = amd64 ] || die "поддерживается только amd64"
+  resolve_freebsd_arch
   step "Окружение"
-  ok "OPNsense $(/usr/local/sbin/opnsense-version 2>/dev/null || echo '')"
+  ok "OPNsense $(/usr/local/sbin/opnsense-version 2>/dev/null || echo '') · $FBARCH"
 
   step "Загрузка"
-  SRC=$(obtain_bundle "ladon-freebsd-amd64")
+  SRC=$(obtain_bundle "ladon-freebsd-${FBARCH}")
   ok "версия: ${TAG:-$LADON_SRC}"
 
   if [ "$DRY_RUN" = 1 ]; then step "Dry-run"; info "пропущено: копирование, сборка .so, регистрация"; exit 0; fi
@@ -369,9 +381,9 @@ install_opnsense() {
 }
 
 install_bsd_bare() {
-  [ "$(uname -m)" = amd64 ] || die "поддерживается только amd64"
-  step "Окружение"; ok "bare FreeBSD/$(uname -r) — без GUI"
-  step "Загрузка"; SRC=$(obtain_bundle "ladon-freebsd-amd64"); ok "версия: ${TAG:-$LADON_SRC}"
+  resolve_freebsd_arch
+  step "Окружение"; ok "bare FreeBSD/$(uname -r) $FBARCH — без GUI"
+  step "Загрузка"; SRC=$(obtain_bundle "ladon-freebsd-${FBARCH}"); ok "версия: ${TAG:-$LADON_SRC}"
   if [ "$DRY_RUN" = 1 ]; then step "Dry-run"; exit 0; fi
 
   step "Установка"

@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
@@ -30,6 +31,33 @@ import (
 // unit that fills ipsets and tails dnsmasq. The checks are identical — only the
 // "how to fix" wording differs by platform.
 func onFreeBSD() bool { return runtime.GOOS == "freebsd" }
+
+// freebsdServiceUp reports whether an rc.d service is currently running, via
+// `service <svc> onestatus` (exit 0 = running, ignores the enable flag).
+func freebsdServiceUp(ctx context.Context, svc string) bool {
+	if _, err := exec.LookPath("service"); err != nil {
+		return false
+	}
+	return exec.CommandContext(ctx, "service", svc, "onestatus").Run() == nil
+}
+
+// unboundVersion returns the running unbound's version ("1.23.1") or "".
+func unboundVersion(ctx context.Context) string {
+	bin, err := exec.LookPath("unbound")
+	if err != nil {
+		bin = "/usr/local/sbin/unbound"
+	}
+	out, err := exec.CommandContext(ctx, bin, "-V").Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if f := strings.Fields(line); len(f) >= 2 && f[0] == "Version" {
+			return f[1]
+		}
+	}
+	return ""
+}
 
 func logCmd() string {
 	if onFreeBSD() {
@@ -142,6 +170,13 @@ func (p Params) now() time.Time {
 	return p.Now.UTC()
 }
 
+func (p Params) serviceName() string {
+	if p.ServiceName != "" {
+		return p.ServiceName
+	}
+	return "ladon"
+}
+
 // Run performs all checks and returns a Report. It never returns an error —
 // every failure mode (DB error, missing tool, dead set) becomes a check so the
 // operator sees one consistent surface.
@@ -151,7 +186,7 @@ func Run(ctx context.Context, store *storage.Store, p Params) Report {
 	add := func(c Check) { checks = append(checks, c) }
 
 	checks = append(checks, engineChecks(ctx, store, p, now)...)
-	checks = append(checks, inputChecks(ctx, store, now)...)
+	checks = append(checks, inputChecks(ctx, store, p, now)...)
 	checks = append(checks, decideChecks(ctx, store, now)...)
 	checks = append(checks, accumChecks(ctx, store, now)...)
 	checks = append(checks, enforceChecks(ctx, store, p, now)...)
@@ -248,11 +283,7 @@ func engineChecks(ctx context.Context, store *storage.Store, p Params, now time.
 
 	// Service liveness — ladon's own daemon (systemd unit on Linux, rc.d on FreeBSD).
 	if p.ProbeService {
-		svc := p.ServiceName
-		if svc == "" {
-			svc = "ladon"
-		}
-		out = append(out, serviceCheck(ctx, svc))
+		out = append(out, serviceCheck(ctx, p.serviceName()))
 	}
 
 	// Heartbeat freshness — the expiry sweeper stamps last_tick_at every
@@ -288,8 +319,48 @@ func engineChecks(ctx context.Context, store *storage.Store, p Params, now time.
 	return out
 }
 
-func inputChecks(ctx context.Context, store *storage.Store, now time.Time) []Check {
+// dynlibCheck (FreeBSD only) verifies the Unbound dynlib — the thing that feeds
+// every DNS observation — is actually built and current. A missing .so means the
+// on-box build failed (no egress / no cc), so the engine sees nothing; surface
+// that as the root cause instead of letting it read as a generic "no DNS". Gated
+// on ProbeService so unit tests never touch the filesystem or shell out.
+func dynlibCheck(ctx context.Context, svc string) (Check, bool) {
+	if !onFreeBSD() {
+		return Check{}, false
+	}
+	const chrootSO = "/var/unbound/ladon_unbound.so"
+	if _, err := os.Stat(chrootSO); err != nil {
+		// A stopped daemon is already reported by serviceCheck — don't double up.
+		if !freebsdServiceUp(ctx, svc) {
+			return Check{}, false
+		}
+		return Check{Stage: StageInput, Status: StatusFail,
+			Title:  "dynlib не собран",
+			Detail: ".so нет в chroot unbound — наблюдений не будет",
+			Fix:    "configctl ladon reconfigure ; tail -n 50 /var/log/ladon/dynlib-build.log"}, true
+	}
+	// Present — built for the running unbound? The stamp sits by the lib copy.
+	if want := unboundVersion(ctx); want != "" {
+		stamp, _ := os.ReadFile("/usr/local/lib/ladon_unbound.so.unbound-version")
+		if got := trim(stamp); got != "" && got != want {
+			return Check{Stage: StageInput, Status: StatusWarn,
+				Title:  "dynlib устарел",
+				Detail: "собран под unbound " + got + ", сейчас " + want,
+				Fix:    "configctl ladon reconfigure"}, true
+		}
+	}
+	return Check{Stage: StageInput, Status: StatusOK,
+		Title: "dynlib подключён", Detail: "ladon_unbound.so в chroot"}, true
+}
+
+func inputChecks(ctx context.Context, store *storage.Store, p Params, now time.Time) []Check {
 	var out []Check
+
+	if p.ProbeService {
+		if c, ok := dynlibCheck(ctx, p.serviceName()); ok {
+			out = append(out, c)
+		}
+	}
 
 	last, ok, err := store.LatestObservationAt(ctx)
 	switch {

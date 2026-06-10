@@ -28,8 +28,8 @@ dynlib into unbound (`unbound.opnsense.d/`), declares the three pf tables as
 Assumes a chrooted unbound at `/var/unbound` (FreeBSD base `local_unbound`). No
 installer — wire it by hand (all pieces are in this repo):
 
-1. **Binary**: `CGO_ENABLED=0 GOOS=freebsd GOARCH=amd64 go build -o ladon ./cmd/ladon`,
-   then `install -m755 ladon /usr/local/bin/ladon`.
+1. **Binary**: `CGO_ENABLED=0 GOOS=freebsd GOARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') go build -o ladon ./cmd/ladon`,
+   then `install -m755 ladon /usr/local/bin/ladon` (amd64 and arm64 both build clean).
 2. **Service**: copy `plugin/src/etc/rc.d/ladon` → `/usr/local/etc/rc.d/ladon`,
    then `sysrc ladon_enable=YES`.
 3. **Dynlib**: `install -m644 release/opnsense/plugin/src/share/ladon/ladon-unbound.c /usr/local/share/ladon/`,
