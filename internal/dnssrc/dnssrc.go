@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/belotserkovtsev/ladon/internal/dnsmasq"
 	"github.com/belotserkovtsev/ladon/internal/tail"
@@ -145,11 +146,11 @@ func (s *unboundSource) Events(ctx context.Context) (<-chan Record, <-chan error
 	out := make(chan Record)
 	errs := make(chan error, 1)
 	go func() {
-		defer close(out)
 		_ = os.Remove(s.socket)
 		ln, err := net.Listen("unix", s.socket)
 		if err != nil {
 			errs <- err
+			close(out)
 			return
 		}
 		_ = os.Chmod(s.socket, 0o660)
@@ -157,17 +158,27 @@ func (s *unboundSource) Events(ctx context.Context) (<-chan Record, <-chan error
 			<-ctx.Done()
 			ln.Close()
 		}()
+		// Close out only after every serveConn sender has returned, or a
+		// connection still writing during shutdown would send on a closed channel
+		// and panic (dirty exit instead of 0). serveConn unblocks on ctx via send().
+		var wg sync.WaitGroup
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
 				select {
 				case <-ctx.Done():
+					wg.Wait()
+					close(out)
 					return
 				default:
 					continue
 				}
 			}
-			go serveConn(ctx, conn, out)
+			wg.Add(1)
+			go func(c net.Conn) {
+				defer wg.Done()
+				serveConn(ctx, c, out)
+			}(conn)
 		}
 	}()
 	return out, errs
@@ -191,8 +202,12 @@ func serveConn(ctx context.Context, conn net.Conn, out chan<- Record) {
 		if len(fields) >= 3 && fields[2] != "" {
 			ips = strings.Split(fields[2], ",")
 		}
+		// Wrap into the same 16-bit space the engine's chainOrigin map assumes
+		// (dnsmasq supplies a 16-bit query id). Unbound streams over one long-lived
+		// connection, so an unwrapped monotonic seq would grow that map for the
+		// whole process lifetime.
 		seq++
-		id := strconv.Itoa(seq)
+		id := strconv.Itoa(seq % 65536)
 		if !send(ctx, out, Record{Kind: Query, Domain: domain, Client: client, ChainID: id}) {
 			return
 		}

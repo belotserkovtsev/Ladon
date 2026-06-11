@@ -60,8 +60,8 @@
                 <MaximumValue>100000</MaximumValue>
             </family_confirm_threshold>
             <ignore_peer type="TextField">
-                <Mask>/^([0-9a-fA-F:.]+)?$/</Mask>
-                <ValidationMessage>An IP address, or empty to auto-use the gateway.</ValidationMessage>
+                <Mask>/^(?!127\.)([0-9a-fA-F:.]+)?$/</Mask>
+                <ValidationMessage>An IP address, or empty for the gateway default. Avoid 127.0.0.x: it is the DNS-hook placeholder and would mute Ladon.</ValidationMessage>
             </ignore_peer>
             <manual_allow type="TextField"/>
             <manual_deny type="TextField"/>

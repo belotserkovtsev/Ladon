@@ -83,7 +83,7 @@
         <label>Ignore client IP</label>
         <type>text</type>
         <advanced>true</advanced>
-        <help>Client IP to skip (the gateway itself). Leave empty to use the engine default.</help>
+        <help>Client IP whose queries to skip (the gateway), default 10.10.0.1. Leave empty for that default. Do not use 127.0.0.1: the OPNsense DNS hook reports that placeholder as the client, so it would mute all observations.</help>
     </field>
     <field>
         <id>ladon.general.log_level</id>

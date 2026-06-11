@@ -8,8 +8,11 @@
                 var r = data['response'];
                 if (!r) { $('#doctor-body').html('<tr><td colspan="4">no data</td></tr>'); return; }
                 var cls = (r.Exit === 0) ? 'success' : (r.Exit === 2 ? 'danger' : 'warning');
+                // r.Exit/r.Verdict are 0/1/2; key the word off Exit (Verdict===0 is
+                // JS-falsy, which is why the raw value showed "1"/"2"/"exit 0").
+                var verdict = (r.Exit === 0) ? 'здоров' : (r.Exit === 2 ? 'сломан' : 'есть замечания');
                 $('#doctor-banner').attr('class', 'alert alert-' + cls)
-                    .text((r.Verdict || ('exit ' + r.Exit)) + '  (ladon ' + (r.Version || '') + ')');
+                    .text(verdict + '  (ladon ' + (r.Version || '') + ')');
                 var rows = '';
                 (r.Checks || []).forEach(function(c) {
                     var g = c.Status === 0 ? '<span class="fa fa-check text-success"></span>'

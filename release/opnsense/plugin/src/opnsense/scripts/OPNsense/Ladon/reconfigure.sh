@@ -14,7 +14,7 @@ mkdir -p /usr/local/etc/ladon /var/db/ladon /var/log/ladon /var/unbound/var/run
 
 configctl template reload OPNsense/Ladon
 
-build_failed=0; aliases_failed=0
+build_failed=0; aliases_failed=0; config_failed=0
 if grep -q 'ladon_enable="YES"' /etc/rc.conf.d/ladon 2>/dev/null; then
     # Build the Unbound dynlib against the running unbound (idempotent — only the
     # first enable compiles; later runs skip via the version stamp). The .so is
@@ -42,6 +42,14 @@ if grep -q 'ladon_enable="YES"' /etc/rc.conf.d/ladon 2>/dev/null; then
     # Not DNS-critical, so we still restart below; just record a failure and surface
     # it in the final exit so the Apply doesn't read as fully ok with aliases missing.
     /usr/local/bin/php /usr/local/opnsense/scripts/OPNsense/Ladon/ensure_aliases.php || aliases_failed=1
+
+    # Validate the freshly-rendered config before restarting the daemon — a bad
+    # value (e.g. an unparseable duration) would otherwise crash ladon silently on
+    # restart with no signal in the GUI. On failure leave the last-good daemon up.
+    if [ -f /usr/local/etc/ladon/config.yaml ] \
+       && ! /usr/local/bin/ladon -db /var/db/ladon/engine.db -config /usr/local/etc/ladon/config.yaml config-check >>"$BUILD_LOG" 2>&1; then
+        config_failed=1
+    fi
 else
     # Disabled: the template renders an empty include; drop the staged .so too so
     # nothing dangles in the chroot.
@@ -51,7 +59,8 @@ fi
 configctl unbound restart
 
 if grep -q 'ladon_enable="YES"' /etc/rc.conf.d/ladon 2>/dev/null; then
-    /usr/local/etc/rc.d/ladon restart
+    # Don't restart onto a config that won't parse — keep the last-good daemon up.
+    [ "$config_failed" = 0 ] && /usr/local/etc/rc.d/ladon restart
 else
     /usr/local/etc/rc.d/ladon stop
 fi
@@ -63,6 +72,10 @@ if [ "$build_failed" = 1 ]; then
 fi
 if [ "$aliases_failed" = 1 ]; then
     echo "Не удалось завести фаервольные алиасы ladon_engine/ladon_manual/ladon_cidr, повтори Apply." >&2
+    exit 1
+fi
+if [ "$config_failed" = 1 ]; then
+    echo "config.yaml не прошёл проверку, демон не перезапущен (работает прежняя версия). Лог: $BUILD_LOG" >&2
     exit 1
 fi
 exit 0

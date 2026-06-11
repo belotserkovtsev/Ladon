@@ -38,6 +38,7 @@
 #include <sys/un.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <errno.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,7 +56,8 @@ static void ladon_connect(void) {
 	struct sockaddr_un sa;
 	int fd;
 	if (ladon_fd >= 0) return;
-	fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	/* Non-blocking: a stuck ladon reader must never stall unbound's worker. */
+	fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
 	if (fd < 0) return;
 	memset(&sa, 0, sizeof(sa));
 	sa.sun_family = AF_UNIX;
@@ -71,6 +73,9 @@ static void ladon_emit(const char* line, size_t len) {
 	ladon_connect();
 	if (ladon_fd < 0) return;
 	if (write(ladon_fd, line, len) < 0) {
+		/* Backpressured (ladon slow/stuck): drop this observation rather than
+		 * ever blocking unbound. Only a real socket error tears down the fd. */
+		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return;
 		close(ladon_fd);
 		ladon_fd = -1;
 	}

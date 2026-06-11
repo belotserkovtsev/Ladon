@@ -108,7 +108,10 @@ obtain_bundle() {
   if [ -n "$LADON_SRC" ]; then printf '%s' "$LADON_SRC"; return 0; fi
   resolve_tag
   _work=$(mktemp -d); _TMPDIRS="$_TMPDIRS $_work"
-  _base="$1-${TAG}.tar.gz"
+  # CI publishes assets WITHOUT the tag in the filename (ladon-<os>-<arch>.tar.gz);
+  # the tag lives only in the release path and the tar-internal dir. So fetch the
+  # un-tagged asset name, but extract into the tagged dir ($1-${TAG}) below.
+  _base="$1.tar.gz"
   _url="https://github.com/${GH_REPO}/releases/download/${TAG}/${_base}"
   fetch_to "$_work/${_base}" "$_url" || die "не скачал $_url"
   if fetch_to "$_work/${_base}.sha256" "${_url}.sha256" 2>/dev/null; then
@@ -366,6 +369,18 @@ install_opnsense() {
     ok "плагин зарегистрирован (configd + модель + шаблоны)"
   else
     warn "регистрация прошла с ошибками, перезапусти install.sh чтобы завершить"
+  fi
+
+  # On an in-place upgrade of an already-enabled box we stopped the daemon above
+  # for the binary swap; bring it back via the normal reconfigure path. A fresh or
+  # disabled install has no enable flag, so this is skipped (operator does Apply).
+  if grep -q 'ladon_enable="YES"' /etc/rc.conf.d/ladon 2>/dev/null; then
+    step "Перезапуск"
+    if configctl ladon reconfigure >/dev/null 2>&1; then
+      ok "служба ladon перезапущена (обновление)"
+    else
+      warn "не удалось перезапустить, открой Services ▸ Ladon ▸ Apply"
+    fi
   fi
 
   printf '\n  %s● ГОТОВО · плагин os-ladon установлен%s\n' "$GREEN" "$NC"

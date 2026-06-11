@@ -53,6 +53,7 @@ commands:
   run  [-from-start] [-config PATH] <logfile>
   status                  what ladon is doing: activity, recent decisions, footprint
   doctor [-config PATH]   diagnosis: walks the pipeline, finds the first break
+  config-check [-config PATH]  parse+validate the config, non-zero exit if bad
   why <domain>            decision trail for one domain (probes, state, ipset)
                           (these open full-screen on a terminal — q to exit; piped = plain)`)
 }
@@ -230,6 +231,19 @@ func main() {
 
 	case "status":
 		statusCmd(ctx, store, *dbPath)
+
+	case "config-check":
+		// Parse + validate the config without touching the DB or network, so the
+		// OPNsense Apply can fail loudly on a bad value instead of letting the
+		// daemon crash silently on restart. config.Load already runs Validate and
+		// the duration parser, so a bad value surfaces here as a non-zero exit.
+		file, err := config.Load(*configPath)
+		if err != nil && err != config.ErrNotFound {
+			fatal("config: %v", err)
+		}
+		cfg := engine.Defaults("")
+		applyConfigFile(&cfg, file)
+		fmt.Println("config ok")
 
 	case "doctor":
 		doctorCmd(ctx, store, *configPath, args[1:])
@@ -505,25 +519,25 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 		cfg.ManualDenyPath = f.ManualDeny
 	}
 	if f.Probe.Timeout > 0 {
-		cfg.ProbeTimeout = f.Probe.Timeout
+		cfg.ProbeTimeout = time.Duration(f.Probe.Timeout)
 	}
 	if f.Probe.Cooldown > 0 {
-		cfg.ProbeCooldown = f.Probe.Cooldown
+		cfg.ProbeCooldown = time.Duration(f.Probe.Cooldown)
 	}
 	if f.Probe.Concurrency > 0 {
 		cfg.InlineProbeConcurrency = f.Probe.Concurrency
 	}
 	if f.Probe.Interval > 0 {
-		cfg.ProbeInterval = f.Probe.Interval
+		cfg.ProbeInterval = time.Duration(f.Probe.Interval)
 	}
 	if f.Probe.Batch > 0 {
 		cfg.ProbeBatch = f.Probe.Batch
 	}
 	if f.Scorer.Interval > 0 {
-		cfg.Scorer.Interval = f.Scorer.Interval
+		cfg.Scorer.Interval = time.Duration(f.Scorer.Interval)
 	}
 	if f.Scorer.Window > 0 {
-		cfg.Scorer.Window = f.Scorer.Window
+		cfg.Scorer.Window = time.Duration(f.Scorer.Window)
 	}
 	if f.Scorer.PromoteThreshold > 0 {
 		cfg.Scorer.PromoteThreshold = f.Scorer.PromoteThreshold
@@ -538,13 +552,13 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 		cfg.CIDRIpsetName = f.Ipset.CIDRName
 	}
 	if f.Ipset.Interval > 0 {
-		cfg.IpsetInterval = f.Ipset.Interval
+		cfg.IpsetInterval = time.Duration(f.Ipset.Interval)
 	}
 	if f.HotTTL > 0 {
-		cfg.HotTTL = f.HotTTL
+		cfg.HotTTL = time.Duration(f.HotTTL)
 	}
 	if f.DNSFreshness > 0 {
-		cfg.DNSFreshness = f.DNSFreshness
+		cfg.DNSFreshness = time.Duration(f.DNSFreshness)
 	}
 	if f.FamilyConfirmThreshold > 0 {
 		cfg.FamilyConfirmThreshold = f.FamilyConfirmThreshold

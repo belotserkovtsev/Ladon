@@ -10,6 +10,7 @@ probe:
   remote:
     url: {{ g.remote_url }}
 {% if g.remote_auth|default('') != '' %}
+    auth_header: Authorization
     auth_value: {{ g.remote_auth }}
 {% endif %}
 {% endif %}

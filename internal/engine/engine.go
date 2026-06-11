@@ -239,8 +239,10 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	}
 	loadDenyExtensions(ctx, store, cfg)
 
-	// Manual-allow + extensions are delegated to dnsmasq's native ipset=
-	// directive. Reasons for the architectural split:
+	// Manual-allow + extensions: on the dnsmasq (Linux) path they're delegated to
+	// dnsmasq's native ipset= directive below; on the unbound path the engine's
+	// manual-syncer fills ladon_manual instead (launched further down). dnsmasq is
+	// preferred where available because:
 	//   1. dnsmasq adds resolved IPs to the kernel set BEFORE returning the
 	//      DNS answer, so the client's first TCP SYN already finds the IP.
 	//      Our tail-and-reconcile loop can never win that race.
@@ -276,7 +278,7 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	// a single buffered slot coalesces storms of hot events into one sync pass.
 	ipsetTrigger := make(chan struct{}, 1)
 
-	errCh := make(chan error, 6)
+	errCh := make(chan error, 7) // 6 always-on stages + manual-syncer on the unbound path
 
 	// launch runs a pipeline stage and reports to errCh only if it returns
 	// BEFORE shutdown was requested. A stage exiting early (a tailer log-read
@@ -301,6 +303,13 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	launch("probe-worker", func() error { return runProbeWorker(ctx, store, cfg, ipsetTrigger) })
 	launch("expiry-sweeper", func() error { return runExpirySweeper(ctx, store, cfg) })
 	launch("ipset-syncer", func() error { return runIpsetSyncer(ctx, store, cfg, ipsetTrigger) })
+	// On the unbound/pfctl path dnsmasq isn't there to fill ladon_manual via its
+	// ipset= directive, so the engine reconciles that set from the observed IPs of
+	// the manual-allow + extension domains. Gated to the non-dnsmasq path so it
+	// never fights dnsmasq's adds on Linux (see the manual block above).
+	if cfg.ManualIpsetName != "" && len(manualEntries.Domains) > 0 && dnssrc.Resolve(cfg.DNSSource) != "dnsmasq" {
+		launch("manual-syncer", func() error { return runManualSyncer(ctx, store, cfg, manualEntries.Domains) })
+	}
 	launch("maintenance", func() error { return runMaintenance(ctx, store, cfg) })
 	launch("scorer", func() error { return scorer.Run(ctx, store, cfg.Scorer) })
 
@@ -324,9 +333,10 @@ func runIngest(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 	// reply's domain is the LAST hop in the chain (e.g. vercel-dns-013.com
 	// for a query against developers.openai.com). Without this map, that IP
 	// would land in dns_cache under vercel-dns-013.com — and our manual-allow
-	// eTLD+1 expansion of openai.com would never see it. Map size is bounded
-	// by the dnsmasq query-id space (~65k); each entry is overwritten when
-	// the id wraps around, so no explicit cleanup needed.
+	// eTLD+1 expansion of openai.com would never see it. Map size is bounded to
+	// the 16-bit id space (~65k): dnsmasq supplies a 16-bit query id and the
+	// unbound source wraps its per-connection seq at 65536, so entries overwrite
+	// instead of accumulating — no explicit cleanup needed.
 	chainOrigin := make(map[string]string)
 
 	for {
@@ -690,6 +700,103 @@ func runIpsetSyncer(ctx context.Context, store *storage.Store, cfg Config, trigg
 		case <-ticker.C:
 			syncNow()
 		case <-trigger:
+			syncNow()
+		}
+	}
+}
+
+// runManualSyncer fills the ladon_manual SET from the observed IPs of the
+// manual-allow + non-CIDR extension domains. It's the unbound/pfctl analog of
+// dnsmasq's ipset= directive: on Linux dnsmasq owns ladon_manual, but on the
+// unbound path nothing else fills it, so the GUI's "always tunneled" promise
+// would be empty without this. Gated to the non-dnsmasq path by the caller, so
+// its destructive Reconcile never strips IPs dnsmasq added on Linux.
+//
+// Per domain it unions the exact-name IPs (store.LookupIPs) with the eTLD+1
+// family IPs (store.LookupIPsByETLD), mirroring dnsmasq's suffix match — a
+// freshly-added manual domain won't tunnel until it has been observed at least
+// once (no DNS observation, no IP to push).
+func runManualSyncer(ctx context.Context, store *storage.Store, cfg Config, domains []string) error {
+	// A launched stage that returns before shutdown is treated as a failure
+	// ("exited unexpectedly"), so every "nothing to do" path here waits for ctx
+	// rather than returning — manual-allow is optional and must never crash the
+	// daemon.
+	if cfg.ManualIpsetName == "" || len(domains) == 0 {
+		<-ctx.Done()
+		return nil
+	}
+	mgr := ipset.New(cfg.ManualIpsetName)
+	ok, err := mgr.Exists(ctx)
+	if err != nil {
+		logIpset.Error("manual ipset exists check failed", "set", cfg.ManualIpsetName, "err", err)
+		<-ctx.Done()
+		return nil
+	}
+	if !ok {
+		logIpset.Warn("manual ipset not found — manual-allow not enforced",
+			"set", cfg.ManualIpsetName,
+			"hint", fmt.Sprintf("ipset create %s hash:ip", cfg.ManualIpsetName))
+		<-ctx.Done()
+		return nil
+	}
+
+	// Family roots are fixed (the manual list is read once at startup).
+	roots := map[string]struct{}{}
+	for _, d := range domains {
+		if r := etld.Compute(d); r != "" {
+			roots[r] = struct{}{}
+		}
+	}
+
+	ticker := time.NewTicker(cfg.IpsetInterval)
+	defer ticker.Stop()
+
+	syncNow := func() {
+		freshSince := time.Now().UTC().Add(-cfg.DNSFreshness)
+		seen := map[string]struct{}{}
+		want := make([]string, 0, len(domains))
+		add := func(ips []string) {
+			for _, ip := range ips {
+				if _, dup := seen[ip]; dup {
+					continue
+				}
+				seen[ip] = struct{}{}
+				want = append(want, ip)
+			}
+		}
+		for _, d := range domains {
+			ips, err := store.LookupIPs(ctx, d, freshSince)
+			if err != nil {
+				logIpset.Error("manual lookup ips failed", "domain", d, "err", err)
+				return
+			}
+			add(ips)
+		}
+		for r := range roots {
+			ips, err := store.LookupIPsByETLD(ctx, r, freshSince)
+			if err != nil {
+				logIpset.Error("manual lookup etld failed", "etld", r, "err", err)
+				return
+			}
+			add(ips)
+		}
+		added, removed, err := mgr.Reconcile(ctx, want)
+		if err != nil {
+			logIpset.Error("manual ipset reconcile failed", "set", cfg.ManualIpsetName, "err", err)
+			return
+		}
+		if added > 0 || removed > 0 {
+			logIpset.Info("manual ipset synced",
+				"set", cfg.ManualIpsetName, "added", added, "removed", removed, "total", len(want))
+		}
+	}
+	syncNow()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
 			syncNow()
 		}
 	}
