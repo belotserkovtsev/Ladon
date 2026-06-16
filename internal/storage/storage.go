@@ -100,12 +100,16 @@ func openPool(path string) (*sql.DB, error) {
 func Open(path string) (*Store, error) {
 	rdb, err := openPool(path)
 	if err != nil {
-		return nil, err
+		// Name the path: the underlying driver reports a missing/unreachable
+		// file as a cryptic "unable to open database file: out of memory (14)",
+		// so without the path operators chase a phantom OOM (it's usually just a
+		// wrong/relative -db pointing at a dir that doesn't exist).
+		return nil, fmt.Errorf("open %q: %w", path, err)
 	}
 	wdb, err := openPool(path)
 	if err != nil {
 		rdb.Close()
-		return nil, err
+		return nil, fmt.Errorf("open %q: %w", path, err)
 	}
 	// Cap the write pool at one connection. All calls routed through wdb
 	// serialize in Go via sql.DB's internal queue; SQLite never sees two

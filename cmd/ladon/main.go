@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -40,6 +41,22 @@ import (
 // (see .github/workflows/release.yml). Defaults to "dev" for local builds.
 var version = "dev"
 
+// defaultDBPath is where a bare `ladon <cmd>` (no -db) looks for the database.
+// It mirrors where each platform's installer puts it so on-box diagnostics
+// (`ladon doctor`, `ladon status`) just work; the service, rc.d and OPNsense
+// configd actions all pass -db explicitly and are unaffected. A relative dev
+// fallback keeps `go run` working from the repo root.
+func defaultDBPath() string {
+	switch runtime.GOOS {
+	case "freebsd": // OPNsense plugin (release/opnsense/plugin/src/etc/rc.d/ladon)
+		return "/var/db/ladon/engine.db"
+	case "linux": // systemd unit default prefix (release/ladon.service)
+		return "/opt/ladon/state/engine.db"
+	default:
+		return filepath.Join("state", "ladon.db")
+	}
+}
+
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage: ladon [-db PATH] [-config PATH] <cmd> [args]
 commands:
@@ -59,7 +76,7 @@ commands:
 }
 
 func main() {
-	dbPath := flag.String("db", filepath.Join("state", "ladon.db"), "path to SQLite database")
+	dbPath := flag.String("db", defaultDBPath(), "path to SQLite database")
 	configPath := flag.String("config", "", "path to YAML config file (optional — defaults apply if empty)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Usage = usage
@@ -80,7 +97,7 @@ func main() {
 
 	store, err := storage.Open(*dbPath)
 	if err != nil {
-		fatal("open db: %v", err)
+		fatal("%v", err)
 	}
 	defer store.Close()
 
