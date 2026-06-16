@@ -108,9 +108,11 @@ func TestPipelineLatencyQueryToHot(t *testing.T) {
 
 	appendLogLine(t, logPath,
 		"Apr 16 00:00:00 dnsmasq[1]: 1 10.10.99.99/1 query[A] blocked.test from 10.10.99.99")
+	appendLogLine(t, logPath,
+		"Apr 16 00:00:00 dnsmasq[1]: 1 10.10.99.99/1 reply blocked.test is "+unreachableIP)
 
-	// Default tail poll is 200ms, so the floor on detection is ~200ms + probe
-	// timeout. Budget 3s to cover slow-CI noise.
+	// Floor on detection is ~200ms tail poll + ~150ms dnsmasq source settle +
+	// probe timeout. Budget 3s to cover slow-CI noise.
 	elapsed := waitForState(t, ctx, s, "blocked.test", "hot", 3*time.Second)
 	t.Logf("query→hot latency: %v (probe_timeout=%v, tailer=fsnotify)", elapsed, probeTimeout)
 
@@ -126,8 +128,8 @@ func TestPipelineLatencyQueryToHot(t *testing.T) {
 	<-engineDone
 }
 
-// TestPipelineThroughput writes N query lines as fast as possible and waits
-// for all N domains to reach a terminal state (hot, ignore, or watch).
+// TestPipelineThroughput writes N query+reply pairs as fast as possible and
+// waits for all N domains to reach a terminal state (hot, ignore, or watch).
 // Surfaces regressions in the scheduling fabric (inline semaphore cap,
 // probe-worker batch size) more than raw probe speed.
 func TestPipelineThroughput(t *testing.T) {
@@ -167,9 +169,13 @@ func TestPipelineThroughput(t *testing.T) {
 
 	start := time.Now()
 	for i := 0; i < N; i++ {
+		peer := i%250 + 2
 		appendLogLine(t, logPath, fmt.Sprintf(
 			"Apr 16 00:00:00 dnsmasq[1]: %d 10.10.99.%d/1 query[A] blocked-%d.test from 10.10.99.%d",
-			i+1, i%250+2, i, i%250+2))
+			i+1, peer, i, peer))
+		appendLogLine(t, logPath, fmt.Sprintf(
+			"Apr 16 00:00:00 dnsmasq[1]: %d 10.10.99.%d/1 reply blocked-%d.test is %s",
+			i+1, peer, i, unreachableIP))
 	}
 
 	// Wait for all N domains to have completed at least one probe (state !=

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -327,18 +326,6 @@ func runIngest(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 	report := time.NewTicker(30 * time.Second)
 	defer report.Stop()
 
-	// chainOrigin tracks dnsmasq query-id → the domain the client originally
-	// asked for. dnsmasq emits ALL replies in a CNAME chain under the same
-	// query-id, but only the terminal A-record carries an IP, and that
-	// reply's domain is the LAST hop in the chain (e.g. vercel-dns-013.com
-	// for a query against developers.openai.com). Without this map, that IP
-	// would land in dns_cache under vercel-dns-013.com — and our manual-allow
-	// eTLD+1 expansion of openai.com would never see it. Map size is bounded to
-	// the 16-bit id space (~65k): dnsmasq supplies a 16-bit query id and the
-	// unbound source wraps its per-connection seq at 65536, so entries overwrite
-	// instead of accumulating — no explicit cleanup needed.
-	chainOrigin := make(map[string]string)
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -347,62 +334,42 @@ func runIngest(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 			if ok && err != nil {
 				return fmt.Errorf("ingest: %w", err)
 			}
-		case rec, ok := <-events:
+		case obs, ok := <-events:
 			if !ok {
 				return nil
 			}
-			switch rec.Kind {
-			case dnssrc.Query:
-				if rec.Client == "" || rec.Client == cfg.IgnorePeer {
-					skipped++
-					continue
-				}
-				// Remember the original queried domain — we'll use it to
-				// re-attribute IP replies that come back through CNAME hops
-				// to a different domain family.
-				if rec.ChainID != "" {
-					chainOrigin[rec.ChainID] = rec.Domain
-				}
-				if deny, _ := store.IsInDenyList(ctx, rec.Domain, etld.Compute(rec.Domain)); deny {
-					skipped++
-					continue
-				}
-				if _, err := watcher.Ingest(ctx, store, watcher.Event{
-					Domain: rec.Domain,
-					Peer:   rec.Client,
-				}); err != nil {
-					logIngest.Error("ingest failed", "domain", rec.Domain, "err", err)
-					continue
-				}
-				ingested++
-				// Inline probe fast-path: kick off right after ingest so a
-				// freshly-observed blocked domain lands in the ipset within
-				// sub-second. probeDomain short-circuits to 'covered' for members
-				// of an already-confirmed family, so no probe fires for
-				// established CDN churn (handled once, in probeDomain).
-				tryInlineProbe(ctx, store, cfg, rec.Domain, sem, ipsetTrigger)
-			case dnssrc.Reply:
-				parsed := net.ParseIP(rec.IP)
-				// We operate on v4 only — stun0, WG subnet, iptables rules
-				// and the prod ipset are all v4. v6 answers would just create
-				// probe-time "cannot assign" failures and pollute dns_cache.
-				if parsed == nil || parsed.To4() == nil {
-					skipped++
-					continue
-				}
-				// CNAME re-attribution: if we tracked the original query for
-				// this id, store the IP under THAT domain so eTLD+1 lookups
-				// from manual-allow can find it. Falls back to the raw reply
-				// domain when we don't have a record (log started mid-stream).
-				storeDomain := rec.Domain
-				if origin, ok := chainOrigin[rec.ChainID]; ok && origin != "" {
-					storeDomain = origin
-				}
-				if err := store.UpsertDNSObservation(ctx, storeDomain, rec.IP, time.Time{}); err != nil {
-					logIngest.Error("dns_cache upsert failed", "domain", storeDomain, "ip", rec.IP, "err", err)
-					continue
+			// Every Observation is a resolved query: domain + the v4 IPs the
+			// client got, CNAME already re-attributed by the source. The engine
+			// stays resolver-agnostic and never resolves anything itself.
+			if obs.Client == "" || obs.Client == cfg.IgnorePeer {
+				skipped++
+				continue
+			}
+			if deny, _ := store.IsInDenyList(ctx, obs.Domain, etld.Compute(obs.Domain)); deny {
+				skipped++
+				continue
+			}
+			if _, err := watcher.Ingest(ctx, store, watcher.Event{
+				Domain: obs.Domain,
+				Peer:   obs.Client,
+			}); err != nil {
+				logIngest.Error("ingest failed", "domain", obs.Domain, "err", err)
+				continue
+			}
+			// Feed dns_cache (the source of truth for ipset routing, eTLD/family
+			// expansion and batch re-probe). Observation IPs are already v4.
+			for _, ip := range obs.IPs {
+				if err := store.UpsertDNSObservation(ctx, obs.Domain, ip, time.Time{}); err != nil {
+					logIngest.Error("dns_cache upsert failed", "domain", obs.Domain, "ip", ip, "err", err)
 				}
 			}
+			ingested++
+			// Inline probe fast-path: kick off right after ingest so a freshly
+			// observed blocked domain lands in the ipset within sub-second, using
+			// the IPs the client actually resolved — no cache race, no self-resolve.
+			// probeDomain short-circuits to 'covered' for members of an
+			// already-confirmed family, so no probe fires for established CDN churn.
+			tryInlineProbe(ctx, store, cfg, obs.Domain, obs.IPs, sem, ipsetTrigger)
 		case <-report.C:
 			logIngest.Info("ingest progress", "ingested", ingested, "skipped", skipped)
 		}
@@ -413,7 +380,7 @@ func runIngest(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 // has room. If the semaphore is full we simply drop the fast-path attempt —
 // the regular probe-worker ticks will pick the domain up shortly after, so
 // nothing is lost, we just don't beat the worker to it under heavy load.
-func tryInlineProbe(ctx context.Context, store *storage.Store, cfg Config, domain string, sem chan struct{}, ipsetTrigger chan<- struct{}) {
+func tryInlineProbe(ctx context.Context, store *storage.Store, cfg Config, domain string, ips []string, sem chan struct{}, ipsetTrigger chan<- struct{}) {
 	if cap(sem) == 0 || cfg.InlineProbeConcurrency == 0 {
 		return
 	}
@@ -428,10 +395,10 @@ func tryInlineProbe(ctx context.Context, store *storage.Store, cfg Config, domai
 		if err != nil || !eligible {
 			return
 		}
-		// Inline path: local-only. The exit-compare validator (if configured)
-		// runs on the batch worker's cooldown re-probe — it would blow the
-		// inline latency budget here.
-		probeDomain(ctx, store, cfg, domain, ipsetTrigger, false)
+		// Inline path: local-only, probing the IPs the client just resolved. The
+		// exit-compare validator (if configured) runs on the batch worker's
+		// cooldown re-probe — it would blow the inline latency budget here.
+		probeDomain(ctx, store, cfg, domain, ips, ipsetTrigger, false)
 	}()
 }
 
@@ -457,22 +424,34 @@ func probeOnce(ctx context.Context, store *storage.Store, cfg Config, ipsetTrigg
 	if err != nil {
 		return err
 	}
+	freshSince := now.Add(-cfg.DNSFreshness)
 	for _, d := range candidates {
 		if err := ctx.Err(); err != nil {
 			return nil
 		}
+		// Probe the IPs the client actually resolved (dns_cache). If the fresh
+		// window has aged out, fall back to the last-known IPs rather than
+		// self-resolving — on a gateway a self-resolve would re-enter the very
+		// resolver we observe. Candidates only ever reach the table from a
+		// resolved observation, so this is virtually always populated.
+		ips, err := store.LookupIPs(ctx, d.Domain, freshSince)
+		if err != nil {
+			logEngine.Warn("dns_cache lookup failed", "domain", d.Domain, "err", err)
+		}
+		if len(ips) == 0 {
+			ips, _ = store.LookupAllIPs(ctx, d.Domain)
+		}
 		// Batch worker uses exit-compare when RemoteProber is configured —
 		// gives the operator's vantage point a vote on borderline calls.
-		probeDomain(ctx, store, cfg, d.Domain, ipsetTrigger, true)
+		probeDomain(ctx, store, cfg, d.Domain, ips, ipsetTrigger, true)
 	}
 	return nil
 }
 
-// probeDomain runs one full probe→decision→persist cycle for a single domain.
-// Shared by the batch worker and the inline fast-path from the tailer; the
-// useExitCompare flag turns on the optional remote validator stage that only
-// the batch path opts into.
-func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain string, ipsetTrigger chan<- struct{}, useExitCompare bool) {
+// probeDomain runs one probe→decision→persist cycle for a domain against the
+// caller-supplied IPs (the inline path passes what the client just resolved;
+// the batch worker passes dns_cache). The engine never resolves DNS itself.
+func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain string, ips []string, ipsetTrigger chan<- struct{}, useExitCompare bool) {
 	if err := prober.Validate(domain); err != nil {
 		_ = store.SetDomainState(ctx, domain, "ignore", time.Time{})
 		return
@@ -492,14 +471,6 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 		}
 		return
 	}
-	// Prefer IPs that dnsmasq actually handed to the client — avoids engine/
-	// client view mismatch with CDNs that geo-route.
-	freshSince := time.Now().UTC().Add(-cfg.DNSFreshness)
-	ips, err := store.LookupIPs(ctx, domain, freshSince)
-	if err != nil {
-		logEngine.Warn("dns_cache lookup failed", "domain", domain, "err", err)
-	}
-
 	// Phase 1: local probe (always). This is the gateway-side view; if it says
 	// the destination is reachable, no exit comparison can change that.
 	res := cfg.LocalProber.Probe(ctx, domain, ips)
