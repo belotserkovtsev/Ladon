@@ -1,0 +1,35 @@
+#!/bin/sh
+# PROVIDE: ladon
+# REQUIRE: NETWORKING SERVERS unbound pf
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="ladon"
+rcvar="ladon_enable"
+pidfile="/var/run/${name}.pid"
+
+ladon_bin="/usr/local/bin/ladon"
+ladon_db="/var/db/ladon/engine.db"
+ladon_config="/usr/local/etc/ladon/config.yaml"
+ladon_log="/var/log/ladon/run.log"
+
+load_rc_config $name
+: ${ladon_enable:="NO"}
+
+# Config is optional: with none, ladon auto-configures (Unbound DNS source +
+# pf tables on FreeBSD). Drop a config.yaml only to tune non-default knobs.
+ladon_cfg_arg=""
+[ -f "${ladon_config}" ] && ladon_cfg_arg="-config ${ladon_config}"
+
+command="/usr/sbin/daemon"
+command_args="-f -o ${ladon_log} -p ${pidfile} ${ladon_bin} -db ${ladon_db} ${ladon_cfg_arg} run"
+procname="${ladon_bin}"
+
+start_precmd="ladon_precmd"
+ladon_precmd()
+{
+    /bin/mkdir -p /var/db/ladon /var/log/ladon /var/unbound/var/run
+}
+
+run_rc_command "$1"

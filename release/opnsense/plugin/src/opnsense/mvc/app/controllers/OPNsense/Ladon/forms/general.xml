@@ -1,0 +1,94 @@
+<form>
+    <field>
+        <type>header</type>
+        <label>Ladon</label>
+    </field>
+    <field>
+        <id>ladon.general.enabled</id>
+        <label>Enable Ladon</label>
+        <type>checkbox</type>
+        <help>Run the Ladon split-routing engine and load the Unbound DNS hook.</help>
+    </field>
+    <field>
+        <id>ladon.general.probe_mode</id>
+        <label>Probe mode</label>
+        <type>dropdown</type>
+        <help>local: gateway-side probe only. exit-compare: also validate blocks against a remote prober (needs a clean exit).</help>
+    </field>
+    <field>
+        <id>ladon.general.remote_url</id>
+        <label>Remote prober URL</label>
+        <type>text</type>
+        <help>exit-compare only. HTTP endpoint of the remote prober.</help>
+    </field>
+    <field>
+        <id>ladon.general.remote_auth</id>
+        <label>Remote prober token</label>
+        <type>password</type>
+        <help>exit-compare only. Sent as the prober auth value.</help>
+    </field>
+    <field>
+        <id>ladon.general.allow_extensions</id>
+        <label>Route presets</label>
+        <type>select_multiple</type>
+        <help>Bundled allow-lists to always send through the tunnel.</help>
+    </field>
+    <field>
+        <id>ladon.general.promote_threshold</id>
+        <label>Promote threshold</label>
+        <type>text</type>
+        <hint>50</hint>
+        <help>Blocked verdicts within the scorer window before a domain is cached durably.</help>
+    </field>
+    <field>
+        <id>ladon.general.hot_ttl</id>
+        <label>Hot TTL</label>
+        <type>text</type>
+        <hint>24h</hint>
+        <help>How long a one-off detected block stays tunneled.</help>
+    </field>
+    <field>
+        <type>header</type>
+        <label>Manual lists</label>
+    </field>
+    <field>
+        <id>ladon.general.manual_allow</id>
+        <label>Manual allow</label>
+        <type>textbox</type>
+        <help>One domain or CIDR per line — always tunneled.</help>
+    </field>
+    <field>
+        <id>ladon.general.manual_deny</id>
+        <label>Manual deny</label>
+        <type>textbox</type>
+        <help>One domain per line — never tracked or tunneled.</help>
+    </field>
+    <field>
+        <id>ladon.general.deny_extensions</id>
+        <label>Deny presets</label>
+        <type>select_multiple</type>
+        <advanced>true</advanced>
+        <help>Bundled deny-lists (same pool as route presets; a name cannot be in both).</help>
+    </field>
+    <field>
+        <id>ladon.general.family_confirm_threshold</id>
+        <label>Family confirm threshold</label>
+        <type>text</type>
+        <hint>10</hint>
+        <advanced>true</advanced>
+        <help>Confirmed members of an eTLD+1 before the whole family (CDN) is trusted and expanded.</help>
+    </field>
+    <field>
+        <id>ladon.general.ignore_peer</id>
+        <label>Ignore client IP</label>
+        <type>text</type>
+        <advanced>true</advanced>
+        <help>Client IP whose queries to skip (the gateway), default 10.10.0.1. Leave empty for that default. Do not use 127.0.0.1: the OPNsense DNS hook reports that placeholder as the client, so it would mute all observations.</help>
+    </field>
+    <field>
+        <id>ladon.general.log_level</id>
+        <label>Log level</label>
+        <type>dropdown</type>
+        <advanced>true</advanced>
+    </field>
+</form>

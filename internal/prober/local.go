@@ -33,12 +33,12 @@ func NewLocal(timeout time.Duration) *LocalProber {
 // Name implements Prober.
 func (p *LocalProber) Name() string { return "local" }
 
-// Probe implements Prober. When ips are provided it skips DNS and probes them
-// directly (keeps the engine's view consistent with what dnsmasq already gave
-// the client); otherwise it falls back to the system resolver.
+// Probe implements Prober. It always probes the caller-supplied IPs (what the
+// observer saw the client resolve) and never resolves DNS itself: on a gateway
+// a self-resolve would re-enter the very resolver we observe — a feedback loop —
+// and re-resolve names the client couldn't (search-domain runaway). Empty ips
+// yield CodeNoIPs: nothing resolved, nothing to tunnel. The self-resolving path
+// lives only in the package-level Probe, used by the `ladon probe` CLI.
 func (p *LocalProber) Probe(ctx context.Context, domain string, ips []string) Result {
-	if len(ips) > 0 {
-		return ProbeIPs(ctx, domain, ips, p.Timeout)
-	}
-	return Probe(ctx, domain, p.Timeout)
+	return ProbeIPs(ctx, domain, ips, p.Timeout)
 }

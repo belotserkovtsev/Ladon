@@ -1,0 +1,6 @@
+Ladon split-routing engine for OPNsense.
+
+Observes DNS resolutions through an Unbound dynlib hook, probes
+destinations, and populates pf tables (ladon_engine / ladon_manual /
+ladon_cidr) so an operator firewall rule can route blocked traffic
+through a tunnel gateway.

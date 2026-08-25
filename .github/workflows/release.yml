@@ -61,9 +61,52 @@ jobs:
             dist/ladon-linux-${{ matrix.arch }}.tar.gz.sha256
           retention-days: 7
 
+  build-freebsd:
+    name: 🏗 build freebsd (engine + os-ladon plugin)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build freebsd bundle
+        # amd64 only — OPNsense is amd64. The .so is built on the target box, so
+        # the plugin tree is arch-neutral; just the Go engine binary is GOARCH-set.
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          STAGE="dist/ladon-freebsd-amd64-${TAG}"
+          mkdir -p "${STAGE}/plugin"
+          CGO_ENABLED=0 GOOS=freebsd GOARCH=amd64 \
+            go build -trimpath -ldflags="-s -w -X main.version=${TAG}" \
+            -o "${STAGE}/ladon" ./cmd/ladon
+
+          # plugin/ mirrors the OPNsense hier with the src/ level stripped:
+          #   plugin/{etc,opnsense,share} → /usr/local/{etc,opnsense,share}
+          # which is exactly what install.sh `cp -R "$SRC/plugin/." /usr/local/`
+          # expects. .gitattributes keeps these scripts LF, so the checkout
+          # carries no CRLF into the tarball.
+          cp -R release/opnsense/plugin/src/. "${STAGE}/plugin/"
+
+          tar -czf "dist/ladon-freebsd-amd64.tar.gz" -C dist "ladon-freebsd-amd64-${TAG}"
+          (cd dist && sha256sum "ladon-freebsd-amd64.tar.gz" \
+            > "ladon-freebsd-amd64.tar.gz.sha256")
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ladon-freebsd-amd64
+          path: |
+            dist/ladon-freebsd-amd64.tar.gz
+            dist/ladon-freebsd-amd64.tar.gz.sha256
+          retention-days: 7
+
   publish:
     name: 📦 publish release
-    needs: build
+    needs: [build, build-freebsd]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -78,12 +121,21 @@ jobs:
         run: ls -la dist/
 
       - name: stage standalone install scripts
-        # Publish install.sh / uninstall.sh as separate release assets too,
-        # so the recommended curl one-liner can fetch them via the predictable
-        # /releases/latest/download/install.sh URL without unpacking a tarball.
+        # Publish install.sh / uninstall.sh as separate release assets too. Bake
+        # THIS release's tag into the published install.sh as the default TAG, so a
+        # tester who runs it without TAG= installs THIS release's bundles — not
+        # whatever /releases/latest resolves to (a prerelease beta is never
+        # "latest", and an older stable tag predates the freebsd bundles). The
+        # in-repo install.sh keeps TAG="${TAG:-}" = follow-latest for local use.
+        env:
+          TAG_NAME: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           cp release/install.sh   dist/install.sh
           cp release/uninstall.sh dist/uninstall.sh
+          sed -i "s|^TAG=\"\${TAG:-}\"|TAG=\"\${TAG:-${TAG_NAME}}\"|" dist/install.sh
+          grep -q "^TAG=\"\${TAG:-${TAG_NAME}}\"\$" dist/install.sh \
+            || { echo "could not bake TAG into install.sh — the TAG= line format changed"; exit 1; }
           chmod +x dist/install.sh dist/uninstall.sh
 
       - name: release notes from the merged PR description

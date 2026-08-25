@@ -14,7 +14,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +25,88 @@ import (
 	"github.com/belotserkovtsev/ladon/internal/storage"
 	"github.com/belotserkovtsev/ladon/internal/ui"
 )
+
+// Platform-aware fix hints. On FreeBSD (OPNsense) ladon is an rc.d service that
+// fills pf tables and reads DNS via the Unbound dynlib; on Linux it's a systemd
+// unit that fills ipsets and tails dnsmasq. The checks are identical — only the
+// "how to fix" wording differs by platform.
+func onFreeBSD() bool { return runtime.GOOS == "freebsd" }
+
+// freebsdServiceUp reports whether an rc.d service is currently running, via
+// `service <svc> onestatus` (exit 0 = running, ignores the enable flag).
+func freebsdServiceUp(ctx context.Context, svc string) bool {
+	if _, err := exec.LookPath("service"); err != nil {
+		return false
+	}
+	return exec.CommandContext(ctx, "service", svc, "onestatus").Run() == nil
+}
+
+// unboundVersion returns the running unbound's version ("1.23.1") or "".
+func unboundVersion(ctx context.Context) string {
+	bin, err := exec.LookPath("unbound")
+	if err != nil {
+		bin = "/usr/local/sbin/unbound"
+	}
+	out, err := exec.CommandContext(ctx, bin, "-V").Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if f := strings.Fields(line); len(f) >= 2 && f[0] == "Version" {
+			return f[1]
+		}
+	}
+	return ""
+}
+
+func logCmd() string {
+	if onFreeBSD() {
+		return "tail -n 50 /var/log/ladon/run.log"
+	}
+	return "journalctl -u ladon -n 50 --no-pager"
+}
+
+func restartCmd() string {
+	if onFreeBSD() {
+		return "service ladon restart"
+	}
+	return "systemctl restart ladon"
+}
+
+func grepLog(pat string) string {
+	if onFreeBSD() {
+		return "grep " + pat + " /var/log/ladon/run.log"
+	}
+	return "journalctl -u ladon | grep " + pat
+}
+
+func dnsSourceFix() string {
+	if onFreeBSD() {
+		return "проверь, что unbound запущен и ladon-dynlib подключён, а клиенты резолвят через него"
+	}
+	return "проверь, что dnsmasq пишет лог и `log-queries` включён, а клиенты ходят через этот резолвер"
+}
+
+func dnsQuietFix() string {
+	if onFreeBSD() {
+		return "тихая сеть — или unbound/ladon-dynlib перестал слать наблюдения"
+	}
+	return "тихая сеть — или dnsmasq перестал писать лог (journalctl -u dnsmasq -n 20)"
+}
+
+func setMissingFix(name string) string {
+	if onFreeBSD() {
+		return "заведи External-алиас " + name + " (Firewall → Aliases), затем " + restartCmd()
+	}
+	return "ipset create " + name + " hash:ip ; systemctl restart ladon"
+}
+
+func setEmptyFix(name string) string {
+	if onFreeBSD() {
+		return "reconcile не наполняет таблицу: проверь, что pf-алиас " + name + " существует, " + grepLog("ipset") + ", затем " + restartCmd()
+	}
+	return "reconcile не наполняет набор: проверь права (CAP_NET_ADMIN), " + grepLog("ipset") + ", затем " + restartCmd()
+}
 
 // Status is a single check's outcome.
 type Status int
@@ -86,6 +170,13 @@ func (p Params) now() time.Time {
 	return p.Now.UTC()
 }
 
+func (p Params) serviceName() string {
+	if p.ServiceName != "" {
+		return p.ServiceName
+	}
+	return "ladon"
+}
+
 // Run performs all checks and returns a Report. It never returns an error —
 // every failure mode (DB error, missing tool, dead set) becomes a check so the
 // operator sees one consistent surface.
@@ -95,7 +186,7 @@ func Run(ctx context.Context, store *storage.Store, p Params) Report {
 	add := func(c Check) { checks = append(checks, c) }
 
 	checks = append(checks, engineChecks(ctx, store, p, now)...)
-	checks = append(checks, inputChecks(ctx, store, now)...)
+	checks = append(checks, inputChecks(ctx, store, p, now)...)
 	checks = append(checks, decideChecks(ctx, store, now)...)
 	checks = append(checks, accumChecks(ctx, store, now)...)
 	checks = append(checks, enforceChecks(ctx, store, p, now)...)
@@ -156,29 +247,43 @@ func countWarn(checks []Check) int {
 
 // --- stage checks ---
 
+// serviceCheck reports daemon liveness via the platform service manager.
+func serviceCheck(ctx context.Context, svc string) Check {
+	if onFreeBSD() {
+		if _, err := exec.LookPath("service"); err != nil {
+			return Check{Stage: StageEngine, Status: StatusWarn,
+				Title: "служба: не могу проверить", Detail: "`service` не найден"}
+		}
+		// rc.d `onestatus` exits 0 when the daemon runs, ignoring the enable flag.
+		if err := exec.CommandContext(ctx, "service", svc, "onestatus").Run(); err == nil {
+			return Check{Stage: StageEngine, Status: StatusOK,
+				Title: "служба активна", Detail: svc + " (rc.d)"}
+		}
+		return Check{Stage: StageEngine, Status: StatusFail,
+			Title: "служба не активна", Detail: svc + " (rc.d)",
+			Fix: "service " + svc + " onestart ; " + logCmd()}
+	}
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		return Check{Stage: StageEngine, Status: StatusWarn,
+			Title: "служба: не могу проверить", Detail: "systemctl не найден (не systemd-хост?)"}
+	}
+	state, _ := exec.CommandContext(ctx, "systemctl", "is-active", svc).Output()
+	if str := trim(state); str == "active" {
+		return Check{Stage: StageEngine, Status: StatusOK,
+			Title: "служба активна", Detail: svc + ".service"}
+	} else {
+		return Check{Stage: StageEngine, Status: StatusFail,
+			Title: "служба не активна", Detail: svc + ".service: " + str,
+			Fix: "systemctl status " + svc + " ; journalctl -u " + svc + " -n 50 --no-pager"}
+	}
+}
+
 func engineChecks(ctx context.Context, store *storage.Store, p Params, now time.Time) []Check {
 	var out []Check
 
-	// Service liveness (systemd) — checking ladon's own unit, not routing.
+	// Service liveness — ladon's own daemon (systemd unit on Linux, rc.d on FreeBSD).
 	if p.ProbeService {
-		svc := p.ServiceName
-		if svc == "" {
-			svc = "ladon"
-		}
-		if _, err := exec.LookPath("systemctl"); err != nil {
-			out = append(out, Check{Stage: StageEngine, Status: StatusWarn,
-				Title: "служба: не могу проверить", Detail: "systemctl не найден (не systemd-хост?)"})
-		} else {
-			state, _ := exec.CommandContext(ctx, "systemctl", "is-active", svc).Output()
-			if str := trim(state); str == "active" {
-				out = append(out, Check{Stage: StageEngine, Status: StatusOK,
-					Title: "служба активна", Detail: svc + ".service"})
-			} else {
-				out = append(out, Check{Stage: StageEngine, Status: StatusFail,
-					Title: "служба не активна", Detail: svc + ".service: " + str,
-					Fix: "systemctl status " + svc + " ; journalctl -u " + svc + " -n 50 --no-pager"})
-			}
-		}
+		out = append(out, serviceCheck(ctx, p.serviceName()))
 	}
 
 	// Heartbeat freshness — the expiry sweeper stamps last_tick_at every
@@ -196,7 +301,7 @@ func engineChecks(ctx context.Context, store *storage.Store, p Params, now time.
 	} else if age := now.Sub(tick); age > stale {
 		out = append(out, Check{Stage: StageEngine, Status: StatusFail,
 			Title: "движок завис", Detail: "последний тик " + humanAge(age) + " назад",
-			Fix: "journalctl -u ladon -n 50 --no-pager ; systemctl restart ladon"})
+			Fix: logCmd() + " ; " + restartCmd()})
 	} else {
 		out = append(out, Check{Stage: StageEngine, Status: StatusOK,
 			Title: "живой тик", Detail: humanAge(now.Sub(tick)) + " назад"})
@@ -214,8 +319,48 @@ func engineChecks(ctx context.Context, store *storage.Store, p Params, now time.
 	return out
 }
 
-func inputChecks(ctx context.Context, store *storage.Store, now time.Time) []Check {
+// dynlibCheck (FreeBSD only) verifies the Unbound dynlib — the thing that feeds
+// every DNS observation — is actually built and current. A missing .so means the
+// on-box build failed (no egress / no cc), so the engine sees nothing; surface
+// that as the root cause instead of letting it read as a generic "no DNS". Gated
+// on ProbeService so unit tests never touch the filesystem or shell out.
+func dynlibCheck(ctx context.Context, svc string) (Check, bool) {
+	if !onFreeBSD() {
+		return Check{}, false
+	}
+	const chrootSO = "/var/unbound/ladon_unbound.so"
+	if _, err := os.Stat(chrootSO); err != nil {
+		// A stopped daemon is already reported by serviceCheck — don't double up.
+		if !freebsdServiceUp(ctx, svc) {
+			return Check{}, false
+		}
+		return Check{Stage: StageInput, Status: StatusFail,
+			Title:  "dynlib не собран",
+			Detail: ".so нет в chroot unbound — наблюдений не будет",
+			Fix:    "configctl ladon reconfigure ; tail -n 50 /var/log/ladon/dynlib-build.log"}, true
+	}
+	// Present — built for the running unbound? The stamp sits by the lib copy.
+	if want := unboundVersion(ctx); want != "" {
+		stamp, _ := os.ReadFile("/usr/local/lib/ladon_unbound.so.unbound-version")
+		if got := trim(stamp); got != "" && got != want {
+			return Check{Stage: StageInput, Status: StatusWarn,
+				Title:  "dynlib устарел",
+				Detail: "собран под unbound " + got + ", сейчас " + want,
+				Fix:    "configctl ladon reconfigure"}, true
+		}
+	}
+	return Check{Stage: StageInput, Status: StatusOK,
+		Title: "dynlib подключён", Detail: "ladon_unbound.so в chroot"}, true
+}
+
+func inputChecks(ctx context.Context, store *storage.Store, p Params, now time.Time) []Check {
 	var out []Check
+
+	if p.ProbeService {
+		if c, ok := dynlibCheck(ctx, p.serviceName()); ok {
+			out = append(out, c)
+		}
+	}
 
 	last, ok, err := store.LatestObservationAt(ctx)
 	switch {
@@ -225,14 +370,14 @@ func inputChecks(ctx context.Context, store *storage.Store, now time.Time) []Che
 	case !ok:
 		out = append(out, Check{Stage: StageInput, Status: StatusFail,
 			Title: "ладон не видит DNS", Detail: "ни одного наблюдения в базе",
-			Fix: "проверь, что dnsmasq пишет лог и `log-queries` включён, а клиенты ходят через этот резолвер"})
+			Fix: dnsSourceFix()})
 	default:
 		age := now.Sub(last)
 		switch {
 		case age > 15*time.Minute:
 			out = append(out, Check{Stage: StageInput, Status: StatusWarn,
 				Title: "давно не видел DNS", Detail: "последнее наблюдение " + humanAge(age) + " назад",
-				Fix: "тихая сеть — или dnsmasq перестал писать лог (journalctl -u dnsmasq -n 20)"})
+				Fix: dnsQuietFix()})
 		default:
 			out = append(out, Check{Stage: StageInput, Status: StatusOK,
 				Title: "видит трафик", Detail: "последнее наблюдение " + humanAge(age) + " назад"})
@@ -260,7 +405,7 @@ func decideChecks(ctx context.Context, store *storage.Store, now time.Time) []Ch
 		if pending > 0 {
 			out = append(out, Check{Stage: StageDecide, Status: StatusWarn,
 				Title: "проб ещё нет", Detail: strconv.Itoa(pending) + " доменов ждут пробы",
-				Fix: "если это надолго — проб-воркер мог встать (journalctl -u ladon | grep prober)"})
+				Fix: "если это надолго — проб-воркер мог встать (" + grepLog("prober") + ")"})
 		} else {
 			out = append(out, Check{Stage: StageDecide, Status: StatusOK,
 				Title: "проб ещё нет", Detail: "нет кандидатов — норма для свежего старта"})
@@ -270,7 +415,7 @@ func decideChecks(ctx context.Context, store *storage.Store, now time.Time) []Ch
 		if age > 10*time.Minute && pending > 0 {
 			out = append(out, Check{Stage: StageDecide, Status: StatusWarn,
 				Title: "пробы отстают", Detail: "последняя " + humanAge(age) + " назад, а кандидаты есть",
-				Fix: "journalctl -u ladon | grep prober"})
+				Fix: grepLog("prober")})
 		} else {
 			out = append(out, Check{Stage: StageDecide, Status: StatusOK,
 				Title: "пробы идут", Detail: "последняя " + humanAge(age) + " назад"})
@@ -365,8 +510,12 @@ func ipsetCheck(ctx context.Context, name, label string, expected int, haveExpec
 	ok, err := mgr.Exists(ctx)
 	if err != nil {
 		if errors.Is(err, exec.ErrNotFound) {
+			tool := "ipset"
+			if onFreeBSD() {
+				tool = "pfctl"
+			}
 			return []Check{{Stage: StageEnforce, Status: StatusWarn,
-				Title: label + ": не могу проверить", Detail: "бинарь `ipset` не найден (не Linux-шлюз?)"}}
+				Title: label + ": не могу проверить", Detail: "бинарь `" + tool + "` не найден"}}
 		}
 		return []Check{{Stage: StageEnforce, Status: StatusWarn,
 			Title: label + ": ошибка проверки", Detail: err.Error()}}
@@ -378,7 +527,7 @@ func ipsetCheck(ctx context.Context, name, label string, expected int, haveExpec
 		}
 		return []Check{{Stage: StageEnforce, Status: st,
 			Title: label + " не существует", Detail: "набор не создан в ядре",
-			Fix: "ipset create " + name + " hash:ip ; systemctl restart ladon"}}
+			Fix: setMissingFix(name)}}
 	}
 	members, err := mgr.Members(ctx)
 	if err != nil {
@@ -394,7 +543,7 @@ func ipsetCheck(ctx context.Context, name, label string, expected int, haveExpec
 		}
 		return []Check{{Stage: StageEnforce, Status: StatusFail,
 			Title: label + " ПУСТОЙ", Detail: detail,
-			Fix: "reconcile не наполняет набор: проверь права (CAP_NET_ADMIN), `journalctl -u ladon | grep ipset`, затем `systemctl restart ladon`"}}
+			Fix: setEmptyFix(name)}}
 	}
 	// Drift between what the syncer thinks it pushed and what's actually in the
 	// kernel — a soft signal (a concurrent reconcile, or a manual edit).

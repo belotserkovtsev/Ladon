@@ -1,0 +1,9 @@
+<acl>
+    <page-services-ladon>
+        <name>Services: Ladon</name>
+        <patterns>
+            <pattern>ui/ladon/*</pattern>
+            <pattern>api/ladon/*</pattern>
+        </patterns>
+    </page-services-ladon>
+</acl>

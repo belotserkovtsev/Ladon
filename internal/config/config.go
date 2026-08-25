@@ -11,11 +11,66 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/belotserkovtsev/ladon/internal/prober"
 	"gopkg.in/yaml.v3"
 )
+
+// Duration is a config duration that also understands a leading day unit ("7d"
+// = 168h, "1d12h" = 36h), which the OPNsense GUI offers but Go's stdlib
+// time.ParseDuration rejects. Plain ms/s/m/h still work, and a bare integer is
+// read as nanoseconds. Without this, a perfectly valid GUI value like "7d" would
+// crash the daemon on startup.
+type Duration time.Duration
+
+func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
+	if n.Tag == "!!int" {
+		var ns int64
+		if err := n.Decode(&ns); err != nil {
+			return err
+		}
+		*d = Duration(ns)
+		return nil
+	}
+	var s string
+	if err := n.Decode(&s); err != nil {
+		return err
+	}
+	if s == "" {
+		*d = 0
+		return nil
+	}
+	parsed, err := parseDuration(s)
+	if err != nil {
+		return err
+	}
+	*d = Duration(parsed)
+	return nil
+}
+
+// parseDuration extends time.ParseDuration with a leading "<int>d" day unit.
+// "7d" -> 168h, "1d12h" -> 36h; anything after the day part is handed to the
+// stdlib parser unchanged.
+func parseDuration(s string) (time.Duration, error) {
+	var days time.Duration
+	if i := strings.IndexByte(s, 'd'); i > 0 {
+		if n, err := strconv.Atoi(s[:i]); err == nil {
+			days = time.Duration(n) * 24 * time.Hour
+			s = s[i+1:]
+		}
+	}
+	if s == "" {
+		return days, nil
+	}
+	rest, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, err
+	}
+	return days + rest, nil
+}
 
 // File mirrors the on-disk YAML shape. All fields are optional — unset values
 // fall through to the engine defaults.
@@ -30,10 +85,10 @@ type File struct {
 	Ipset  IpsetSection  `yaml:"ipset"`
 	Log    LogSection    `yaml:"log"`
 
-	HotTTL                 time.Duration `yaml:"hot_ttl"`
-	DNSFreshness           time.Duration `yaml:"dns_freshness"`
-	IgnorePeer             string        `yaml:"ignore_peer"`
-	FamilyConfirmThreshold int           `yaml:"family_confirm_threshold"`
+	HotTTL                 Duration `yaml:"hot_ttl"`
+	DNSFreshness           Duration `yaml:"dns_freshness"`
+	IgnorePeer             string   `yaml:"ignore_peer"`
+	FamilyConfirmThreshold int      `yaml:"family_confirm_threshold"`
 
 	// AllowExtensions are bundled allow-list presets enabled by name. Each
 	// name resolves to <ExtensionsPath>/<name>.txt and is loaded with the
@@ -59,37 +114,37 @@ type File struct {
 //     validates Hot verdicts. local FAIL + remote OK = real DPI block;
 //     local FAIL + remote FAIL = methodological FP, suppressed.
 type ProbeSection struct {
-	Mode        string        `yaml:"mode"` // "local" (default) | "exit-compare"
-	Timeout     time.Duration `yaml:"timeout"`
-	Cooldown    time.Duration `yaml:"cooldown"`
-	Concurrency int           `yaml:"concurrency"`
-	Interval    time.Duration `yaml:"interval"`
-	Batch       int           `yaml:"batch"`
+	Mode        string   `yaml:"mode"` // "local" (default) | "exit-compare"
+	Timeout     Duration `yaml:"timeout"`
+	Cooldown    Duration `yaml:"cooldown"`
+	Concurrency int      `yaml:"concurrency"`
+	Interval    Duration `yaml:"interval"`
+	Batch       int      `yaml:"batch"`
 
 	Remote RemoteSection `yaml:"remote"`
 }
 
 // RemoteSection configures the RemoteProber. Only consulted when mode=remote.
 type RemoteSection struct {
-	URL        string        `yaml:"url"`
-	Timeout    time.Duration `yaml:"timeout"`
-	AuthHeader string        `yaml:"auth_header"`
-	AuthValue  string        `yaml:"auth_value"`
+	URL        string   `yaml:"url"`
+	Timeout    Duration `yaml:"timeout"`
+	AuthHeader string   `yaml:"auth_header"`
+	AuthValue  string   `yaml:"auth_value"`
 }
 
 // ScorerSection mirrors scorer.Config.
 type ScorerSection struct {
-	Interval         time.Duration `yaml:"interval"`
-	Window           time.Duration `yaml:"window"`
-	PromoteThreshold int           `yaml:"promote_threshold"`
+	Interval         Duration `yaml:"interval"`
+	Window           Duration `yaml:"window"`
+	PromoteThreshold int      `yaml:"promote_threshold"`
 }
 
 // IpsetSection mirrors the ipset knobs.
 type IpsetSection struct {
-	EngineName string        `yaml:"engine_name"` // engine-managed (default ladon_engine)
-	ManualName string        `yaml:"manual_name"` // dnsmasq-managed (default ladon_manual; "" disables)
-	CIDRName   string        `yaml:"cidr_name"`   // CIDR hash:net set fed by extensions (default ladon_cidr; "" disables)
-	Interval   time.Duration `yaml:"interval"`
+	EngineName string   `yaml:"engine_name"` // engine-managed (default ladon_engine)
+	ManualName string   `yaml:"manual_name"` // dnsmasq-managed (default ladon_manual; "" disables)
+	CIDRName   string   `yaml:"cidr_name"`   // CIDR hash:net set fed by extensions (default ladon_cidr; "" disables)
+	Interval   Duration `yaml:"interval"`
 }
 
 // LogSection tunes the daemon's structured logging. All fields are optional —
@@ -176,7 +231,7 @@ func (f *File) BuildRemoteProber() prober.Prober {
 		f.Probe.Remote.URL,
 		f.Probe.Remote.AuthHeader,
 		f.Probe.Remote.AuthValue,
-		f.Probe.Remote.Timeout,
+		time.Duration(f.Probe.Remote.Timeout),
 	)
 }
 

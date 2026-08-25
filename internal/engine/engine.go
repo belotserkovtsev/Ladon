@@ -7,15 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"time"
 
 	"github.com/belotserkovtsev/ladon/internal/decision"
-	"github.com/belotserkovtsev/ladon/internal/dnsmasq"
 	"github.com/belotserkovtsev/ladon/internal/dnsmasqcfg"
+	"github.com/belotserkovtsev/ladon/internal/dnssrc"
 	"github.com/belotserkovtsev/ladon/internal/etld"
 	"github.com/belotserkovtsev/ladon/internal/ipset"
 	"github.com/belotserkovtsev/ladon/internal/manual"
@@ -23,7 +22,6 @@ import (
 	"github.com/belotserkovtsev/ladon/internal/prober"
 	"github.com/belotserkovtsev/ladon/internal/scorer"
 	"github.com/belotserkovtsev/ladon/internal/storage"
-	"github.com/belotserkovtsev/ladon/internal/tail"
 	"github.com/belotserkovtsev/ladon/internal/watcher"
 )
 
@@ -32,7 +30,7 @@ import (
 // log somewhere instead of panicking on a nil logger.
 var (
 	logEngine = slog.Default()
-	logTail   = slog.Default()
+	logIngest = slog.Default()
 	logProbe  = slog.Default()
 	logIpset  = slog.Default()
 	logMaint  = slog.Default()
@@ -128,6 +126,8 @@ func collectManualEntries(cfg Config) (manual.Entries, error) {
 type Config struct {
 	LogPath                string        // dnsmasq log to follow
 	FromStart              bool          // tail from beginning of file
+	DNSSource              string        // ingest source: "auto" (by OS) | "dnsmasq" | "unbound"
+	UnboundSocket          string        // unix socket the unbound module writes observations to
 	ProbeInterval          time.Duration // how often probe worker wakes up
 	ProbeBatch             int           // how many candidates per wake
 	ProbeTimeout           time.Duration // per-stage probe timeout
@@ -181,6 +181,8 @@ type Config struct {
 func Defaults(logPath string) Config {
 	return Config{
 		LogPath:                logPath,
+		DNSSource:              "auto",
+		UnboundSocket:          dnssrc.DefaultUnboundSocket(),
 		ExtensionsPath:         "extensions",
 		ProbeInterval:          2 * time.Second,
 		ProbeBatch:             4,
@@ -207,7 +209,7 @@ func Defaults(logPath string) Config {
 func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	// Bind component loggers off whatever default the CLI configured.
 	logEngine = obs.Logger("engine")
-	logTail = obs.Logger("tailer")
+	logIngest = obs.Logger("ingest")
 	logProbe = obs.Logger("prober")
 	logIpset = obs.Logger("ipset")
 	logMaint = obs.Logger("maintenance")
@@ -236,8 +238,10 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	}
 	loadDenyExtensions(ctx, store, cfg)
 
-	// Manual-allow + extensions are delegated to dnsmasq's native ipset=
-	// directive. Reasons for the architectural split:
+	// Manual-allow + extensions: on the dnsmasq (Linux) path they're delegated to
+	// dnsmasq's native ipset= directive below; on the unbound path the engine's
+	// manual-syncer fills ladon_manual instead (launched further down). dnsmasq is
+	// preferred where available because:
 	//   1. dnsmasq adds resolved IPs to the kernel set BEFORE returning the
 	//      DNS answer, so the client's first TCP SYN already finds the IP.
 	//      Our tail-and-reconcile loop can never win that race.
@@ -249,7 +253,7 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	if err != nil {
 		logEngine.Error("collect manual entries failed", "err", err)
 	}
-	if cfg.ManualIpsetName != "" {
+	if cfg.ManualIpsetName != "" && dnssrc.Resolve(cfg.DNSSource) == "dnsmasq" {
 		if err := dnsmasqcfg.Write(cfg.ManualIpsetName, manualEntries.Domains); err != nil {
 			logEngine.Error("dnsmasq config write failed", "err", err)
 		} else {
@@ -273,7 +277,7 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	// a single buffered slot coalesces storms of hot events into one sync pass.
 	ipsetTrigger := make(chan struct{}, 1)
 
-	errCh := make(chan error, 6)
+	errCh := make(chan error, 7) // 6 always-on stages + manual-syncer on the unbound path
 
 	// launch runs a pipeline stage and reports to errCh only if it returns
 	// BEFORE shutdown was requested. A stage exiting early (a tailer log-read
@@ -293,10 +297,18 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 		}()
 	}
 
-	launch("tailer", func() error { return runTailer(ctx, store, cfg, sem, ipsetTrigger) })
+	ingestSrc := dnssrc.New(dnssrc.Config{Kind: cfg.DNSSource, LogPath: cfg.LogPath, StartAtEnd: !cfg.FromStart, UnboundSocket: cfg.UnboundSocket})
+	launch("ingest", func() error { return runIngest(ctx, store, cfg, sem, ipsetTrigger, ingestSrc) })
 	launch("probe-worker", func() error { return runProbeWorker(ctx, store, cfg, ipsetTrigger) })
 	launch("expiry-sweeper", func() error { return runExpirySweeper(ctx, store, cfg) })
 	launch("ipset-syncer", func() error { return runIpsetSyncer(ctx, store, cfg, ipsetTrigger) })
+	// On the unbound/pfctl path dnsmasq isn't there to fill ladon_manual via its
+	// ipset= directive, so the engine reconciles that set from the observed IPs of
+	// the manual-allow + extension domains. Gated to the non-dnsmasq path so it
+	// never fights dnsmasq's adds on Linux (see the manual block above).
+	if cfg.ManualIpsetName != "" && len(manualEntries.Domains) > 0 && dnssrc.Resolve(cfg.DNSSource) != "dnsmasq" {
+		launch("manual-syncer", func() error { return runManualSyncer(ctx, store, cfg, manualEntries.Domains) })
+	}
 	launch("maintenance", func() error { return runMaintenance(ctx, store, cfg) })
 	launch("scorer", func() error { return scorer.Run(ctx, store, cfg.Scorer) })
 
@@ -308,22 +320,11 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	}
 }
 
-func runTailer(ctx context.Context, store *storage.Store, cfg Config, sem chan struct{}, ipsetTrigger chan<- struct{}) error {
-	lines, errs := tail.Follow(ctx, cfg.LogPath, tail.Options{StartAtEnd: !cfg.FromStart})
+func runIngest(ctx context.Context, store *storage.Store, cfg Config, sem chan struct{}, ipsetTrigger chan<- struct{}, src dnssrc.Source) error {
+	events, errs := src.Events(ctx)
 	ingested, skipped := 0, 0
 	report := time.NewTicker(30 * time.Second)
 	defer report.Stop()
-
-	// chainOrigin tracks dnsmasq query-id → the domain the client originally
-	// asked for. dnsmasq emits ALL replies in a CNAME chain under the same
-	// query-id, but only the terminal A-record carries an IP, and that
-	// reply's domain is the LAST hop in the chain (e.g. vercel-dns-013.com
-	// for a query against developers.openai.com). Without this map, that IP
-	// would land in dns_cache under vercel-dns-013.com — and our manual-allow
-	// eTLD+1 expansion of openai.com would never see it. Map size is bounded
-	// by the dnsmasq query-id space (~65k); each entry is overwritten when
-	// the id wraps around, so no explicit cleanup needed.
-	chainOrigin := make(map[string]string)
 
 	for {
 		select {
@@ -331,73 +332,46 @@ func runTailer(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 			return nil
 		case err, ok := <-errs:
 			if ok && err != nil {
-				return fmt.Errorf("tail: %w", err)
+				return fmt.Errorf("ingest: %w", err)
 			}
-		case line, ok := <-lines:
+		case obs, ok := <-events:
 			if !ok {
 				return nil
 			}
-			ev, parsed := dnsmasq.Parse(line)
-			if !parsed {
+			// Every Observation is a resolved query: domain + the v4 IPs the
+			// client got, CNAME already re-attributed by the source. The engine
+			// stays resolver-agnostic and never resolves anything itself.
+			if obs.Client == "" || obs.Client == cfg.IgnorePeer {
 				skipped++
 				continue
 			}
-			switch ev.Action {
-			case dnsmasq.Query:
-				if ev.Peer == "" || ev.Peer == cfg.IgnorePeer {
-					skipped++
-					continue
-				}
-				// Remember the original queried domain — we'll use it to
-				// re-attribute IP replies that come back through CNAME hops
-				// to a different domain family.
-				if ev.QueryID != "" {
-					chainOrigin[ev.QueryID] = ev.Domain
-				}
-				if deny, _ := store.IsInDenyList(ctx, ev.Domain, etld.Compute(ev.Domain)); deny {
-					skipped++
-					continue
-				}
-				if _, err := watcher.Ingest(ctx, store, watcher.Event{
-					Domain: ev.Domain,
-					Peer:   ev.Peer,
-				}); err != nil {
-					logTail.Error("ingest failed", "domain", ev.Domain, "err", err)
-					continue
-				}
-				ingested++
-				// Inline probe fast-path: kick off right after ingest so a
-				// freshly-observed blocked domain lands in the ipset within
-				// sub-second. probeDomain short-circuits to 'covered' for members
-				// of an already-confirmed family, so no probe fires for
-				// established CDN churn (handled once, in probeDomain).
-				tryInlineProbe(ctx, store, cfg, ev.Domain, sem, ipsetTrigger)
-			case dnsmasq.Reply:
-				parsed := net.ParseIP(ev.Target)
-				// We operate on v4 only — stun0, WG subnet, iptables rules
-				// and the prod ipset are all v4. v6 answers would just create
-				// probe-time "cannot assign" failures and pollute dns_cache.
-				if parsed == nil || parsed.To4() == nil {
-					skipped++
-					continue
-				}
-				// CNAME re-attribution: if we tracked the original query for
-				// this id, store the IP under THAT domain so eTLD+1 lookups
-				// from manual-allow can find it. Falls back to the raw reply
-				// domain when we don't have a record (log started mid-stream).
-				storeDomain := ev.Domain
-				if origin, ok := chainOrigin[ev.QueryID]; ok && origin != "" {
-					storeDomain = origin
-				}
-				if err := store.UpsertDNSObservation(ctx, storeDomain, ev.Target, time.Time{}); err != nil {
-					logTail.Error("dns_cache upsert failed", "domain", storeDomain, "ip", ev.Target, "err", err)
-					continue
-				}
-			default:
+			if deny, _ := store.IsInDenyList(ctx, obs.Domain, etld.Compute(obs.Domain)); deny {
 				skipped++
+				continue
 			}
+			if _, err := watcher.Ingest(ctx, store, watcher.Event{
+				Domain: obs.Domain,
+				Peer:   obs.Client,
+			}); err != nil {
+				logIngest.Error("ingest failed", "domain", obs.Domain, "err", err)
+				continue
+			}
+			// Feed dns_cache (the source of truth for ipset routing, eTLD/family
+			// expansion and batch re-probe). Observation IPs are already v4.
+			for _, ip := range obs.IPs {
+				if err := store.UpsertDNSObservation(ctx, obs.Domain, ip, time.Time{}); err != nil {
+					logIngest.Error("dns_cache upsert failed", "domain", obs.Domain, "ip", ip, "err", err)
+				}
+			}
+			ingested++
+			// Inline probe fast-path: kick off right after ingest so a freshly
+			// observed blocked domain lands in the ipset within sub-second, using
+			// the IPs the client actually resolved — no cache race, no self-resolve.
+			// probeDomain short-circuits to 'covered' for members of an
+			// already-confirmed family, so no probe fires for established CDN churn.
+			tryInlineProbe(ctx, store, cfg, obs.Domain, obs.IPs, sem, ipsetTrigger)
 		case <-report.C:
-			logTail.Info("tailer progress", "ingested", ingested, "skipped", skipped)
+			logIngest.Info("ingest progress", "ingested", ingested, "skipped", skipped)
 		}
 	}
 }
@@ -406,7 +380,7 @@ func runTailer(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 // has room. If the semaphore is full we simply drop the fast-path attempt —
 // the regular probe-worker ticks will pick the domain up shortly after, so
 // nothing is lost, we just don't beat the worker to it under heavy load.
-func tryInlineProbe(ctx context.Context, store *storage.Store, cfg Config, domain string, sem chan struct{}, ipsetTrigger chan<- struct{}) {
+func tryInlineProbe(ctx context.Context, store *storage.Store, cfg Config, domain string, ips []string, sem chan struct{}, ipsetTrigger chan<- struct{}) {
 	if cap(sem) == 0 || cfg.InlineProbeConcurrency == 0 {
 		return
 	}
@@ -421,10 +395,10 @@ func tryInlineProbe(ctx context.Context, store *storage.Store, cfg Config, domai
 		if err != nil || !eligible {
 			return
 		}
-		// Inline path: local-only. The exit-compare validator (if configured)
-		// runs on the batch worker's cooldown re-probe — it would blow the
-		// inline latency budget here.
-		probeDomain(ctx, store, cfg, domain, ipsetTrigger, false)
+		// Inline path: local-only, probing the IPs the client just resolved. The
+		// exit-compare validator (if configured) runs on the batch worker's
+		// cooldown re-probe — it would blow the inline latency budget here.
+		probeDomain(ctx, store, cfg, domain, ips, ipsetTrigger, false)
 	}()
 }
 
@@ -450,22 +424,34 @@ func probeOnce(ctx context.Context, store *storage.Store, cfg Config, ipsetTrigg
 	if err != nil {
 		return err
 	}
+	freshSince := now.Add(-cfg.DNSFreshness)
 	for _, d := range candidates {
 		if err := ctx.Err(); err != nil {
 			return nil
 		}
+		// Probe the IPs the client actually resolved (dns_cache). If the fresh
+		// window has aged out, fall back to the last-known IPs rather than
+		// self-resolving — on a gateway a self-resolve would re-enter the very
+		// resolver we observe. Candidates only ever reach the table from a
+		// resolved observation, so this is virtually always populated.
+		ips, err := store.LookupIPs(ctx, d.Domain, freshSince)
+		if err != nil {
+			logEngine.Warn("dns_cache lookup failed", "domain", d.Domain, "err", err)
+		}
+		if len(ips) == 0 {
+			ips, _ = store.LookupAllIPs(ctx, d.Domain)
+		}
 		// Batch worker uses exit-compare when RemoteProber is configured —
 		// gives the operator's vantage point a vote on borderline calls.
-		probeDomain(ctx, store, cfg, d.Domain, ipsetTrigger, true)
+		probeDomain(ctx, store, cfg, d.Domain, ips, ipsetTrigger, true)
 	}
 	return nil
 }
 
-// probeDomain runs one full probe→decision→persist cycle for a single domain.
-// Shared by the batch worker and the inline fast-path from the tailer; the
-// useExitCompare flag turns on the optional remote validator stage that only
-// the batch path opts into.
-func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain string, ipsetTrigger chan<- struct{}, useExitCompare bool) {
+// probeDomain runs one probe→decision→persist cycle for a domain against the
+// caller-supplied IPs (the inline path passes what the client just resolved;
+// the batch worker passes dns_cache). The engine never resolves DNS itself.
+func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain string, ips []string, ipsetTrigger chan<- struct{}, useExitCompare bool) {
 	if err := prober.Validate(domain); err != nil {
 		_ = store.SetDomainState(ctx, domain, "ignore", time.Time{})
 		return
@@ -485,14 +471,6 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 		}
 		return
 	}
-	// Prefer IPs that dnsmasq actually handed to the client — avoids engine/
-	// client view mismatch with CDNs that geo-route.
-	freshSince := time.Now().UTC().Add(-cfg.DNSFreshness)
-	ips, err := store.LookupIPs(ctx, domain, freshSince)
-	if err != nil {
-		logEngine.Warn("dns_cache lookup failed", "domain", domain, "err", err)
-	}
-
 	// Phase 1: local probe (always). This is the gateway-side view; if it says
 	// the destination is reachable, no exit comparison can change that.
 	res := cfg.LocalProber.Probe(ctx, domain, ips)
@@ -693,6 +671,103 @@ func runIpsetSyncer(ctx context.Context, store *storage.Store, cfg Config, trigg
 		case <-ticker.C:
 			syncNow()
 		case <-trigger:
+			syncNow()
+		}
+	}
+}
+
+// runManualSyncer fills the ladon_manual SET from the observed IPs of the
+// manual-allow + non-CIDR extension domains. It's the unbound/pfctl analog of
+// dnsmasq's ipset= directive: on Linux dnsmasq owns ladon_manual, but on the
+// unbound path nothing else fills it, so the GUI's "always tunneled" promise
+// would be empty without this. Gated to the non-dnsmasq path by the caller, so
+// its destructive Reconcile never strips IPs dnsmasq added on Linux.
+//
+// Per domain it unions the exact-name IPs (store.LookupIPs) with the eTLD+1
+// family IPs (store.LookupIPsByETLD), mirroring dnsmasq's suffix match — a
+// freshly-added manual domain won't tunnel until it has been observed at least
+// once (no DNS observation, no IP to push).
+func runManualSyncer(ctx context.Context, store *storage.Store, cfg Config, domains []string) error {
+	// A launched stage that returns before shutdown is treated as a failure
+	// ("exited unexpectedly"), so every "nothing to do" path here waits for ctx
+	// rather than returning — manual-allow is optional and must never crash the
+	// daemon.
+	if cfg.ManualIpsetName == "" || len(domains) == 0 {
+		<-ctx.Done()
+		return nil
+	}
+	mgr := ipset.New(cfg.ManualIpsetName)
+	ok, err := mgr.Exists(ctx)
+	if err != nil {
+		logIpset.Error("manual ipset exists check failed", "set", cfg.ManualIpsetName, "err", err)
+		<-ctx.Done()
+		return nil
+	}
+	if !ok {
+		logIpset.Warn("manual ipset not found — manual-allow not enforced",
+			"set", cfg.ManualIpsetName,
+			"hint", fmt.Sprintf("ipset create %s hash:ip", cfg.ManualIpsetName))
+		<-ctx.Done()
+		return nil
+	}
+
+	// Family roots are fixed (the manual list is read once at startup).
+	roots := map[string]struct{}{}
+	for _, d := range domains {
+		if r := etld.Compute(d); r != "" {
+			roots[r] = struct{}{}
+		}
+	}
+
+	ticker := time.NewTicker(cfg.IpsetInterval)
+	defer ticker.Stop()
+
+	syncNow := func() {
+		freshSince := time.Now().UTC().Add(-cfg.DNSFreshness)
+		seen := map[string]struct{}{}
+		want := make([]string, 0, len(domains))
+		add := func(ips []string) {
+			for _, ip := range ips {
+				if _, dup := seen[ip]; dup {
+					continue
+				}
+				seen[ip] = struct{}{}
+				want = append(want, ip)
+			}
+		}
+		for _, d := range domains {
+			ips, err := store.LookupIPs(ctx, d, freshSince)
+			if err != nil {
+				logIpset.Error("manual lookup ips failed", "domain", d, "err", err)
+				return
+			}
+			add(ips)
+		}
+		for r := range roots {
+			ips, err := store.LookupIPsByETLD(ctx, r, freshSince)
+			if err != nil {
+				logIpset.Error("manual lookup etld failed", "etld", r, "err", err)
+				return
+			}
+			add(ips)
+		}
+		added, removed, err := mgr.Reconcile(ctx, want)
+		if err != nil {
+			logIpset.Error("manual ipset reconcile failed", "set", cfg.ManualIpsetName, "err", err)
+			return
+		}
+		if added > 0 || removed > 0 {
+			logIpset.Info("manual ipset synced",
+				"set", cfg.ManualIpsetName, "added", added, "removed", removed, "total", len(want))
+		}
+	}
+	syncNow()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
 			syncNow()
 		}
 	}

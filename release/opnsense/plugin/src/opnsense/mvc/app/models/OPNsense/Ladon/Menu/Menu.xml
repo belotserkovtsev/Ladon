@@ -1,0 +1,8 @@
+<menu>
+    <Services>
+        <Ladon VisibleName="Ladon" cssClass="fa fa-random fa-fw">
+            <Settings order="10" url="/ui/ladon/index/settings"/>
+            <Diagnostics order="20" url="/ui/ladon/index/diagnostics"/>
+        </Ladon>
+    </Services>
+</menu>
