@@ -34,6 +34,7 @@ var (
 	logProbe  = slog.Default()
 	logIpset  = slog.Default()
 	logMaint  = slog.Default()
+	logReval  = slog.Default()
 )
 
 // setMeta best-effort writes a runtime_meta heartbeat, warning (not failing the
@@ -175,6 +176,23 @@ type Config struct {
 	// remote FAIL = methodological FP (Ignore — port wrong, dead server,
 	// geofence on both vantage points). Inline path never uses this.
 	RemoteProber prober.Prober
+
+	// Revalidate controls Phase-7 re-probing of terminal-state domains
+	// (cache / ignore). Disabled by default — see RevalidateConfig.
+	Revalidate RevalidateConfig
+}
+
+// RevalidateConfig tunes Phase-7 revalidation. When Enabled is false the
+// revalidator parks and the engine behaves exactly as before. Its job is to
+// keep terminal states honest: a 'cache' domain whose block has lifted, and an
+// 'ignore' domain that only got blocked later, both stop being permanent — the
+// domain is flipped back to 'new' once Streak consecutive probes disagree with
+// its state, and normal probing re-classifies it from scratch.
+type RevalidateConfig struct {
+	Enabled  bool          // master switch (default false → no-op)
+	Interval time.Duration // minimum age before a domain is re-checked
+	Batch    int           // domains re-probed per worker tick
+	Streak   int           // consecutive disagreeing probes before a state flip
 }
 
 // Defaults returns a reasonable baseline config.
@@ -202,6 +220,12 @@ func Defaults(logPath string) Config {
 		ManualAllowPath:        "",
 		ManualDenyPath:         "",
 		IgnorePeer:             "10.10.0.1",
+		Revalidate: RevalidateConfig{
+			Enabled:  false,
+			Interval: 6 * time.Hour,
+			Batch:    4,
+			Streak:   3,
+		},
 	}
 }
 
@@ -213,6 +237,7 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	logProbe = obs.Logger("prober")
 	logIpset = obs.Logger("ipset")
 	logMaint = obs.Logger("maintenance")
+	logReval = obs.Logger("revalidate")
 
 	// Record identity/liveness up front so a `ladon doctor` run right after
 	// startup already sees the process.
@@ -282,7 +307,7 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	// a single buffered slot coalesces storms of hot events into one sync pass.
 	ipsetTrigger := make(chan struct{}, 1)
 
-	errCh := make(chan error, 7) // 6 always-on stages + manual-syncer on the unbound path
+	errCh := make(chan error, 8) // 7 always-on stages + manual-syncer on the unbound path
 
 	// launch runs a pipeline stage and reports to errCh only if it returns
 	// BEFORE shutdown was requested. A stage exiting early (a tailer log-read
@@ -316,6 +341,7 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	}
 	launch("maintenance", func() error { return runMaintenance(ctx, store, cfg) })
 	launch("scorer", func() error { return scorer.Run(ctx, store, cfg.Scorer) })
+	launch("revalidator", func() error { return runRevalidator(ctx, store, cfg, ipsetTrigger) })
 
 	select {
 	case <-ctx.Done():
@@ -550,6 +576,81 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 		// guards against a future verdict slipping through unhandled rather than
 		// silently mis-stating the domain's state.
 		logProbe.Warn("unhandled verdict, leaving state unchanged", "domain", domain, "verdict", string(verdict))
+	}
+}
+
+// runRevalidator re-probes terminal-state domains (cache / ignore) on a slow
+// cadence and flips one back to 'new' once cfg.Revalidate.Streak consecutive
+// probes disagree with its state — a lifted block stops being tunneled forever,
+// and a domain blocked only later stops sitting in 'ignore' forever. Normal
+// probing then re-classifies the reset domain from scratch. Disabled by default:
+// when off it parks on ctx and never touches state, so it can neither crash the
+// daemon nor change behavior.
+func runRevalidator(ctx context.Context, store *storage.Store, cfg Config, ipsetTrigger chan<- struct{}) error {
+	rc := cfg.Revalidate
+	if !rc.Enabled {
+		<-ctx.Done()
+		return nil
+	}
+	if rc.Interval <= 0 {
+		rc.Interval = 6 * time.Hour
+	}
+	if rc.Batch <= 0 {
+		rc.Batch = 4
+	}
+	if rc.Streak <= 0 {
+		rc.Streak = 3
+	}
+	logReval.Info("revalidator enabled",
+		"interval", rc.Interval.String(), "batch", rc.Batch, "streak", rc.Streak)
+
+	tick := time.NewTicker(time.Minute)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-tick.C:
+			now := time.Now().UTC()
+			cands, err := store.ListRevalidationCandidates(ctx, rc.Batch, now.Add(-rc.Interval))
+			if err != nil {
+				logReval.Error("list candidates failed", "err", err)
+				continue
+			}
+			for _, d := range cands {
+				ips, err := store.LookupAllIPs(ctx, d.Domain)
+				if err != nil || len(ips) == 0 {
+					// No observed IPs to probe — stamp reval_at (treated as
+					// "agrees": resets streak, keeps state) so we don't hot-loop.
+					if _, _, aerr := store.ApplyRevalidation(ctx, d.Domain, false, rc.Streak, now); aerr != nil {
+						logReval.Error("stamp failed", "domain", d.Domain, "err", aerr)
+					}
+					continue
+				}
+				res := cfg.LocalProber.Probe(ctx, d.Domain, ips)
+				persistProbe(ctx, store, res)
+				verdict := decision.Classify(res)
+				disagrees := (d.State == "cache" && verdict == decision.Clear) ||
+					(d.State == "ignore" && verdict == decision.Blocked)
+				action, streak, err := store.ApplyRevalidation(ctx, d.Domain, disagrees, rc.Streak, now)
+				if err != nil {
+					logReval.Error("apply failed", "domain", d.Domain, "err", err)
+					continue
+				}
+				switch action {
+				case "reset":
+					logReval.Info("flipped terminal domain to new",
+						"domain", d.Domain, "from", d.State, "verdict", verdict)
+					select {
+					case ipsetTrigger <- struct{}{}:
+					default:
+					}
+				case "pending":
+					logReval.Debug("revalidation disagreement",
+						"domain", d.Domain, "state", d.State, "verdict", verdict, "streak", streak)
+				}
+			}
+		}
 	}
 }
 

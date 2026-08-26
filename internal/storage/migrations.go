@@ -71,7 +71,20 @@ var schema = []migrate.Migration{
 			)`,
 		),
 	},
-	// v5+ — append clean, version-numbered steps here.
+	{
+		Version: 5,
+		Name:    "domains.reval_at + reval_streak for Phase-7 terminal-state revalidation",
+		// The revalidator re-probes terminal-state domains (cache/ignore) on a
+		// slow cadence and flips one back to 'new' once `streak` consecutive
+		// probes disagree with its state, so a lifted block (or a domain blocked
+		// only later) stops being permanent. reval_at rate-limits per domain;
+		// reval_streak is the disagreement counter. Existing rows read NULL / 0.
+		Up: migrate.SQL(
+			`ALTER TABLE domains ADD COLUMN reval_at TEXT`,
+			`ALTER TABLE domains ADD COLUMN reval_streak INTEGER NOT NULL DEFAULT 0`,
+		),
+	},
+	// v6+ — append clean, version-numbered steps here.
 }
 
 // reconcileLegacy converges an un-versioned (pre-user_version) database to the

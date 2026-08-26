@@ -80,10 +80,11 @@ type File struct {
 	ManualAllow string `yaml:"manual_allow"`
 	ManualDeny  string `yaml:"manual_deny"`
 
-	Probe  ProbeSection  `yaml:"probe"`
-	Scorer ScorerSection `yaml:"scorer"`
-	Ipset  IpsetSection  `yaml:"ipset"`
-	Log    LogSection    `yaml:"log"`
+	Probe      ProbeSection      `yaml:"probe"`
+	Scorer     ScorerSection     `yaml:"scorer"`
+	Revalidate RevalidateSection `yaml:"revalidate"`
+	Ipset      IpsetSection      `yaml:"ipset"`
+	Log        LogSection        `yaml:"log"`
 
 	HotTTL                 Duration `yaml:"hot_ttl"`
 	DNSFreshness           Duration `yaml:"dns_freshness"`
@@ -137,6 +138,17 @@ type ScorerSection struct {
 	Interval         Duration `yaml:"interval"`
 	Window           Duration `yaml:"window"`
 	PromoteThreshold int      `yaml:"promote_threshold"`
+}
+
+// RevalidateSection mirrors engine.RevalidateConfig — Phase-7 re-probing of
+// terminal-state domains (cache/ignore). Disabled by default. Enabled is a
+// pointer so an unset value keeps the engine default (off) rather than forcing
+// false.
+type RevalidateSection struct {
+	Enabled  *bool    `yaml:"enabled"`
+	Interval Duration `yaml:"interval"`
+	Batch    int      `yaml:"batch"`
+	Streak   int      `yaml:"streak"`
 }
 
 // IpsetSection mirrors the ipset knobs.
