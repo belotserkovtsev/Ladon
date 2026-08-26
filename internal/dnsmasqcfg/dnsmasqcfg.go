@@ -18,15 +18,18 @@ import (
 
 // Path is where the snippet lives. dnsmasq picks up everything in
 // /etc/dnsmasq.d/ that matches its include glob (set in dnsmasq.conf).
-const Path = "/etc/dnsmasq.d/ladon-manual.conf"
+// A var (not const) so tests can point it at a temp file.
+var Path = "/etc/dnsmasq.d/ladon-manual.conf"
 
 // Write produces the snippet at Path. Atomic via tmp+rename so dnsmasq
 // never observes a half-written file. Empty domains list still writes a
 // stub — keeps file present for operator visibility, dnsmasq treats it
-// as a no-op include.
-func Write(ipsetName string, domains []string) error {
+// as a no-op include. Returns changed=false without touching the file when
+// the snippet already matches on disk, so the caller can skip the dnsmasq
+// restart (see the crash-loop guard below).
+func Write(ipsetName string, domains []string) (changed bool, err error) {
 	if ipsetName == "" {
-		return fmt.Errorf("dnsmasqcfg: empty ipset name")
+		return false, fmt.Errorf("dnsmasqcfg: empty ipset name")
 	}
 	// Dedup + sort for stable diff. Operators reading the file want
 	// alphabetical order, not insertion order.
@@ -53,30 +56,39 @@ func Write(ipsetName string, domains []string) error {
 	for _, d := range sorted {
 		fmt.Fprintf(&sb, "ipset=/%s/%s\n", d, ipsetName)
 	}
+	next := sb.String()
+
+	// Skip the rewrite (and the dnsmasq bounce the caller does on change) when
+	// the snippet already matches on disk. Ladon writes this on every start, so
+	// without the guard a crash-loop restarts dnsmasq every few seconds and
+	// flaps DNS for the whole network — the content is identical each time.
+	if cur, rerr := os.ReadFile(Path); rerr == nil && string(cur) == next {
+		return false, nil
+	}
 
 	dir := filepath.Dir(Path)
 	tmp, err := os.CreateTemp(dir, ".ladon-manual.conf.*")
 	if err != nil {
-		return fmt.Errorf("create temp: %w", err)
+		return false, fmt.Errorf("create temp: %w", err)
 	}
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
 
-	if _, err := tmp.WriteString(sb.String()); err != nil {
+	if _, err := tmp.WriteString(next); err != nil {
 		tmp.Close()
-		return fmt.Errorf("write temp: %w", err)
+		return false, fmt.Errorf("write temp: %w", err)
 	}
 	if err := tmp.Chmod(0o644); err != nil {
 		tmp.Close()
-		return fmt.Errorf("chmod temp: %w", err)
+		return false, fmt.Errorf("chmod temp: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp: %w", err)
+		return false, fmt.Errorf("close temp: %w", err)
 	}
 	if err := os.Rename(tmpPath, Path); err != nil {
-		return fmt.Errorf("rename %s: %w", Path, err)
+		return false, fmt.Errorf("rename %s: %w", Path, err)
 	}
-	return nil
+	return true, nil
 }
 
 // Restart bounces dnsmasq so it re-reads /etc/dnsmasq.d/*.conf. Required

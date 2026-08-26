@@ -254,14 +254,19 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 		logEngine.Error("collect manual entries failed", "err", err)
 	}
 	if cfg.ManualIpsetName != "" && dnssrc.Resolve(cfg.DNSSource) == "dnsmasq" {
-		if err := dnsmasqcfg.Write(cfg.ManualIpsetName, manualEntries.Domains); err != nil {
+		changed, err := dnsmasqcfg.Write(cfg.ManualIpsetName, manualEntries.Domains)
+		switch {
+		case err != nil:
 			logEngine.Error("dnsmasq config write failed", "err", err)
-		} else {
+		case changed:
 			logEngine.Info("manual list written to dnsmasq",
 				"domains", len(manualEntries.Domains), "path", dnsmasqcfg.Path, "ipset", cfg.ManualIpsetName)
 			if err := dnsmasqcfg.Restart(ctx); err != nil {
 				logEngine.Warn("dnsmasq restart failed — manual list activates on next dnsmasq restart", "err", err)
 			}
+		default:
+			logEngine.Debug("manual list unchanged — dnsmasq restart skipped",
+				"domains", len(manualEntries.Domains), "path", dnsmasqcfg.Path)
 		}
 	}
 	// CIDR entries skip dnsmasq entirely — they aren't DNS-driven. Reconcile
