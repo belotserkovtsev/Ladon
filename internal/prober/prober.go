@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -171,9 +172,18 @@ func probeTCPTLS(ctx context.Context, r Result, started time.Time, timeout time.
 
 	conn := probeTLSStaged(&r, reachable, "443", timeout)
 	if conn != nil {
-		probeHTTPStaged(&r, conn, timeout)
-		conn.Close()
-		liftTLS13Verdict(&r)
+		if interceptCode(r.Domain, conn.ConnectionState()) == CodeTLSIntercept {
+			// Cert-substitution MITM: the handshake completed but the presented
+			// cert isn't trusted for this name. Conclusive block — skip the HTTP
+			// stage (a provider stub would happily 200 a block page) and record it.
+			r.FailureCode = CodeTLSIntercept
+			r.FailureReason = formatReason(CodeTLSIntercept, errors.New("cert not trusted for "+r.Domain))
+			conn.Close()
+		} else {
+			probeHTTPStaged(&r, conn, timeout)
+			conn.Close()
+			liftTLS13Verdict(&r)
+		}
 	}
 	r.LatencyMS = int(time.Since(started) / time.Millisecond)
 	return r
@@ -303,6 +313,40 @@ func tlsHandshake(ip, port, sni string, timeout time.Duration, maxVersion uint16
 	}
 	state := c.ConnectionState()
 	return c, CodeOK, "", state.Version
+}
+
+// interceptCode reports CodeTLSIntercept when the peer's certificate chains to
+// no trusted root — the cert-substitution signature, since a middlebox has to
+// sign its stub itself. That is the ONLY signature we act on.
+//
+// A name mismatch is deliberately NOT one: plenty of healthy hosts answer on a
+// name their (properly CA-issued) certificate doesn't cover — legacy service
+// endpoints, shared CDN certs, virtual hosts. Flagging those tunneled traffic
+// that was never blocked. Anything else (expired, and so on) is likewise too
+// weak to act on, so verification runs without a DNSName and only the trust
+// decision is read.
+//
+// Empty or IP-literal SNIs skip the check: there's no name to have been
+// substituted for.
+func interceptCode(sni string, state tls.ConnectionState) FailureCode {
+	return interceptCodeWithRoots(sni, state, nil) // nil roots = system pool
+}
+
+func interceptCodeWithRoots(sni string, state tls.ConnectionState, roots *x509.CertPool) FailureCode {
+	if sni == "" || net.ParseIP(sni) != nil || len(state.PeerCertificates) == 0 {
+		return CodeOK
+	}
+	opts := x509.VerifyOptions{Roots: roots, Intermediates: x509.NewCertPool()}
+	for _, cert := range state.PeerCertificates[1:] {
+		opts.Intermediates.AddCert(cert)
+	}
+	if _, err := state.PeerCertificates[0].Verify(opts); err != nil {
+		var uae x509.UnknownAuthorityError
+		if errors.As(err, &uae) {
+			return CodeTLSIntercept
+		}
+	}
+	return CodeOK
 }
 
 // recordTLSVersion sets TLS12OK or TLS13OK based on the negotiated version.

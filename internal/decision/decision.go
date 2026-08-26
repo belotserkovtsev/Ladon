@@ -38,6 +38,9 @@ func Classify(r prober.Result) Verdict {
 	if !r.DNSOK {
 		return Clear
 	}
+	if r.FailureCode == prober.CodeTLSIntercept {
+		return Blocked // cert-substitution MITM — reachable but tampered, tunnel it
+	}
 	if !r.TCPOK || !r.TLSOK {
 		return Blocked
 	}
