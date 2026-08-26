@@ -559,6 +559,18 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 	if f.Scorer.PromoteThreshold > 0 {
 		cfg.Scorer.PromoteThreshold = f.Scorer.PromoteThreshold
 	}
+	if f.Revalidate.Enabled != nil {
+		cfg.Revalidate.Enabled = *f.Revalidate.Enabled
+	}
+	if f.Revalidate.Interval > 0 {
+		cfg.Revalidate.Interval = time.Duration(f.Revalidate.Interval)
+	}
+	if f.Revalidate.Batch > 0 {
+		cfg.Revalidate.Batch = f.Revalidate.Batch
+	}
+	if f.Revalidate.Streak > 0 {
+		cfg.Revalidate.Streak = f.Revalidate.Streak
+	}
 	if f.Ipset.EngineName != "" {
 		cfg.IpsetName = f.Ipset.EngineName
 	}

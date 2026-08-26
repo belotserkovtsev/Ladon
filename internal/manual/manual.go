@@ -108,7 +108,35 @@ func ReadEntries(path string) (Entries, error) {
 		if domain == "" {
 			continue
 		}
+		if !validDomain(domain) {
+			// A malformed line (inline comment, stray space, non-ASCII) would be
+			// written verbatim into dnsmasq's ipset= directive and stop dnsmasq
+			// from starting — dropping DNS for the whole LAN. Skip it loudly
+			// instead of trusting the file.
+			log.Printf("manual: skipping invalid domain %q in %s", line, path)
+			continue
+		}
 		out.Domains = append(out.Domains, domain)
 	}
 	return out, sc.Err()
+}
+
+// validDomain is a conservative check: letters, digits, hyphen, dot and
+// underscore only, 1–253 chars. Its sole job is to keep a fat-fingered list
+// line (inline comment, stray token, non-ASCII) out of dnsmasq's ipset=
+// directive, where a bad value stops dnsmasq and drops DNS for the whole LAN.
+func validDomain(d string) bool {
+	if len(d) == 0 || len(d) > 253 {
+		return false
+	}
+	for _, r := range d {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case r == '-' || r == '.' || r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }

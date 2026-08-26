@@ -56,6 +56,16 @@ func TestClassify(t *testing.T) {
 			},
 			want: Blocked,
 		},
+		{
+			// Handshake reachable (TLSOK true) but the cert was substituted, so
+			// FailureCode wins over the otherwise-Clear TCP+TLS+no-HTTP shape.
+			name: "tls_intercept (cert-substitution MITM) → hot",
+			in: prober.Result{
+				DNSOK: true, TCPOK: true, TLSOK: true,
+				FailureCode: prober.CodeTLSIntercept,
+			},
+			want: Blocked,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

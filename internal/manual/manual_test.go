@@ -140,3 +140,29 @@ func TestReadEntriesMissingFileIsNoop(t *testing.T) {
 		t.Fatalf("expected empty, got %+v", got)
 	}
 }
+
+func TestReadEntriesSkipsInvalidDomains(t *testing.T) {
+	// A stray inline comment, spaces or non-ASCII must never reach dnsmasq's
+	// ipset= directive — a bad value there stops dnsmasq and drops LAN DNS.
+	body := `example.com
+bad domain with spaces
+inline.test # trailing comment
+пример.рф
+under_score.test
+valid-two.example
+`
+	path := writeFile(t, body)
+	got, err := ReadEntries(path)
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+	want := []string{"example.com", "under_score.test", "valid-two.example"}
+	if len(got.Domains) != len(want) {
+		t.Fatalf("want %v, got %v", want, got.Domains)
+	}
+	for i, w := range want {
+		if got.Domains[i] != w {
+			t.Errorf("domain %d: want %q, got %q", i, w, got.Domains[i])
+		}
+	}
+}

@@ -604,6 +604,110 @@ func (s *Store) ListProbeCandidates(ctx context.Context, limit int, now time.Tim
 	return out, rows.Err()
 }
 
+// ListRevalidationCandidates returns terminal-state domains (cache / ignore)
+// due for a Phase-7 re-probe: their reval_at is null or no newer than dueBefore.
+// Manual-deny domains are excluded, mirroring ListProbeCandidates. Ordered
+// oldest-checked first (null reval_at first) so the sweep cycles fairly.
+func (s *Store) ListRevalidationCandidates(ctx context.Context, limit int, dueBefore time.Time) ([]Domain, error) {
+	ts := formatTime(dueBefore)
+	rows, err := s.rdb.QueryContext(ctx, `
+		SELECT domain, COALESCE(etld_plus_one, ''), COALESCE(first_seen_at, ''),
+		       COALESCE(last_seen_at, ''), hit_count, state,
+		       COALESCE(cooldown_until, '')
+		FROM domains
+		WHERE state IN ('cache', 'ignore')
+		  AND (reval_at IS NULL OR reval_at <= ?)
+		  AND domain NOT IN (SELECT domain FROM manual_entries WHERE list_name = 'deny')
+		  AND (etld_plus_one IS NULL OR etld_plus_one = ''
+		       OR etld_plus_one NOT IN (SELECT domain FROM manual_entries WHERE list_name = 'deny'))
+		ORDER BY reval_at IS NOT NULL, reval_at ASC, last_seen_at DESC
+		LIMIT ?
+	`, ts, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Domain
+	for rows.Next() {
+		var d Domain
+		if err := rows.Scan(
+			&d.Domain, &d.ETLDPlusOne, &d.FirstSeenAt, &d.LastSeenAt,
+			&d.HitCount, &d.State, &d.CooldownUntil,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// ApplyRevalidation records one Phase-7 re-probe outcome and, when a domain has
+// disagreed with its state for `threshold` probes in a row, flips it back to
+// 'new' (dropping any cache/hot membership so it leaves the tunnel) for normal
+// probing to re-classify. `disagrees` is the caller's judgment that this probe
+// contradicts the current state (cache probed Clear, or ignore probed Blocked).
+//
+// It always stamps reval_at=now. An agreeing probe resets the streak.
+//
+// Returns an action label ("kept", "pending", "reset", "gone") and the streak
+// after this probe.
+func (s *Store) ApplyRevalidation(ctx context.Context, domain string, disagrees bool, threshold int, now time.Time) (action string, streak int, err error) {
+	if threshold <= 0 {
+		threshold = 3
+	}
+	ts := formatTime(now)
+	tx, err := s.wdb.BeginTx(ctx, nil)
+	if err != nil {
+		return "", 0, err
+	}
+	defer tx.Rollback()
+
+	var state string
+	var cur int
+	err = tx.QueryRowContext(ctx,
+		`SELECT state, reval_streak FROM domains WHERE domain = ?`, domain).Scan(&state, &cur)
+	if err == sql.ErrNoRows {
+		return "gone", 0, tx.Commit()
+	}
+	if err != nil {
+		return "", 0, err
+	}
+
+	if !disagrees {
+		if _, err = tx.ExecContext(ctx,
+			`UPDATE domains SET reval_at = ?, reval_streak = 0 WHERE domain = ?`, ts, domain); err != nil {
+			return "", 0, err
+		}
+		return "kept", 0, tx.Commit()
+	}
+
+	streak = cur + 1
+	if streak < threshold {
+		if _, err = tx.ExecContext(ctx,
+			`UPDATE domains SET reval_at = ?, reval_streak = ? WHERE domain = ?`, ts, streak, domain); err != nil {
+			return "", 0, err
+		}
+		return "pending", streak, tx.Commit()
+	}
+
+	// Confirmed disagreement: flip back to 'new' and shed tunnel membership.
+	// Normal probing re-classifies from scratch; a still-blocked domain simply
+	// re-accumulates to hot/cache, a lifted one settles into ignore.
+	if _, err = tx.ExecContext(ctx,
+		`UPDATE domains SET state = 'new', reval_streak = 0, reval_at = ?, cooldown_until = NULL WHERE domain = ?`,
+		ts, domain); err != nil {
+		return "", 0, err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM cache_entries WHERE domain = ?`, domain); err != nil {
+		return "", 0, err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM hot_entries WHERE domain = ?`, domain); err != nil {
+		return "", 0, err
+	}
+	return "reset", 0, tx.Commit()
+}
+
 // SetDomainState updates state and cooldown_until atomically.
 func (s *Store) SetDomainState(ctx context.Context, domain, state string, cooldownUntil time.Time) error {
 	var cd any

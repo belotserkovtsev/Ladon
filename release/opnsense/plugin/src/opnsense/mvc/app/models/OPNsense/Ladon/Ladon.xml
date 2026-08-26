@@ -31,6 +31,7 @@
                     <telegram>telegram</telegram>
                     <tiktok>tiktok</tiktok>
                     <twitch>twitch</twitch>
+                    <youtube>youtube</youtube>
                 </OptionValues>
             </allow_extensions>
             <deny_extensions type="OptionField">
@@ -43,6 +44,7 @@
                     <telegram>telegram</telegram>
                     <tiktok>tiktok</tiktok>
                     <twitch>twitch</twitch>
+                    <youtube>youtube</youtube>
                 </OptionValues>
             </deny_extensions>
             <promote_threshold type="IntegerField">

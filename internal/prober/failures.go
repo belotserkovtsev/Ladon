@@ -55,6 +55,16 @@ const (
 	// (ECH/ESNI). Real-world signal for some RU-DPI deployments.
 	CodeTLS13Block FailureCode = "tls13_block"
 
+	// CodeTLSIntercept is set when the TLS handshake completes but the cert the
+	// peer presented chains to no trusted root — the cert-substitution signature
+	// a provider stub on :443 produces, since it has to sign its own cert. A
+	// name mismatch is NOT part of the signal: healthy hosts routinely answer on
+	// names their properly-issued cert doesn't cover. Path-active block, NOT
+	// server-reachable. We probe with InsecureSkipVerify for reachability, so
+	// this is the only place identity is consulted, purely as a censorship
+	// signal.
+	CodeTLSIntercept FailureCode = "tls_intercept"
+
 	CodeHTTPCutoff  FailureCode = "http_cutoff"
 	CodeHTTPTimeout FailureCode = "http_timeout"
 	CodeHTTPReset   FailureCode = "http_reset"
