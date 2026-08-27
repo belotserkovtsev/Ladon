@@ -595,6 +595,9 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 	if f.IgnorePeer != "" {
 		cfg.IgnorePeer = f.IgnorePeer
 	}
+	if f.ManageDNSMasq != nil {
+		cfg.ManageDNSMasq = *f.ManageDNSMasq
+	}
 	if len(f.AllowExtensions) > 0 {
 		cfg.AllowExtensions = f.AllowExtensions
 	}

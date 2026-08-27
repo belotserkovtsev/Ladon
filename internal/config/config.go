@@ -91,6 +91,13 @@ type File struct {
 	IgnorePeer             string   `yaml:"ignore_peer"`
 	FamilyConfirmThreshold int      `yaml:"family_confirm_threshold"`
 
+	// ManageDNSMasq: let ladon write dnsmasq's snippet and restart it. Default
+	// true. A pointer so an unset key keeps the default instead of forcing
+	// false. Set it to false where ladon can't drive dnsmasq — in a container,
+	// or when someone else owns the resolver — and the engine fills the manual
+	// set itself.
+	ManageDNSMasq *bool `yaml:"manage_dnsmasq"`
+
 	// AllowExtensions are bundled allow-list presets enabled by name. Each
 	// name resolves to <ExtensionsPath>/<name>.txt and is loaded with the
 	// same parser as ManualAllow.

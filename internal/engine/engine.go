@@ -180,6 +180,20 @@ type Config struct {
 	// Revalidate controls Phase-7 re-probing of terminal-state domains
 	// (cache / ignore). Disabled by default — see RevalidateConfig.
 	Revalidate RevalidateConfig
+
+	// ManageDNSMasq lets the engine own dnsmasq's snippet: it writes the
+	// manual/extension domains as `ipset=` directives and restarts dnsmasq so
+	// they take effect. Default true, and the right choice on a host where
+	// ladon and dnsmasq live together, because dnsmasq puts an address in the
+	// set while it answers the query — ahead of the client's first packet.
+	//
+	// Turn it off where ladon cannot (or should not) drive dnsmasq — a
+	// container without the host's service manager, or a resolver someone else
+	// owns. The engine then fills the manual set itself from what it observes.
+	// That path is a hair slower: the address lands once the observation is
+	// read rather than during the answer, so a client can race the very first
+	// connection to a name it has never resolved before.
+	ManageDNSMasq bool
 }
 
 // RevalidateConfig tunes Phase-7 revalidation. When Enabled is false the
@@ -220,6 +234,7 @@ func Defaults(logPath string) Config {
 		ManualAllowPath:        "",
 		ManualDenyPath:         "",
 		IgnorePeer:             "10.10.0.1",
+		ManageDNSMasq:          true,
 		Revalidate: RevalidateConfig{
 			Enabled:  false,
 			Interval: 6 * time.Hour,
@@ -278,7 +293,12 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	if err != nil {
 		logEngine.Error("collect manual entries failed", "err", err)
 	}
-	if cfg.ManualIpsetName != "" && dnssrc.Resolve(cfg.DNSSource) == "dnsmasq" {
+	// Who fills the manual set: dnsmasq via its own `ipset=` directive, or the
+	// engine from what it observes. Delegating needs both a dnsmasq to talk to
+	// and permission to drive it; otherwise the engine takes the job itself
+	// (the manual-syncer launched further down).
+	delegateManual := cfg.ManageDNSMasq && dnssrc.Resolve(cfg.DNSSource) == "dnsmasq"
+	if cfg.ManualIpsetName != "" && delegateManual {
 		changed, err := dnsmasqcfg.Write(cfg.ManualIpsetName, manualEntries.Domains)
 		switch {
 		case err != nil:
@@ -307,7 +327,17 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	// a single buffered slot coalesces storms of hot events into one sync pass.
 	ipsetTrigger := make(chan struct{}, 1)
 
-	errCh := make(chan error, 8) // 7 always-on stages + manual-syncer on the unbound path
+	// Same shape for the manual set, used only when the engine fills it itself.
+	// Ingest pokes this the moment it sees a manual-list name resolve, so the
+	// address is in the set on the heels of the answer instead of waiting out
+	// the safety tick.
+	manualTrigger := make(chan struct{}, 1)
+	var manualNames *nameSet
+	if !delegateManual {
+		manualNames = newNameSet(manualEntries.Domains)
+	}
+
+	errCh := make(chan error, 8) // 7 always-on stages + manual-syncer when the engine owns the manual set
 
 	// launch runs a pipeline stage and reports to errCh only if it returns
 	// BEFORE shutdown was requested. A stage exiting early (a tailer log-read
@@ -328,16 +358,19 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	}
 
 	ingestSrc := dnssrc.New(dnssrc.Config{Kind: cfg.DNSSource, LogPath: cfg.LogPath, StartAtEnd: !cfg.FromStart, UnboundSocket: cfg.UnboundSocket})
-	launch("ingest", func() error { return runIngest(ctx, store, cfg, sem, ipsetTrigger, ingestSrc) })
+	launch("ingest", func() error {
+		return runIngest(ctx, store, cfg, sem, ipsetTrigger, ingestSrc, manualNames, manualTrigger)
+	})
 	launch("probe-worker", func() error { return runProbeWorker(ctx, store, cfg, ipsetTrigger) })
 	launch("expiry-sweeper", func() error { return runExpirySweeper(ctx, store, cfg) })
 	launch("ipset-syncer", func() error { return runIpsetSyncer(ctx, store, cfg, ipsetTrigger) })
-	// On the unbound/pfctl path dnsmasq isn't there to fill ladon_manual via its
-	// ipset= directive, so the engine reconciles that set from the observed IPs of
-	// the manual-allow + extension domains. Gated to the non-dnsmasq path so it
-	// never fights dnsmasq's adds on Linux (see the manual block above).
-	if cfg.ManualIpsetName != "" && len(manualEntries.Domains) > 0 && dnssrc.Resolve(cfg.DNSSource) != "dnsmasq" {
-		launch("manual-syncer", func() error { return runManualSyncer(ctx, store, cfg, manualEntries.Domains) })
+	// When the manual set isn't delegated to dnsmasq, the engine reconciles it
+	// from the observed IPs of the manual-allow + extension domains. Gated on
+	// the same flag as the snippet above so the two never fight over the set.
+	if cfg.ManualIpsetName != "" && len(manualEntries.Domains) > 0 && !delegateManual {
+		launch("manual-syncer", func() error {
+			return runManualSyncer(ctx, store, cfg, manualEntries.Domains, manualTrigger)
+		})
 	}
 	launch("maintenance", func() error { return runMaintenance(ctx, store, cfg) })
 	launch("scorer", func() error { return scorer.Run(ctx, store, cfg.Scorer) })
@@ -351,7 +384,40 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	}
 }
 
-func runIngest(ctx context.Context, store *storage.Store, cfg Config, sem chan struct{}, ipsetTrigger chan<- struct{}, src dnssrc.Source) error {
+// nameSet answers "is this name on the manual list", counting a subdomain of a
+// listed name as a member — the manual set is filled by eTLD+1 expansion too,
+// so a hit on any member of the family is worth a sync.
+type nameSet struct {
+	exact map[string]struct{}
+	roots map[string]struct{}
+}
+
+func newNameSet(domains []string) *nameSet {
+	s := &nameSet{exact: map[string]struct{}{}, roots: map[string]struct{}{}}
+	for _, d := range domains {
+		s.exact[d] = struct{}{}
+		if r := etld.Compute(d); r != "" {
+			s.roots[r] = struct{}{}
+		}
+	}
+	return s
+}
+
+func (s *nameSet) matches(domain string) bool {
+	if s == nil {
+		return false
+	}
+	if _, ok := s.exact[domain]; ok {
+		return true
+	}
+	if r := etld.Compute(domain); r != "" {
+		_, ok := s.roots[r]
+		return ok
+	}
+	return false
+}
+
+func runIngest(ctx context.Context, store *storage.Store, cfg Config, sem chan struct{}, ipsetTrigger chan<- struct{}, src dnssrc.Source, manualNames *nameSet, manualTrigger chan<- struct{}) error {
 	events, errs := src.Events(ctx)
 	ingested, skipped := 0, 0
 	report := time.NewTicker(30 * time.Second)
@@ -395,6 +461,15 @@ func runIngest(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 				}
 			}
 			ingested++
+			// A manual-list name just resolved: nudge the syncer so its address
+			// reaches the set now rather than on the next safety tick. Buffered
+			// 1, so a burst of names collapses into a single pass.
+			if manualNames.matches(obs.Domain) {
+				select {
+				case manualTrigger <- struct{}{}:
+				default:
+				}
+			}
 			// Inline probe fast-path: kick off right after ingest so a freshly
 			// observed blocked domain lands in the ipset within sub-second, using
 			// the IPs the client actually resolved — no cache race, no self-resolve.
@@ -793,7 +868,7 @@ func runIpsetSyncer(ctx context.Context, store *storage.Store, cfg Config, trigg
 // family IPs (store.LookupIPsByETLD), mirroring dnsmasq's suffix match — a
 // freshly-added manual domain won't tunnel until it has been observed at least
 // once (no DNS observation, no IP to push).
-func runManualSyncer(ctx context.Context, store *storage.Store, cfg Config, domains []string) error {
+func runManualSyncer(ctx context.Context, store *storage.Store, cfg Config, domains []string, trigger <-chan struct{}) error {
 	// A launched stage that returns before shutdown is treated as a failure
 	// ("exited unexpectedly"), so every "nothing to do" path here waits for ctx
 	// rather than returning — manual-allow is optional and must never crash the
@@ -873,6 +948,8 @@ func runManualSyncer(ctx context.Context, store *storage.Store, cfg Config, doma
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-trigger:
+			syncNow()
 		case <-ticker.C:
 			syncNow()
 		}
