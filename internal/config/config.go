@@ -145,7 +145,11 @@ type RemoteSection struct {
 // differently than the kernel sets do — a proxy client routing by domain, an
 // in-place bypass rewriting packets where they are. Empty path leaves it off.
 type PublishSection struct {
-	Path     string   `yaml:"path"`
+	Path string `yaml:"path"`
+	// "domains" (default) writes the plain list — no schema, no dependency on
+	// anyone's format. "sing-box" writes a rule-set that client reloads on its
+	// own when the file changes.
+	Format   string   `yaml:"format"`
 	Interval Duration `yaml:"interval"`
 }
 
@@ -214,6 +218,12 @@ func (f *File) Validate() error {
 		// ok
 	default:
 		return fmt.Errorf("probe.mode: unknown %q (want local|exit-compare)", f.Probe.Mode)
+	}
+	switch f.Publish.Format {
+	case "", "domains", "sing-box":
+		// ok
+	default:
+		return fmt.Errorf("publish.format: unknown %q (want domains|sing-box)", f.Publish.Format)
 	}
 	if f.Probe.Mode == "exit-compare" && f.Probe.Remote.URL == "" {
 		return prober.ErrEmptyURL

@@ -593,6 +593,9 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 	if f.Publish.Path != "" {
 		cfg.Publish.Path = f.Publish.Path
 	}
+	if f.Publish.Format != "" {
+		cfg.Publish.Format = f.Publish.Format
+	}
 	if f.Publish.Interval > 0 {
 		cfg.Publish.Interval = time.Duration(f.Publish.Interval)
 	}

@@ -4,6 +4,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -223,7 +224,63 @@ type RevalidateConfig struct {
 // Empty Path leaves the stage parked — nothing is written and nothing changes.
 type PublishConfig struct {
 	Path     string        // where to write; empty disables
+	Format   string        // "domains" (default) | "sing-box"
 	Interval time.Duration // how often to check for changes
+}
+
+// singBoxRuleSetVersion is the schema version stamped on the emitted rule-set.
+// Lower means a wider range of sing-box builds will read it, and 2 is what this
+// content actually needs: compiling a rule-set of plain `domain` matches and
+// decompiling it again hands back version 2, which is sing-box saying so itself.
+const singBoxRuleSetVersion = 2
+
+// renderVerdict turns the blocked domains into whatever the consumer reads.
+//
+// The default is the plain list: one domain per line, no schema, no dependency
+// on anyone's format. That is the neutral form, and it stays the default for
+// exactly that reason — a client-specific format here is a convenience, not
+// what ladon produces.
+func renderVerdict(format string, domains []string) (string, error) {
+	switch format {
+	case "", "domains":
+		var sb strings.Builder
+		sb.WriteString("# Domains ladon currently judges blocked. Generated — do not edit.\n")
+		sb.WriteString("# One per line, sorted. Subdomains are listed in their own right.\n")
+		for _, d := range domains {
+			sb.WriteString(d)
+			sb.WriteByte('\n')
+		}
+		return sb.String(), nil
+
+	case "sing-box":
+		// A source-format rule-set. sing-box watches a local rule-set file and
+		// reloads it on change, so writing it is the whole integration — there
+		// is nothing to signal and nothing to schedule.
+		//
+		// Exact `domain` matches rather than `domain_suffix`: the list already
+		// carries every subdomain ladon actually judged, and a suffix would
+		// route names it never saw, which is a wider claim than the verdict.
+		type rule struct {
+			Domain []string `json:"domain,omitempty"`
+		}
+		doc := struct {
+			Version int    `json:"version"`
+			Rules   []rule `json:"rules"`
+		}{Version: singBoxRuleSetVersion}
+		if len(domains) > 0 {
+			doc.Rules = []rule{{Domain: domains}}
+		} else {
+			// An empty rules array is valid and means "match nothing", which is
+			// the honest state when ladon has not judged anything blocked yet.
+			doc.Rules = []rule{}
+		}
+		b, err := json.MarshalIndent(doc, "", "  ")
+		if err != nil {
+			return "", err
+		}
+		return string(b) + "\n", nil
+	}
+	return "", fmt.Errorf("unknown publish format %q (want domains or sing-box)", format)
 }
 
 // Defaults returns a reasonable baseline config.
@@ -1139,14 +1196,11 @@ func runVerdictPublisher(ctx context.Context, store *storage.Store, cfg Config) 
 			logEngine.Error("publish: list failed", "err", err)
 			return
 		}
-		var sb strings.Builder
-		sb.WriteString("# Domains ladon currently judges blocked. Generated — do not edit.\n")
-		sb.WriteString("# One per line, sorted. Subdomains are listed in their own right.\n")
-		for _, d := range domains {
-			sb.WriteString(d)
-			sb.WriteByte('\n')
+		body, err := renderVerdict(cfg.Publish.Format, domains)
+		if err != nil {
+			logEngine.Error("publish: cannot render", "err", err)
+			return
 		}
-		body := sb.String()
 		if body == last {
 			return
 		}
