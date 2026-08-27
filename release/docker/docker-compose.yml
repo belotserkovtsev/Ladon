@@ -1,0 +1,50 @@
+# Ladon alongside a resolver that already runs on the host.
+#
+# Read release/docker/README.md first: the sets and the firewall rules that act
+# on them have to exist on the host before this is worth starting.
+
+services:
+  ladon:
+    image: ghcr.io/belotserkovtsev/ladon:latest
+    # Собрать из исходников вместо готового образа:
+    #   docker compose -f release/docker/docker-compose.yml build
+    # build:
+    #   context: ../..
+    #   args:
+    #     VERSION: dev
+    container_name: ladon
+
+    # The sets live in the host's network namespace, so the engine has to share
+    # it — a container on its own network would program sets nothing routes on.
+    # This also means the probe leaves by the host's normal path, which is what
+    # tells it whether a domain is blocked.
+    network_mode: host
+
+    # Enough to program the sets. Not privileged: the engine never touches the
+    # firewall itself, that stays the operator's.
+    cap_add:
+      - NET_ADMIN
+
+    volumes:
+      # Config and the manual allow/deny lists.
+      - /etc/ladon:/etc/ladon
+      # The database. Keep it on a volume or every restart forgets what ladon
+      # learned and it starts classifying from nothing.
+      - ladon-state:/opt/ladon/state
+      # The resolver's log — the engine only reads it.
+      - /var/log/dnsmasq.log:/var/log/dnsmasq.log:ro
+      # Own presets, if any, on top of the ones baked into the image.
+      # - /opt/ladon/extensions:/opt/ladon/extensions
+
+    restart: unless-stopped
+
+    # `ladon doctor` reports on the whole pipeline, so an unhealthy answer here
+    # means something below ladon is broken too.
+    healthcheck:
+      test: ["CMD", "/opt/ladon/ladon", "-db", "/opt/ladon/state/engine.db", "doctor"]
+      interval: 5m
+      timeout: 30s
+      start_period: 1m
+
+volumes:
+  ladon-state:
