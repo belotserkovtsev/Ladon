@@ -571,6 +571,12 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 	if f.Revalidate.Streak > 0 {
 		cfg.Revalidate.Streak = f.Revalidate.Streak
 	}
+	if f.Publish.Path != "" {
+		cfg.Publish.Path = f.Publish.Path
+	}
+	if f.Publish.Interval > 0 {
+		cfg.Publish.Interval = time.Duration(f.Publish.Interval)
+	}
 	if f.Ipset.EngineName != "" {
 		cfg.IpsetName = f.Ipset.EngineName
 	}

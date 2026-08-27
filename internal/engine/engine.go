@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/belotserkovtsev/ladon/internal/decision"
@@ -170,6 +171,10 @@ type Config struct {
 	// budget) and as the first stage of the batch worker. Defaults to NewLocal.
 	LocalProber prober.Prober
 
+	// Publish writes out what ladon currently judges blocked, for tools that
+	// enforce differently than the kernel sets do. Off unless a path is given.
+	Publish PublishConfig
+
 	// RemoteProber is the optional exit-compare validator. When non-nil, the
 	// batch worker runs it ONLY after a local FAIL, and uses the combined
 	// verdict: local FAIL + remote OK = real DPI block (Hot); local FAIL +
@@ -209,6 +214,18 @@ type RevalidateConfig struct {
 	Streak   int           // consecutive disagreeing probes before a state flip
 }
 
+// PublishConfig controls writing out the current verdict. Ladon programs the
+// kernel sets itself, but that primitive is not the only way to act on a
+// verdict: a proxy client routes by domain, and an in-place bypass rewrites
+// packets without moving them anywhere. Both want the same answer in a form
+// they can read, so it is written to a plain file rather than assumed.
+//
+// Empty Path leaves the stage parked — nothing is written and nothing changes.
+type PublishConfig struct {
+	Path     string        // where to write; empty disables
+	Interval time.Duration // how often to check for changes
+}
+
 // Defaults returns a reasonable baseline config.
 func Defaults(logPath string) Config {
 	return Config{
@@ -235,6 +252,7 @@ func Defaults(logPath string) Config {
 		ManualDenyPath:         "",
 		IgnorePeer:             "10.10.0.1",
 		ManageDNSMasq:          true,
+		Publish:                PublishConfig{Interval: time.Minute},
 		Revalidate: RevalidateConfig{
 			Enabled:  false,
 			Interval: 6 * time.Hour,
@@ -337,7 +355,7 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 		manualNames = newNameSet(manualEntries.Domains)
 	}
 
-	errCh := make(chan error, 8) // 7 always-on stages + manual-syncer when the engine owns the manual set
+	errCh := make(chan error, 9) // 8 always-on stages + manual-syncer when the engine owns the manual set
 
 	// launch runs a pipeline stage and reports to errCh only if it returns
 	// BEFORE shutdown was requested. A stage exiting early (a tailer log-read
@@ -374,6 +392,7 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 	}
 	launch("maintenance", func() error { return runMaintenance(ctx, store, cfg) })
 	launch("scorer", func() error { return scorer.Run(ctx, store, cfg.Scorer) })
+	launch("publisher", func() error { return runVerdictPublisher(ctx, store, cfg) })
 	launch("revalidator", func() error { return runRevalidator(ctx, store, cfg, ipsetTrigger) })
 
 	select {
@@ -1078,6 +1097,90 @@ func runExpirySweeper(ctx context.Context, store *storage.Store, cfg Config) err
 //
 // Retentions carry generous margins so a clock skew or a wider window never
 // deletes a row a reader still wants.
+// runVerdictPublisher keeps a file in step with what ladon judges blocked, so
+// tools that enforce differently than the kernel sets can act on the same
+// answer: a proxy client routing by domain, an in-place bypass rewriting
+// packets where they are. Ladon decides either way and does not care which.
+//
+// Rewritten only when the contents actually change, and atomically, so a reader
+// polling the file never catches it half-written and never re-reads an
+// identical one. Parked when no path is configured.
+func runVerdictPublisher(ctx context.Context, store *storage.Store, cfg Config) error {
+	// A stage that returns before shutdown is treated as a failure, so the
+	// disabled path waits on ctx instead: publishing is optional and must never
+	// bring the daemon down with it.
+	if cfg.Publish.Path == "" {
+		<-ctx.Done()
+		return nil
+	}
+	every := cfg.Publish.Interval
+	if every <= 0 {
+		every = time.Minute
+	}
+
+	var last string
+	writeOnce := func() {
+		domains, err := store.ListBlockedDomains(ctx)
+		if err != nil {
+			logEngine.Error("publish: list failed", "err", err)
+			return
+		}
+		var sb strings.Builder
+		sb.WriteString("# Domains ladon currently judges blocked. Generated — do not edit.\n")
+		sb.WriteString("# One per line, sorted. Subdomains are listed in their own right.\n")
+		for _, d := range domains {
+			sb.WriteString(d)
+			sb.WriteByte('\n')
+		}
+		body := sb.String()
+		if body == last {
+			return
+		}
+		dir := filepath.Dir(cfg.Publish.Path)
+		tmp, err := os.CreateTemp(dir, ".ladon-blocked.*")
+		if err != nil {
+			logEngine.Error("publish: temp file failed", "dir", dir, "err", err)
+			return
+		}
+		tmpPath := tmp.Name()
+		defer os.Remove(tmpPath)
+		if _, err := tmp.WriteString(body); err != nil {
+			tmp.Close()
+			logEngine.Error("publish: write failed", "err", err)
+			return
+		}
+		if err := tmp.Chmod(0o644); err != nil {
+			tmp.Close()
+			logEngine.Error("publish: chmod failed", "err", err)
+			return
+		}
+		if err := tmp.Close(); err != nil {
+			logEngine.Error("publish: close failed", "err", err)
+			return
+		}
+		if err := os.Rename(tmpPath, cfg.Publish.Path); err != nil {
+			logEngine.Error("publish: rename failed", "path", cfg.Publish.Path, "err", err)
+			return
+		}
+		last = body
+		logEngine.Info("published blocked domains", "count", len(domains), "path", cfg.Publish.Path)
+	}
+
+	logEngine.Info("publisher enabled", "path", cfg.Publish.Path, "interval", every.String())
+	writeOnce()
+
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			writeOnce()
+		}
+	}
+}
+
 func runMaintenance(ctx context.Context, store *storage.Store, cfg Config) error {
 	interval := cfg.MaintenanceInterval
 	if interval <= 0 {

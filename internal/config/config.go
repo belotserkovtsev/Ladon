@@ -83,6 +83,7 @@ type File struct {
 	Probe      ProbeSection      `yaml:"probe"`
 	Scorer     ScorerSection     `yaml:"scorer"`
 	Revalidate RevalidateSection `yaml:"revalidate"`
+	Publish    PublishSection    `yaml:"publish"`
 	Ipset      IpsetSection      `yaml:"ipset"`
 	Log        LogSection        `yaml:"log"`
 
@@ -138,6 +139,14 @@ type RemoteSection struct {
 	Timeout    Duration `yaml:"timeout"`
 	AuthHeader string   `yaml:"auth_header"`
 	AuthValue  string   `yaml:"auth_value"`
+}
+
+// PublishSection writes out what ladon judges blocked, for tools that enforce
+// differently than the kernel sets do — a proxy client routing by domain, an
+// in-place bypass rewriting packets where they are. Empty path leaves it off.
+type PublishSection struct {
+	Path     string   `yaml:"path"`
+	Interval Duration `yaml:"interval"`
 }
 
 // ScorerSection mirrors scorer.Config.
