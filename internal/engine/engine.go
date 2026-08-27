@@ -812,20 +812,34 @@ func syncCIDRSet(ctx context.Context, cfg Config, cidrs []string) {
 // safety ticker and by the ipsetTrigger channel — hot probes signal the
 // channel so a just-observed blocked IP lands in `prod` within ~milliseconds.
 func runIpsetSyncer(ctx context.Context, store *storage.Store, cfg Config, trigger <-chan struct{}) error {
+	// Every "cannot do this" path below waits on ctx rather than returning.
+	// A launched stage that returns early is reported as a failure, the daemon
+	// exits and the service manager restarts it — which fixes nothing here,
+	// because an absent set or an absent `ipset` is a host problem that no
+	// number of restarts resolves. What the restarts do accomplish is bouncing
+	// dnsmasq every few seconds and flapping DNS for everyone behind us.
+	//
+	// So the daemon stays up and keeps doing the rest of its job: observing,
+	// probing, publishing. It just isn't programming the set, which is stated
+	// loudly here and reported by `ladon doctor`.
 	if cfg.IpsetName == "" {
+		<-ctx.Done()
 		return nil
 	}
 	mgr := ipset.New(cfg.IpsetName)
 
 	ok, err := mgr.Exists(ctx)
 	if err != nil {
-		logIpset.Error("ipset exists check failed", "set", cfg.IpsetName, "err", err)
+		logIpset.Error("cannot use the set — routing is NOT being programmed",
+			"set", cfg.IpsetName, "err", err)
+		<-ctx.Done()
 		return nil
 	}
 	if !ok {
-		logIpset.Warn("ipset not found — skipping ipset syncer",
+		logIpset.Error("set not found — routing is NOT being programmed",
 			"set", cfg.IpsetName,
-			"hint", fmt.Sprintf("ipset create %s hash:ip", cfg.IpsetName))
+			"hint", fmt.Sprintf("ipset create %s hash:ip family inet -exist", cfg.IpsetName))
+		<-ctx.Done()
 		return nil
 	}
 
