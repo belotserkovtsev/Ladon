@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -66,22 +67,30 @@ func (m *Manager) Save(ctx context.Context) ([]byte, error) { return m.be.save(c
 
 // Reconcile makes the set contain exactly desired (and nothing more).
 // Returns counts of adds and deletes applied. Backend-agnostic set diff.
+//
+// The diff is taken on a canonical key rather than the raw string, because a
+// set does not always report an entry back the way it was written: a single
+// host given as "10.0.0.1/32" comes back as "10.0.0.1". Diffing raw strings
+// treats those as two different entries, so every pass adds the one and then
+// deletes the other — the same address, leaving the set short by exactly the
+// entries an operator pinned as /32. Add and Del still get the original
+// strings, so each backend receives the syntax it was given.
 func (m *Manager) Reconcile(ctx context.Context, desired []string) (added, removed int, err error) {
 	current, err := m.Members(ctx)
 	if err != nil {
 		return 0, 0, err
 	}
-	want := make(map[string]struct{}, len(desired))
+	want := make(map[string]string, len(desired))
 	for _, ip := range desired {
-		want[ip] = struct{}{}
+		want[canonical(ip)] = ip
 	}
-	have := make(map[string]struct{}, len(current))
+	have := make(map[string]string, len(current))
 	for _, ip := range current {
-		have[ip] = struct{}{}
+		have[canonical(ip)] = ip
 	}
 
-	for ip := range want {
-		if _, ok := have[ip]; ok {
+	for key, ip := range want {
+		if _, ok := have[key]; ok {
 			continue
 		}
 		if err := m.Add(ctx, ip); err != nil {
@@ -89,8 +98,8 @@ func (m *Manager) Reconcile(ctx context.Context, desired []string) (added, remov
 		}
 		added++
 	}
-	for ip := range have {
-		if _, ok := want[ip]; ok {
+	for key, ip := range have {
+		if _, ok := want[key]; ok {
 			continue
 		}
 		if err := m.Del(ctx, ip); err != nil {
@@ -99,6 +108,24 @@ func (m *Manager) Reconcile(ctx context.Context, desired []string) (added, remov
 		removed++
 	}
 	return added, removed, nil
+}
+
+// canonical renders an entry the way a set reports it back, so a desired entry
+// and the member it produced compare equal. A full-length prefix is dropped
+// ("10.0.0.1/32" -> "10.0.0.1"), a network is reduced to its base address
+// ("10.0.0.5/24" -> "10.0.0.0/24"), and anything unparseable is returned
+// untouched so an unfamiliar syntax still diffs against itself.
+func canonical(entry string) string {
+	if ip := net.ParseIP(entry); ip != nil {
+		return ip.String()
+	}
+	if ip, ipnet, err := net.ParseCIDR(entry); err == nil {
+		if ones, bits := ipnet.Mask.Size(); ones == bits {
+			return ip.String()
+		}
+		return ipnet.String()
+	}
+	return entry
 }
 
 // ---- Linux: ipset CLI ----

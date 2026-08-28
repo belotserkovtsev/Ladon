@@ -66,3 +66,34 @@ jobs:
         # so a flaky shared runner doesn't kill the whole job mid-probe;
         # the inner test deadline is 120s, so 240s leaves room for CI overhead.
         run: go test -v -run 'TestPipeline' -timeout 240s ./internal/engine/
+
+  image:
+    name: 🐳 image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: build image
+        # Build only, never push: this job exists so a broken Dockerfile fails
+        # here rather than at release time. amd64 alone is enough to prove the
+        # build; the release job is what produces the multi-arch image.
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: ladon:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: image runs and carries its dependencies
+        run: |
+          set -euo pipefail
+          docker run --rm ladon:ci version
+          # ipset and the trust store are what the engine actually needs at
+          # runtime: the sets, and verifying a chain to spot a substituted cert.
+          docker run --rm --entrypoint sh ladon:ci -c 'command -v ipset'
+          docker run --rm --entrypoint sh ladon:ci -c 'test -s /etc/ssl/certs/ca-certificates.crt'
+          docker run --rm --entrypoint sh ladon:ci -c 'ls /opt/ladon/extensions/ | head -3'

@@ -43,6 +43,12 @@ LADON_EXTENSIONS="${LADON_EXTENSIONS:-}"
 LADON_PROBE_MODE="${LADON_PROBE_MODE:-}"
 LADON_REMOTE_URL="${LADON_REMOTE_URL:-}"
 LADON_REMOTE_TOKEN="${LADON_REMOTE_TOKEN:-}"
+# systemd | docker. Unset asks, defaulting to whatever the machine looks like.
+LADON_MODE="${LADON_MODE:-}"
+LADON_IMAGE="${LADON_IMAGE:-ghcr.io/belotserkovtsev/ladon:latest}"
+LADON_NET="${LADON_NET:-172.30.0.0/24}"
+LADON_IP="${LADON_IP:-172.30.0.2}"
+LADON_EGRESS_GW="${LADON_EGRESS_GW:-}"
 FORCE=0
 for a in "$@"; do case "$a" in -f|--force) FORCE=1 ;; esac; done
 
@@ -177,6 +183,96 @@ ask_probe_mode() {
   esac
 }
 
+MODE=""
+ask_install_mode() { # $1 = what the machine looks like
+  printf '  %s?%s Как ставить?  %sпохоже на: %s%s\n' "$CYAN" "$NC" "$DIM" "$1" "$NC"
+  printf '    1) systemd  %sслужба на хосте: быстрее всего, но нужен свой резолвер и правила%s\n' "$DIM" "$NC"
+  printf '    2) docker   %sконтейнер со своим резолвером: работает и на обычной машине%s\n' "$DIM" "$NC"
+  printf '    > '
+  IFS= read -r m <&3 || m=""
+  case "$m" in
+    1|systemd) MODE=systemd ;;
+    2|docker)  MODE=docker ;;
+    *)         MODE="$1" ;;
+  esac
+}
+
+install_docker() {
+  have docker || die "docker не найден — поставь его или выбери режим systemd"
+  docker info >/dev/null 2>&1 || die "docker есть, но демон не отвечает"
+
+  step "Образ"
+  if docker pull "$LADON_IMAGE" >/dev/null 2>&1; then
+    ok "$LADON_IMAGE"
+  elif docker image inspect "$LADON_IMAGE" >/dev/null 2>&1; then
+    # Built here rather than pulled — a normal way to run an unreleased build.
+    ok "$LADON_IMAGE (локальный, не скачивался)"
+  else
+    die "образа $LADON_IMAGE нет ни в реестре, ни локально"
+  fi
+
+  # The presets live in the image, so ask about the ones actually shipped there
+  # rather than a list guessed here.
+  EXT_NAMES=$(docker run --rm --entrypoint sh "$LADON_IMAGE" \
+      -c 'ls /opt/ladon/extensions/*.txt 2>/dev/null' 2>/dev/null \
+      | sed 's|.*/||; s|\.txt$||' | tr '\n' ' ' | sed 's/ *$//')
+
+  FRESH=1; [ -f "$LADON_CONFIG_DIR/config.yaml" ] && FRESH=0
+  [ -n "$LADON_EXTENSIONS" ] && CHOICE_MULTI="$LADON_EXTENSIONS"
+  if [ "$FRESH" = 1 ] && [ -z "$LADON_EXTENSIONS" ] && [ -n "$EXT_NAMES" ] \
+     && ( exec 3</dev/tty ) 2>/dev/null && exec 3</dev/tty; then
+    step "Настройка"
+    ask_extensions
+    exec 3<&-
+  fi
+
+  [ "$DRY_RUN" = 1 ] && { step "Dry-run"; info "пропущено: сеть, контейнер, конфиг"; exit 0; }
+
+  step "Установка"
+  install -d "$LADON_CONFIG_DIR"
+  if [ "$FRESH" = 1 ]; then
+    write_config_linux
+    ok "конфиг → $LADON_CONFIG_DIR/config.yaml"
+  else
+    info "config.yaml на месте — не трогаю"
+  fi
+  [ -f "$LADON_CONFIG_DIR/manual-allow.txt" ] || : > "$LADON_CONFIG_DIR/manual-allow.txt"
+  [ -f "$LADON_CONFIG_DIR/manual-deny.txt" ]  || : > "$LADON_CONFIG_DIR/manual-deny.txt"
+
+  if ! docker network inspect ladon >/dev/null 2>&1; then
+    if ! _err=$(docker network create --subnet "$LADON_NET" ladon 2>&1); then
+      case "$_err" in
+        *overlap*|*Pool*) die "подсеть $LADON_NET уже занята другой сетью docker — задай свою: LADON_NET=172.31.0.0/24 LADON_IP=172.31.0.2" ;;
+        *) die "не создал сеть docker: $_err" ;;
+      esac
+    fi
+  fi
+  docker rm -f ladon >/dev/null 2>&1 || true
+
+  # NET_ADMIN programs the sets and the rules; forwarding has to be granted
+  # here because /proc/sys is read-only inside. Nothing else is needed —
+  # the host's firewall is never touched.
+  set -- --name ladon -d --restart unless-stopped \
+        --network ladon --ip "$LADON_IP" \
+        --cap-add NET_ADMIN --sysctl net.ipv4.ip_forward=1 \
+        -v "$LADON_CONFIG_DIR":/etc/ladon \
+        -v ladon-state:/opt/ladon/state
+  [ -n "$LADON_EGRESS_GW" ] && set -- "$@" -e LADON_EGRESS_GW="$LADON_EGRESS_GW"
+  docker run "$@" "$LADON_IMAGE" >/dev/null || die "контейнер не стартовал"
+  sleep 5
+  [ "$(docker inspect -f '{{.State.Status}}' ladon 2>/dev/null)" = "running" ] \
+    || { docker logs ladon 2>&1 | tail -5 >&2; die "контейнер упал — лог выше"; }
+  ok "контейнер ladon на $LADON_IP"
+
+  step "Осталось направить трафик в него"
+  info "резолвить через него:  echo nameserver $LADON_IP | sudo tee /etc/resolv.conf"
+  info "и отдать ему трафик:   sudo ip route add default via $LADON_IP metric 50"
+  info "другие устройства:     указать $LADON_IP как DNS и шлюз"
+  [ -z "$LADON_EGRESS_GW" ] && \
+    warn "LADON_EGRESS_GW не задан — отобранное уйдёт обычным путём, без туннеля"
+  info "проверка:              docker exec -it ladon /opt/ladon/ladon doctor"
+}
+
 write_config_linux() {
   cfg="$LADON_CONFIG_DIR/config.yaml"
   {
@@ -211,7 +307,6 @@ install_linux() {
     *debian*|*ubuntu*) ;;
     *) die "поддерживается только Debian/Ubuntu (ID=${ID:-?})" ;;
   esac
-  have systemctl || die "нужен systemd"
   have curl || die "нужен curl"
   case "$(uname -m)" in
     x86_64|amd64) ARCH=amd64 ;;
@@ -222,9 +317,30 @@ install_linux() {
   step "Окружение"
   ok "Linux/$ARCH (${PRETTY_NAME:-$ID})"
 
+  # What the machine looks like now picks a default instead of refusing. A
+  # desktop is precisely what the container is for: it brings its own resolver
+  # and keeps the split inside its own namespace, so nothing here has to be a
+  # gateway. The host install still wants one.
   detect_topology
+  [ "$DETECT_GUESS" = gateway ] && MODE_HINT=systemd || MODE_HINT=docker
+  MODE="$LADON_MODE"
+  if [ -z "$MODE" ]; then
+    if ( exec 3</dev/tty ) 2>/dev/null && exec 3</dev/tty; then
+      step "Режим"
+      ask_install_mode "$MODE_HINT"
+      exec 3<&-
+    else
+      MODE="$MODE_HINT"
+      info "режим не задан и спросить некого — беру $MODE"
+    fi
+  fi
+  ok "режим: $MODE"
+
+  if [ "$MODE" = docker ]; then install_docker; return; fi
+
+  have systemctl || die "выбран systemd, но systemd на машине нет"
   if [ "$DETECT_GUESS" = "desktop" ] && [ "$FORCE" != 1 ]; then
-    die "устройство определено как десктоп — установка остановлена (-f чтобы пропустить)"
+    die "это похоже на десктоп — для него режим docker (-f чтобы всё равно ставить службу)"
   fi
 
   step "Загрузка"

@@ -83,6 +83,7 @@ type File struct {
 	Probe      ProbeSection      `yaml:"probe"`
 	Scorer     ScorerSection     `yaml:"scorer"`
 	Revalidate RevalidateSection `yaml:"revalidate"`
+	Publish    PublishSection    `yaml:"publish"`
 	Ipset      IpsetSection      `yaml:"ipset"`
 	Log        LogSection        `yaml:"log"`
 
@@ -90,6 +91,13 @@ type File struct {
 	DNSFreshness           Duration `yaml:"dns_freshness"`
 	IgnorePeer             string   `yaml:"ignore_peer"`
 	FamilyConfirmThreshold int      `yaml:"family_confirm_threshold"`
+
+	// ManageDNSMasq: let ladon write dnsmasq's snippet and restart it. Default
+	// true. A pointer so an unset key keeps the default instead of forcing
+	// false. Set it to false where ladon can't drive dnsmasq — in a container,
+	// or when someone else owns the resolver — and the engine fills the manual
+	// set itself.
+	ManageDNSMasq *bool `yaml:"manage_dnsmasq"`
 
 	// AllowExtensions are bundled allow-list presets enabled by name. Each
 	// name resolves to <ExtensionsPath>/<name>.txt and is loaded with the
@@ -131,6 +139,18 @@ type RemoteSection struct {
 	Timeout    Duration `yaml:"timeout"`
 	AuthHeader string   `yaml:"auth_header"`
 	AuthValue  string   `yaml:"auth_value"`
+}
+
+// PublishSection writes out what ladon judges blocked, for tools that enforce
+// differently than the kernel sets do — a proxy client routing by domain, an
+// in-place bypass rewriting packets where they are. Empty path leaves it off.
+type PublishSection struct {
+	Path string `yaml:"path"`
+	// "domains" (default) writes the plain list — no schema, no dependency on
+	// anyone's format. "sing-box" writes a rule-set that client reloads on its
+	// own when the file changes.
+	Format   string   `yaml:"format"`
+	Interval Duration `yaml:"interval"`
 }
 
 // ScorerSection mirrors scorer.Config.
@@ -198,6 +218,12 @@ func (f *File) Validate() error {
 		// ok
 	default:
 		return fmt.Errorf("probe.mode: unknown %q (want local|exit-compare)", f.Probe.Mode)
+	}
+	switch f.Publish.Format {
+	case "", "domains", "sing-box":
+		// ok
+	default:
+		return fmt.Errorf("publish.format: unknown %q (want domains|sing-box)", f.Publish.Format)
 	}
 	if f.Probe.Mode == "exit-compare" && f.Probe.Remote.URL == "" {
 		return prober.ErrEmptyURL

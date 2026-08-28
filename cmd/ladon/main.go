@@ -254,13 +254,32 @@ func main() {
 		// OPNsense Apply can fail loudly on a bad value instead of letting the
 		// daemon crash silently on restart. config.Load already runs Validate and
 		// the duration parser, so a bad value surfaces here as a non-zero exit.
-		file, err := config.Load(*configPath)
+		//
+		// The flag is taken after the subcommand as well as before it, the way
+		// doctor does. The usage line reads `config-check [-config PATH]`, and
+		// following it literally put the flag where the global parser never
+		// looks — so the check happily reported success on a file it had not
+		// read, which is worse than no check at all.
+		fs := flag.NewFlagSet("config-check", flag.ExitOnError)
+		cfgFlag := fs.String("config", "", "path to YAML config")
+		_ = fs.Parse(args[1:])
+		path := *configPath
+		if *cfgFlag != "" {
+			path = *cfgFlag
+		}
+		file, err := config.Load(path)
 		if err != nil && err != config.ErrNotFound {
 			fatal("config: %v", err)
 		}
 		cfg := engine.Defaults("")
 		applyConfigFile(&cfg, file)
-		fmt.Println("config ok")
+		if file == nil {
+			// Saying "ok" here would claim a file was validated when none was
+			// named. The defaults are valid, so this is not a failure.
+			fmt.Println("no config given — defaults apply")
+		} else {
+			fmt.Println("config ok")
+		}
 
 	case "doctor":
 		doctorCmd(ctx, store, *configPath, args[1:])
@@ -571,6 +590,15 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 	if f.Revalidate.Streak > 0 {
 		cfg.Revalidate.Streak = f.Revalidate.Streak
 	}
+	if f.Publish.Path != "" {
+		cfg.Publish.Path = f.Publish.Path
+	}
+	if f.Publish.Format != "" {
+		cfg.Publish.Format = f.Publish.Format
+	}
+	if f.Publish.Interval > 0 {
+		cfg.Publish.Interval = time.Duration(f.Publish.Interval)
+	}
 	if f.Ipset.EngineName != "" {
 		cfg.IpsetName = f.Ipset.EngineName
 	}
@@ -594,6 +622,9 @@ func applyConfigFile(cfg *engine.Config, f *config.File) {
 	}
 	if f.IgnorePeer != "" {
 		cfg.IgnorePeer = f.IgnorePeer
+	}
+	if f.ManageDNSMasq != nil {
+		cfg.ManageDNSMasq = *f.ManageDNSMasq
 	}
 	if len(f.AllowExtensions) > 0 {
 		cfg.AllowExtensions = f.AllowExtensions

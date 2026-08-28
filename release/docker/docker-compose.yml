@@ -1,0 +1,70 @@
+# Ladon in a network namespace of its own.
+#
+# Read release/docker/README.md first: this only splits traffic that goes
+# through the container, so the last step is pointing the machine at it.
+
+services:
+  ladon:
+    image: ghcr.io/belotserkovtsev/ladon:latest
+    # Собрать из исходников вместо готового образа:
+    #   docker compose -f release/docker/docker-compose.yml build
+    # build:
+    #   context: ../..
+    #   args:
+    #     VERSION: dev
+    container_name: ladon
+
+    # Deliberately NOT host networking: on the host's namespace there would be
+    # nothing to isolate, since the sets and the rules acting on them would be
+    # the host's own. Here they are the container's, and the host keeps none.
+    networks:
+      ladon:
+        ipv4_address: 172.30.0.2
+
+    # Enough to program the sets and the rules. Not privileged: nothing here
+    # reaches outside this namespace.
+    cap_add:
+      - NET_ADMIN
+
+    # Traffic passes through, so forwarding has to be on — and /proc/sys is
+    # read-only inside, which makes it the caller's to grant.
+    sysctls:
+      net.ipv4.ip_forward: 1
+
+    environment:
+      # Where the resolver forwards. An encrypted upstream is worth having:
+      # a plain one can be answered by somebody else on the way.
+      LADON_UPSTREAM_DNS: 1.1.1.1
+      # A router that already carries a tunnel. Set it and this container needs
+      # no tunnel of its own — it decides, the router carries. Left unset,
+      # split traffic simply leaves the normal way, which tests the plumbing
+      # without proving anything about the tunnel.
+      # LADON_EGRESS_GW: 192.168.0.1
+
+    volumes:
+      # Config and the manual allow/deny lists.
+      - /etc/ladon:/etc/ladon
+      # The database. Without a volume every restart forgets what ladon learned
+      # and it starts classifying from nothing.
+      - ladon-state:/opt/ladon/state
+      # Own presets, if any, on top of the ones baked into the image.
+      # - /opt/ladon/extensions:/opt/ladon/extensions
+
+    restart: unless-stopped
+
+    # `ladon doctor` walks the whole pipeline and judges only ladon itself, so
+    # an unhealthy answer here means ladon, not the tunnel underneath it.
+    healthcheck:
+      test: ["CMD", "/opt/ladon/ladon", "-db", "/opt/ladon/state/engine.db", "doctor"]
+      interval: 5m
+      timeout: 30s
+      start_period: 1m
+
+networks:
+  ladon:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  ladon-state:

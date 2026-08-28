@@ -452,6 +452,33 @@ func (s *Store) PromoteCache(ctx context.Context, domain, reason string, at time
 }
 
 // ListCacheEntries returns all cached domains.
+// ListBlockedDomains returns every domain ladon currently judges blocked,
+// sorted. That is the three states routed through the tunnel: 'hot' (a probe
+// said so and the verdict is still fresh), 'cache' (it kept saying so long
+// enough to stick) and 'covered' (a member of a site confirmed as a whole).
+//
+// Deliberately domains rather than addresses: this is what the verdict is
+// about, it survives the addresses rotating underneath, and it is the unit
+// every consumer outside ladon speaks — a proxy's routing rules, an
+// in-place bypass's list, an operator reading the file.
+func (s *Store) ListBlockedDomains(ctx context.Context) ([]string, error) {
+	rows, err := s.rdb.QueryContext(ctx,
+		`SELECT domain FROM domains WHERE state IN ('hot', 'cache', 'covered') ORDER BY domain`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) ListCacheEntries(ctx context.Context) ([]string, error) {
 	rows, err := s.rdb.QueryContext(ctx, `SELECT domain FROM cache_entries ORDER BY domain`)
 	if err != nil {
