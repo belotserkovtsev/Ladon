@@ -19,8 +19,14 @@
 #   LADON_EXTENSIONS="discord telegram"   non-interactive preset list
 #   LADON_PROBE_MODE=local|exit-compare   non-interactive probe mode
 #   LADON_REMOTE_URL= / LADON_REMOTE_TOKEN=   exit-compare prober
+#   LADON_MODE=systemd|docker             skip the "how to install" question
 #   NO_COLOR=1           disable color
 #   IPSET_ENGINE / IPSET_MANUAL / IPSET_CIDR / LADON_PREFIX / LADON_CONFIG_DIR   (Linux)
+#   docker mode only:
+#     LADON_IMAGE=…         image to run (default: ghcr.io release)
+#     LADON_NET / LADON_IP  the container's own subnet and address
+#     LADON_UPSTREAM_DNS=…  where its resolver forwards (default 1.1.1.1)
+#     LADON_EGRESS_GW=…     router that already carries a tunnel
 
 set -eu
 
@@ -49,6 +55,10 @@ LADON_IMAGE="${LADON_IMAGE:-ghcr.io/belotserkovtsev/ladon:latest}"
 LADON_NET="${LADON_NET:-172.30.0.0/24}"
 LADON_IP="${LADON_IP:-172.30.0.2}"
 LADON_EGRESS_GW="${LADON_EGRESS_GW:-}"
+# Where the container's resolver forwards. Worth pointing at something
+# encrypted: a plaintext query is answerable by whoever is on the way, and a
+# forged answer is exactly the failure ladon is meant to see through.
+LADON_UPSTREAM_DNS="${LADON_UPSTREAM_DNS:-1.1.1.1}"
 FORCE=0
 for a in "$@"; do case "$a" in -f|--force) FORCE=1 ;; esac; done
 
@@ -218,11 +228,21 @@ install_docker() {
       | sed 's|.*/||; s|\.txt$||' | tr '\n' ' ' | sed 's/ *$//')
 
   FRESH=1; [ -f "$LADON_CONFIG_DIR/config.yaml" ] && FRESH=0
-  [ -n "$LADON_EXTENSIONS" ] && CHOICE_MULTI="$LADON_EXTENSIONS"
-  if [ "$FRESH" = 1 ] && [ -z "$LADON_EXTENSIONS" ] && [ -n "$EXT_NAMES" ] \
+
+  # The same env preset as the systemd path honours. The config written here is
+  # the same config, so an option that works in one mode has to work in the
+  # other — silently dropping probe mode because docker was chosen would leave
+  # the operator with a config they never asked for.
+  [ -n "$LADON_PROBE_MODE" ]   && PROBE_MODE="$LADON_PROBE_MODE"
+  [ -n "$LADON_EXTENSIONS" ]   && CHOICE_MULTI="$LADON_EXTENSIONS"
+  [ -n "$LADON_REMOTE_URL" ]   && REMOTE_URL="$LADON_REMOTE_URL"
+  [ -n "$LADON_REMOTE_TOKEN" ] && REMOTE_TOKEN="$LADON_REMOTE_TOKEN"
+
+  if [ "$FRESH" = 1 ] && { [ -z "$LADON_PROBE_MODE" ] || [ -z "$LADON_EXTENSIONS" ]; } \
      && ( exec 3</dev/tty ) 2>/dev/null && exec 3</dev/tty; then
     step "Настройка"
-    ask_extensions
+    [ -n "$EXT_NAMES" ] && [ -z "$LADON_EXTENSIONS" ] && ask_extensions
+    [ -z "$LADON_PROBE_MODE" ] && ask_probe_mode
     exec 3<&-
   fi
 
@@ -255,6 +275,7 @@ install_docker() {
   set -- --name ladon -d --restart unless-stopped \
         --network ladon --ip "$LADON_IP" \
         --cap-add NET_ADMIN --sysctl net.ipv4.ip_forward=1 \
+        -e LADON_UPSTREAM_DNS="$LADON_UPSTREAM_DNS" \
         -v "$LADON_CONFIG_DIR":/etc/ladon \
         -v ladon-state:/opt/ladon/state
   [ -n "$LADON_EGRESS_GW" ] && set -- "$@" -e LADON_EGRESS_GW="$LADON_EGRESS_GW"
@@ -270,6 +291,11 @@ install_docker() {
   info "другие устройства:     указать $LADON_IP как DNS и шлюз"
   [ -z "$LADON_EGRESS_GW" ] && \
     warn "LADON_EGRESS_GW не задан — отобранное уйдёт обычным путём, без туннеля"
+  # Both commands above change the machine, and neither undoes itself. Saying
+  # how to step back belongs next to them, not in a file someone reads later:
+  # a default route into a container that is gone takes the network with it.
+  info "откатить маршрут:      sudo ip route del default via $LADON_IP metric 50"
+  info "снести целиком:        uninstall.sh (контейнер, сеть и том)"
   info "проверка:              docker exec -it ladon /opt/ladon/ladon doctor"
 }
 

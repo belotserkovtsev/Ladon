@@ -18,11 +18,29 @@
 #   ipset create ladon_engine hash:ip  family inet -exist
 #   ipset create ladon_manual hash:ip  family inet -exist
 #   ipset create ladon_cidr   hash:net family inet -exist
+#
+# Two limits worth knowing before you rely on this:
+#
+#   TCP only. REDIRECT has nothing to offer UDP here, so QUIC (HTTP/3) is left
+#   to leave directly — and a browser that reaches a listed site over QUIC gets
+#   the blocked path, not the tunnel. Browsers do fall back to TCP, but not
+#   always quickly. Turn QUIC off in the client, or block UDP/443 to listed
+#   destinations so the fallback happens at once.
+#
+#   The tunnel client needs its own user. Its connection to its own server is
+#   to a public address like any other, so without an exception it matches the
+#   sets and gets redirected into itself. LADON_TUNNEL_USER names that user:
+#
+#     LADON_TUNNEL_USER=sing-box ./setup-routing.sh up
+#
+#   Running the client as root leaves nothing to distinguish it by — give it a
+#   dedicated user instead.
 
 set -eu
 
 CHAIN=LADON_OUT
 PORT="${2:-12345}"
+LADON_TUNNEL_USER="${LADON_TUNNEL_USER:-xray}"
 
 need() {
     command -v "$1" >/dev/null 2>&1 || { echo "missing: $1" >&2; exit 1; }
@@ -50,8 +68,11 @@ up() {
 
     # The tunnel client runs as its own user; without this its outbound
     # connection would match the sets and be redirected back into itself.
-    if id -u xray >/dev/null 2>&1; then
-        iptables -t nat -A "$CHAIN" -m owner --uid-owner xray -j RETURN
+    if id -u "$LADON_TUNNEL_USER" >/dev/null 2>&1; then
+        iptables -t nat -A "$CHAIN" -m owner --uid-owner "$LADON_TUNNEL_USER" -j RETURN
+    else
+        echo "warning: no user '$LADON_TUNNEL_USER' — the tunnel's own traffic is NOT excluded" >&2
+        echo "         set LADON_TUNNEL_USER to the user your client runs as, or it will loop" >&2
     fi
 
     for s in ladon_engine ladon_manual ladon_cidr; do

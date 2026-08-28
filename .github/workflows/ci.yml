@@ -97,3 +97,6 @@ jobs:
           docker run --rm --entrypoint sh ladon:ci -c 'command -v ipset'
           docker run --rm --entrypoint sh ladon:ci -c 'test -s /etc/ssl/certs/ca-certificates.crt'
           docker run --rm --entrypoint sh ladon:ci -c 'ls /opt/ladon/extensions/ | head -3'
+          # Docker calls the healthcheck by path; a missed copy or chmod would
+          # only show up as a container stuck "starting" long after release.
+          docker run --rm --entrypoint sh ladon:ci -c 'test -x /opt/ladon/healthcheck.sh'

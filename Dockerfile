@@ -34,7 +34,12 @@ WORKDIR /opt/ladon
 COPY --from=build /out/ladon /opt/ladon/ladon
 COPY release/extensions/ /opt/ladon/extensions/
 COPY release/docker/entrypoint.sh /opt/ladon/entrypoint.sh
-RUN chmod +x /opt/ladon/entrypoint.sh
+COPY release/docker/healthcheck.sh /opt/ladon/healthcheck.sh
+RUN chmod +x /opt/ladon/entrypoint.sh /opt/ladon/healthcheck.sh
+
+# Carried by the image so a plain `docker run` is watched too, not only compose.
+HEALTHCHECK --interval=5m --timeout=30s --start-period=1m \
+    CMD /opt/ladon/healthcheck.sh
 
 # state: the SQLite database. /etc/ladon: config and the manual lists.
 VOLUME ["/opt/ladon/state", "/etc/ladon"]
