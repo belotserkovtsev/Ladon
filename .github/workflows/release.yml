@@ -177,6 +177,10 @@ jobs:
 
   image:
     name: 🐳 publish image
+    # Gated on the binary build: the image carries the same code, so publishing
+    # one for a tag whose build failed would put a broken `latest` in the
+    # registry while the release itself never appears.
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

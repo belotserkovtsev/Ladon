@@ -451,7 +451,6 @@ func (s *Store) PromoteCache(ctx context.Context, domain, reason string, at time
 	return tx.Commit()
 }
 
-// ListCacheEntries returns all cached domains.
 // ListBlockedDomains returns every domain ladon currently judges blocked,
 // sorted. That is the three states routed through the tunnel: 'hot' (a probe
 // said so and the verdict is still fresh), 'cache' (it kept saying so long
@@ -479,6 +478,7 @@ func (s *Store) ListBlockedDomains(ctx context.Context) ([]string, error) {
 	return out, rows.Err()
 }
 
+// ListCacheEntries returns all cached domains.
 func (s *Store) ListCacheEntries(ctx context.Context) ([]string, error) {
 	rows, err := s.rdb.QueryContext(ctx, `SELECT domain FROM cache_entries ORDER BY domain`)
 	if err != nil {

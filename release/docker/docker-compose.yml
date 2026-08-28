@@ -54,8 +54,11 @@ services:
 
     # `ladon doctor` walks the whole pipeline and judges only ladon itself, so
     # an unhealthy answer here means ladon, not the tunnel underneath it.
+    #
+    # The script is in the image (and set as its HEALTHCHECK, so a plain
+    # `docker run` is watched too); what it decides is written down there.
     healthcheck:
-      test: ["CMD", "/opt/ladon/ladon", "-db", "/opt/ladon/state/engine.db", "doctor"]
+      test: ["CMD", "/opt/ladon/healthcheck.sh"]
       interval: 5m
       timeout: 30s
       start_period: 1m

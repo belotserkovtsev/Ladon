@@ -1032,18 +1032,57 @@ func runManualSyncer(ctx context.Context, store *storage.Store, cfg Config, doma
 				"set", cfg.ManualIpsetName, "added", added, "removed", removed, "total", len(want))
 		}
 	}
-	syncNow()
+	// Triggers arrive on every observation of a manual-list name, which on a
+	// busy resolver is a continuous stream — far more traffic than the hot-probe
+	// verdicts the same mechanism carries for the engine set. A pass costs a
+	// lookup per domain plus a full reconcile, so triggered passes are spaced:
+	// the first after a quiet spell runs immediately, and any arriving while the
+	// window is open are answered by one pass when it closes. Nothing is
+	// dropped, and the syncer never runs back-to-back on a busy gateway.
+	const triggerSpacing = 2 * time.Second
+	var lastSync time.Time
+	sync := func() {
+		lastSync = time.Now()
+		syncNow()
+	}
+
+	waiting := false
+	spacer := time.NewTimer(time.Hour)
+	spacer.Stop()
+	defer spacer.Stop()
+
+	sync()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-trigger:
-			syncNow()
+			if wait, ok := triggerDue(time.Now(), lastSync, triggerSpacing); !ok {
+				if !waiting {
+					waiting = true
+					spacer.Reset(wait)
+				}
+				continue
+			}
+			sync()
+		case <-spacer.C:
+			waiting = false
+			sync()
 		case <-ticker.C:
-			syncNow()
+			sync()
 		}
 	}
+}
+
+// triggerDue answers whether a triggered pass may run now, and if not, how long
+// until it may. Split out from the loop so the spacing can be tested without a
+// kernel set to reconcile against.
+func triggerDue(now, lastSync time.Time, spacing time.Duration) (time.Duration, bool) {
+	if wait := spacing - now.Sub(lastSync); wait > 0 {
+		return wait, false
+	}
+	return 0, true
 }
 
 // computeDesiredIPs walks hot ∪ cache and returns the union of IPs that
@@ -1157,17 +1196,6 @@ func runExpirySweeper(ctx context.Context, store *storage.Store, cfg Config) err
 	}
 }
 
-// runMaintenance bounds on-disk growth on a slow cadence. Nothing here affects
-// correctness — it only reclaims space the rest of the engine never reads again:
-//   - WAL checkpoint(TRUNCATE): the long-lived read pool blocks SQLite's passive
-//     auto-truncate, so the -wal file grows without this.
-//   - prune probes older than the scorer's window (the scorer only ever counts
-//     verdicts within Scorer.Window, so older rows are dead weight).
-//   - prune dns_cache observations past their freshness horizon (reads already
-//     filter on DNSFreshness, so stale rows are never shipped to the ipset).
-//
-// Retentions carry generous margins so a clock skew or a wider window never
-// deletes a row a reader still wants.
 // runVerdictPublisher keeps a file in step with what ladon judges blocked, so
 // tools that enforce differently than the kernel sets can act on the same
 // answer: a proxy client routing by domain, an in-place bypass rewriting
@@ -1193,6 +1221,9 @@ func runVerdictPublisher(ctx context.Context, store *storage.Store, cfg Config) 
 	writeOnce := func() {
 		domains, err := store.ListBlockedDomains(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return // shutting down, not a failure worth a line
+			}
 			logEngine.Error("publish: list failed", "err", err)
 			return
 		}
@@ -1201,10 +1232,23 @@ func runVerdictPublisher(ctx context.Context, store *storage.Store, cfg Config) 
 			logEngine.Error("publish: cannot render", "err", err)
 			return
 		}
-		if body == last {
+		// The cached body says what was written last, not what is on disk now.
+		// Something else may have removed the file — a cleanup job, a tmpfs
+		// that did not survive a reboot, an operator tidying up — and whoever
+		// reads it would then be acting on nothing at all. So the file's
+		// absence overrides the cache and forces a rewrite.
+		if _, err := os.Stat(cfg.Publish.Path); err == nil && body == last {
 			return
 		}
 		dir := filepath.Dir(cfg.Publish.Path)
+		// Creating the directory rather than failing on it: the path is
+		// somebody's choice in a config file, and an unwritten verdict every
+		// minute forever is a poor answer to a directory that simply is not
+		// there yet.
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			logEngine.Error("publish: cannot create directory", "dir", dir, "err", err)
+			return
+		}
 		tmp, err := os.CreateTemp(dir, ".ladon-blocked.*")
 		if err != nil {
 			logEngine.Error("publish: temp file failed", "dir", dir, "err", err)
@@ -1249,6 +1293,17 @@ func runVerdictPublisher(ctx context.Context, store *storage.Store, cfg Config) 
 	}
 }
 
+// runMaintenance bounds on-disk growth on a slow cadence. Nothing here affects
+// correctness — it only reclaims space the rest of the engine never reads again:
+//   - WAL checkpoint(TRUNCATE): the long-lived read pool blocks SQLite's passive
+//     auto-truncate, so the -wal file grows without this.
+//   - prune probes older than the scorer's window (the scorer only ever counts
+//     verdicts within Scorer.Window, so older rows are dead weight).
+//   - prune dns_cache observations past their freshness horizon (reads already
+//     filter on DNSFreshness, so stale rows are never shipped to the ipset).
+//
+// Retentions carry generous margins so a clock skew or a wider window never
+// deletes a row a reader still wants.
 func runMaintenance(ctx context.Context, store *storage.Store, cfg Config) error {
 	interval := cfg.MaintenanceInterval
 	if interval <= 0 {

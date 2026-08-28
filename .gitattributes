@@ -2,3 +2,8 @@
 # working copy never injects CRLF (which breaks sh/php on the target).
 release/opnsense/plugin/** text eol=lf
 release/*.sh text eol=lf
+
+# Same reason, one level down: the container and desktop scripts run on Linux,
+# and a CRLF on the shebang line is read as part of the interpreter's name.
+release/**/*.sh text eol=lf
+release/**/*.py text eol=lf

@@ -5,8 +5,11 @@
 # didn't add them. Firewall aliases still referenced by an operator rule are
 # kept (removing them would break that rule); the script reports which.
 #
-# Plain run keeps operator state (config node + engine.db) so a reinstall
-# resumes. Pass --purge to also wipe settings + DB + logs.
+# Both Linux install modes are undone: the systemd service and, if it is there,
+# the container along with its network and volume.
+#
+# Plain run keeps operator state (config node + engine.db, the container's state
+# volume) so a reinstall resumes. Pass --purge to also wipe settings + DB + logs.
 #
 # Usage:
 #   curl -fsSL …/uninstall.sh | sudo sh
@@ -36,7 +39,39 @@ die()  { printf '%s==>%s %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
 # ============================================================
 #  LINUX
 # ============================================================
+# The container install leaves nothing on the host but the container itself, its
+# network and its volume — so that is exactly what comes off here. Called before
+# the host teardown because both are idempotent and a machine may carry either.
+#
+# The volume holds engine.db and follows the same rule as the host install: kept
+# unless --purge, so a reinstall resumes with everything ladon has learned.
+uninstall_docker_linux() {
+  command -v docker >/dev/null 2>&1 || return 0
+  docker info >/dev/null 2>&1 || return 0
+  docker inspect ladon >/dev/null 2>&1 || docker network inspect ladon >/dev/null 2>&1 || return 0
+
+  log "removing the ladon container"
+  docker rm -f ladon >/dev/null 2>&1 || true
+  docker network rm ladon >/dev/null 2>&1 || true
+  if [ "$PURGE" = 1 ]; then
+    docker volume rm ladon-state >/dev/null 2>&1 || true
+    log "purged the state volume"
+  else
+    docker volume inspect ladon-state >/dev/null 2>&1 \
+      && log "kept the ladon-state volume, engine.db is in it (--purge to remove)"
+  fi
+
+  # install.sh printed both of these as the last step, and neither undoes
+  # itself. A default route into a container that no longer exists takes the
+  # machine's network with it, so it is worth naming rather than implying.
+  warn "если ты направлял машину в контейнер — верни обратно:"
+  warn "  sudo ip route del default via <адрес контейнера>   (проверь: ip route)"
+  warn "  и вход в /etc/resolv.conf на прежний DNS"
+}
+
 uninstall_linux() {
+  uninstall_docker_linux
+
   log "stopping ladon"
   systemctl disable --now ladon 2>/dev/null || true
   rm -f /etc/systemd/system/ladon.service
@@ -47,6 +82,10 @@ uninstall_linux() {
 
   log "destroying ipsets (skips any still referenced by iptables)"
   for s in "$IPSET_ENGINE" "$IPSET_MANUAL" "$IPSET_CIDR"; do
+    # A set that was never there and a set that cannot be dropped both make
+    # destroy fail, and telling the operator to go hunt for iptables rules that
+    # do not exist is worse than saying nothing. Only the second case is news.
+    ipset list -n "$s" >/dev/null 2>&1 || continue
     ipset destroy "$s" 2>/dev/null || warn "$s still in use; remove iptables rules referencing it first"
   done
   mkdir -p /etc/iptables && ipset save > /etc/iptables/ipsets 2>/dev/null || true

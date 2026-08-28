@@ -155,3 +155,61 @@ func TestPublisherStaysParkedWithoutAPath(t *testing.T) {
 		t.Error("did not unwind on shutdown")
 	}
 }
+
+// The cached body says what was written last, not what is on disk. If anything
+// removes the file — a cleanup job, a tmpfs that did not survive a reboot, an
+// operator tidying up — whoever reads it is acting on nothing at all, and the
+// cache would keep it that way until the verdict happened to change.
+func TestPublisherRestoresAFileRemovedUnderneathIt(t *testing.T) {
+	s, ctx := publishStore(t)
+	_ = s.UpsertDomain(ctx, "blocked.test", time.Now().UTC())
+	_ = s.SetDomainState(ctx, "blocked.test", "cache", time.Time{})
+
+	out := filepath.Join(t.TempDir(), "blocked.txt")
+	cfg := Defaults("")
+	cfg.Publish = PublishConfig{Path: out, Interval: 20 * time.Millisecond}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() { _ = runVerdictPublisher(runCtx, s, cfg) }()
+
+	if !waitFor(t, 3*time.Second, func() bool { _, err := os.Stat(out); return err == nil }) {
+		t.Fatal("publisher never wrote the file")
+	}
+	if err := os.Remove(out); err != nil {
+		t.Fatal(err)
+	}
+
+	ok := waitFor(t, 3*time.Second, func() bool {
+		b, err := os.ReadFile(out)
+		return err == nil && strings.Contains(string(b), "blocked.test")
+	})
+	if !ok {
+		t.Error("the file never came back — the verdict had not changed, so the cache kept it gone")
+	}
+}
+
+// The path is somebody's choice in a config file. A directory that is not there
+// yet should not cost an unwritten verdict every minute for as long as the
+// daemon runs.
+func TestPublisherCreatesTheDirectory(t *testing.T) {
+	s, ctx := publishStore(t)
+	_ = s.UpsertDomain(ctx, "blocked.test", time.Now().UTC())
+	_ = s.SetDomainState(ctx, "blocked.test", "cache", time.Time{})
+
+	out := filepath.Join(t.TempDir(), "state", "published", "blocked.txt")
+	cfg := Defaults("")
+	cfg.Publish = PublishConfig{Path: out, Interval: 20 * time.Millisecond}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() { _ = runVerdictPublisher(runCtx, s, cfg) }()
+
+	ok := waitFor(t, 3*time.Second, func() bool {
+		b, err := os.ReadFile(out)
+		return err == nil && strings.Contains(string(b), "blocked.test")
+	})
+	if !ok {
+		t.Error("nothing written — the directory did not exist and was not created")
+	}
+}
