@@ -48,9 +48,9 @@ curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/ins
 | | |
 |---|---|
 | [docs/install.md](docs/install.md) | install (auto + manual), troubleshooting |
+| [docs/install-docker.md](docs/install-docker.md) | контейнер: запуск, маршрут в него, откат |
+| [docs/install-opnsense.md](docs/install-opnsense.md) | плагин os-ladon для OPNsense |
 | [docs/configuration.md](docs/configuration.md) | YAML, CLI, manual lists, ревалидация, отдача вердикта, exit-compare, prune |
-| [release/docker/README.md](release/docker/README.md) | контейнер: запуск, маршрут в него, откат |
-| [release/opnsense/NOTES.md](release/opnsense/NOTES.md) | плагин os-ladon для OPNsense |
 | [docs/methodology.md](docs/methodology.md) | как Ladon работает |
 | [docs/extensions.md](docs/extensions.md) | bundled allow/deny-пресеты + формат своих списков |
 | [docs/probe-api.md](docs/probe-api.md) | HTTP-контракт probe-сервера для exit-compare |
