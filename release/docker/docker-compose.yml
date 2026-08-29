@@ -1,6 +1,6 @@
 # Ladon in a network namespace of its own.
 #
-# Read release/docker/README.md first: this only splits traffic that goes
+# Read docs/install-docker.md first: this only splits traffic that goes
 # through the container, so the last step is pointing the machine at it.
 
 services:

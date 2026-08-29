@@ -5,7 +5,7 @@
 # traffic only passes through something that answers its DNS and forwards its
 # packets. Sets are per-namespace, so deciding and enforcing have to share one.
 #
-# See release/docker/README.md for what the host still has to do.
+# See docs/install-docker.md for what the host still has to do.
 #
 #   docker build -t ladon:local --build-arg VERSION=$(git describe --tags) .
 
