@@ -15,6 +15,8 @@
 
 Ladon реактивно наблюдает DNS-трафик клиентов шлюза, четырёхстадийной пробой (DNS → TCP:443 → TLS handshake → HTTP read до 32KB) идентифицирует реальные DPI-блокировки и собирает IP в kernel ipset для tunnel-routing. **За доли секунды.**
 
+Ставится службой на шлюз, контейнером на обычную машину или плагином на OPNsense. Вердикт можно забрать файлом, если заворачивает трафик не ipset, а прокси-клиент или обфускатор.
+
 ## Установка
 
 ```bash
@@ -22,7 +24,7 @@ curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/ins
   | sudo bash
 ```
 
-Скрипт ставит бинарь, конфиги, ipset'ы и dnsmasq drop-in — нужен Debian/Ubuntu. Полный runbook + manual install + troubleshooting —
+Скрипт ставит бинарь, конфиги, ipset'ы и dnsmasq drop-in. На Debian/Ubuntu он спросит, ставить службой или контейнером (`LADON_MODE=systemd|docker`, чтобы не спрашивал), на OPNsense поставит плагин. Полный runbook + manual install + troubleshooting —
 в [docs/install.md](docs/install.md).
 
 ## Как работает
@@ -31,10 +33,12 @@ curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/ins
 
 - **Реактивная подписка** — probe только на домены, которые клиенты сами запросили через DNS.
 - **Четырёхстадийный probe** — DNS → TCP:443 → TLS handshake → HTTP read до 32KB.
-- **20+ типизированных failure-кодов** — `tls_alert`, `tls_garbage`, `tls_reset`, `tls13_block`, `mtls_required`, `tcp_refused`, `http_cutoff`, `http_451`, ...
+- **20+ типизированных failure-кодов** — `tls_alert`, `tls_garbage`, `tls_reset`, `tls13_block`, `tls_intercept`, `mtls_required`, `tcp_refused`, `http_cutoff`, `http_451`, ...
 - **Server-active vs path-active** — TLS alert / RST / `connection refused` отделены от timeout / cutoff / garbage.
 - **24h temporal accumulation** — порог blocked-вердиктов в окне для постоянного списка.
 - **Семья как единица** — при ≥N подтверждённых поддоменов eTLD+1 семья тянется в туннель целиком: её IP разворачиваются скопом, новые поддомены (`covered`) больше не пробятся.
+- **Опциональная ревалидация** — `cache` и `ignore` не навсегда: домен возвращается к пробам, когда состояние перестаёт подтверждаться.
+- **Вердикт наружу** — список заблокированных доменов файлом, простым списком или rule-set для `sing-box`, для тех, кто исполняет решение не через ipset.
 - **Опциональный exit-compare** — второй observer из другой геолокации.
 
 Полная методология — в [docs/methodology.md](docs/methodology.md).
@@ -44,7 +48,9 @@ curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/ins
 | | |
 |---|---|
 | [docs/install.md](docs/install.md) | install (auto + manual), troubleshooting |
-| [docs/configuration.md](docs/configuration.md) | YAML, CLI, manual lists, exit-compare, prune |
+| [docs/configuration.md](docs/configuration.md) | YAML, CLI, manual lists, ревалидация, отдача вердикта, exit-compare, prune |
+| [release/docker/README.md](release/docker/README.md) | контейнер: запуск, маршрут в него, откат |
+| [release/opnsense/NOTES.md](release/opnsense/NOTES.md) | плагин os-ladon для OPNsense |
 | [docs/methodology.md](docs/methodology.md) | как Ladon работает |
 | [docs/extensions.md](docs/extensions.md) | bundled allow/deny-пресеты + формат своих списков |
 | [docs/probe-api.md](docs/probe-api.md) | HTTP-контракт probe-сервера для exit-compare |
