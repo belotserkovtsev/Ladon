@@ -3,6 +3,7 @@ package prober
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -11,8 +12,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/net/html"
 )
 
 // httpReadLimit caps how many response bytes the HTTP cutoff probe will
@@ -396,6 +401,14 @@ func recordTLSVersion(r *Result, version uint16) {
 // otherwise. A 4xx/5xx with a tiny body still counts as ptr(true) — the
 // path is reachable; the server made a deliberate response. We're
 // detecting middlebox cutoffs, not server semantics.
+//
+// A page that completes below httpReadLimit proves less than it seems: the
+// cutoff strikes once a connection has carried ~16 KB, and a small landing
+// page — the shell of a single-page app, typically — never gets there. The
+// site still breaks, because the bundle it loads next freezes midway, but the
+// probe saw a clean response and called it clear. So when the page is small
+// HTML, one same-origin asset from it is fetched too (see probeSubresource):
+// that is where the bytes live, and where a browser hits the cutoff.
 func probeHTTPStaged(r *Result, conn *tls.Conn, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	if err := conn.SetDeadline(deadline); err != nil {
@@ -438,8 +451,9 @@ func probeHTTPStaged(r *Result, conn *tls.Conn, timeout time.Duration) {
 	// Drain up to the limit. Many small responses finish well below it
 	// (e.g. an empty 204 or a 301 redirect) — that's fine, EOF after a
 	// clean response is success. We only fail on read errors that
-	// indicate the stream was severed mid-flight.
-	_, copyErr := io.Copy(io.Discard, io.LimitReader(resp.Body, httpReadLimit))
+	// indicate the stream was severed mid-flight. The bytes are kept: if
+	// the page turns out small, its markup says where to look next.
+	body, copyErr := io.ReadAll(io.LimitReader(resp.Body, httpReadLimit))
 	resp.Body.Close()
 	if copyErr != nil && !errors.Is(copyErr, io.EOF) {
 		setHTTPFail(r, stageHTTP, copyErr)
@@ -448,6 +462,153 @@ func probeHTTPStaged(r *Result, conn *tls.Conn, timeout time.Duration) {
 
 	t := true
 	r.HTTPOK = &t
+
+	if len(body) < httpReadLimit && resp.StatusCode/100 == 2 &&
+		isHTML(resp.Header.Get("Content-Type"), body) {
+		if path := sameOriginSubresource(body, r.Domain); path != "" {
+			probeSubresource(r, conn, path, timeout)
+		}
+	}
+}
+
+// probeSubresource fetches one same-origin asset from the address the page
+// came from and records a cutoff if its stream dies midway.
+//
+// It uses a fresh connection: the page's was opened with Connection: close and
+// is spent, and a browser opens several anyway — a range that freezes every
+// connection after ~16 KB freezes this one too.
+//
+// Only one signature counts: bytes were flowing, then stopped before the
+// response finished. A second handshake that fails, headers that never come, a
+// non-2xx answer, an asset that is itself small — none of these say anything
+// about the cutoff, and the page did load, so the verdict is left untouched. A
+// false block here would tunnel a working site; a missed one costs no more than
+// the probe already missed before this stage existed.
+func probeSubresource(r *Result, page *tls.Conn, path string, timeout time.Duration) {
+	ip, port, err := net.SplitHostPort(page.RemoteAddr().String())
+	if err != nil {
+		return
+	}
+	// Same address, same name, and no newer TLS than the page negotiated: if
+	// 1.3 is what is being blocked, the asset must not trip over that instead
+	// of over the cutoff we are looking for.
+	conn, _, _, _ := tlsHandshake(ip, port, r.Domain, timeout, page.ConnectionState().Version)
+	if conn == nil {
+		return
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return
+	}
+
+	req := fmt.Sprintf(
+		"GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (compatible; ladon-probe)\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+		path, r.Domain,
+	)
+	if _, err := io.WriteString(conn, req); err != nil {
+		return
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return
+	}
+
+	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, httpReadLimit))
+	if err == nil || n == 0 {
+		return // finished, reached the limit, or never started: no cutoff seen
+	}
+	// Classify the raw error: categorize recognises a timeout by its type, so
+	// the context below goes into the reason only.
+	code := categorize(stageHTTP, err)
+	if IsServerReachable(code) {
+		return
+	}
+	f := false
+	r.HTTPOK = &f
+	r.FailureCode = code
+	r.FailureReason = formatReason(code, fmt.Errorf("subresource %s cut after %d bytes: %w", path, n, err))
+}
+
+// sameOriginSubresource picks the asset most likely to be large: the first
+// script (bundles run to hundreds of KB), otherwise the first stylesheet or
+// module preload. Only same-origin URLs qualify — the probe has this host's
+// addresses and no others. An asset on another host is that host's own name;
+// the resolver sees it when the browser asks, and the engine probes it then.
+func sameOriginSubresource(body []byte, domain string) string {
+	base := &url.URL{Scheme: "https", Host: domain, Path: "/"}
+	style := ""
+	z := html.NewTokenizer(bytes.NewReader(body))
+	for {
+		tt := z.Next()
+		if tt == html.ErrorToken {
+			return style
+		}
+		if tt != html.StartTagToken && tt != html.SelfClosingTagToken {
+			continue
+		}
+		name, hasAttr := z.TagName()
+		tag := string(name)
+		if !hasAttr || (tag != "script" && tag != "link") {
+			continue
+		}
+		attrs := map[string]string{}
+		for more := true; more; {
+			var k, v []byte
+			k, v, more = z.TagAttr()
+			attrs[string(k)] = string(v)
+		}
+		switch tag {
+		case "script":
+			if p := resolveSameOrigin(base, attrs["src"], domain); p != "" {
+				return p
+			}
+		case "link":
+			if style != "" {
+				continue
+			}
+			for _, rel := range strings.Fields(strings.ToLower(attrs["rel"])) {
+				if rel == "stylesheet" || rel == "modulepreload" {
+					style = resolveSameOrigin(base, attrs["href"], domain)
+					break
+				}
+			}
+		}
+	}
+}
+
+// resolveSameOrigin turns a reference from the page into a request path, or ""
+// when it points anywhere but this host over HTTPS.
+func resolveSameOrigin(base *url.URL, ref, domain string) string {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return ""
+	}
+	u, err := base.Parse(ref)
+	if err != nil || u.Scheme != "https" || !strings.EqualFold(u.Hostname(), domain) {
+		return ""
+	}
+	if port := u.Port(); port != "" && port != "443" {
+		return ""
+	}
+	p := u.RequestURI()
+	if p == "" || p == "/" || strings.ContainsAny(p, " \r\n") {
+		return ""
+	}
+	return p
+}
+
+// isHTML trusts the declared type when there is one and sniffs only when the
+// server sent none.
+func isHTML(contentType string, body []byte) bool {
+	if contentType == "" {
+		contentType = http.DetectContentType(body)
+	}
+	ct := strings.ToLower(contentType)
+	return strings.HasPrefix(ct, "text/html") || strings.HasPrefix(ct, "application/xhtml+xml")
 }
 
 func setHTTPFail(r *Result, stage string, err error) {
