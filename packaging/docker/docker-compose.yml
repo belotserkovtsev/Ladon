@@ -7,7 +7,7 @@ services:
   ladon:
     image: ghcr.io/belotserkovtsev/ladon:latest
     # Собрать из исходников вместо готового образа:
-    #   docker compose -f release/docker/docker-compose.yml build
+    #   docker compose -f packaging/docker/docker-compose.yml build
     # build:
     #   context: ../..
     #   args:

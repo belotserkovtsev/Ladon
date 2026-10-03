@@ -7,6 +7,8 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/belotserkovtsev/ladon/internal/etld"
@@ -98,6 +100,16 @@ func openPool(path string) (*sql.DB, error) {
 }
 
 func Open(path string) (*Store, error) {
+	// Create the directory rather than fail on it. The driver reports a missing
+	// parent as "unable to open database file", which sends whoever reads it
+	// looking for a corrupt database instead of an absent folder — and the
+	// folder is one an installer laid out on a gateway but nobody laid out for
+	// a client someone just ran.
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, fmt.Errorf("create %q: %w", dir, err)
+		}
+	}
 	rdb, err := openPool(path)
 	if err != nil {
 		// Name the path: the underlying driver reports a missing/unreachable

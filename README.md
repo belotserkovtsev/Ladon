@@ -54,7 +54,7 @@ curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/ins
 | [docs/methodology.md](docs/methodology.md) | как Ladon работает |
 | [docs/extensions.md](docs/extensions.md) | bundled allow/deny-пресеты + формат своих списков |
 | [docs/probe-api.md](docs/probe-api.md) | HTTP-контракт probe-сервера для exit-compare |
-| [probe-server/ladon/](probe-server/ladon/) | референсная Go-имплементация probe-сервера |
+| [cmd/probe-server/](cmd/probe-server/) | референсная Go-имплементация probe-сервера |
 
 ## Благодарности
 

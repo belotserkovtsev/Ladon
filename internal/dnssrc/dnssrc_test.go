@@ -66,12 +66,13 @@ func TestUnbound_SettledLineToObservation(t *testing.T) {
 	assertNoMore(t, out, 100*time.Millisecond)
 }
 
-func TestDnsmasq_AssemblesQueriesAndDropsUnresolved(t *testing.T) {
+func TestDnsmasq_AssemblesQueriesAndReportsRefusals(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "dnsmasq.log")
 	// id 1: plain A. id 2: CNAME chain (IP must attribute to the ORIGINAL
-	// queried domain, not the CDN hop). id 3: NXDOMAIN (no A reply). id 4:
-	// AAAA query (v4-only tool ignores it).
+	// queried domain, not the CDN hop). id 3: NXDOMAIN — reported as a refusal,
+	// because a name answered away is a block the probe path can never see.
+	// id 4: AAAA query (v4-only tool ignores it, and it is NOT a refusal).
 	content := "" +
 		"1 10.0.0.2/1 query[A] foo.com from 10.0.0.2\n" +
 		"1 10.0.0.2/1 reply foo.com is 1.2.3.4\n" +
@@ -90,17 +91,25 @@ func TestDnsmasq_AssemblesQueriesAndDropsUnresolved(t *testing.T) {
 	src := &dnsmasqSource{logPath: logPath, startAtEnd: false, settle: 20 * time.Millisecond}
 	out, _ := src.Events(ctx)
 
-	got := readObs(t, out, 2)
+	got := readObs(t, out, 3)
 	sort.Slice(got, func(i, j int) bool { return got[i].Domain < got[j].Domain })
 
 	if got[0].Domain != "bar.com" || got[0].Client != "10.0.0.3" ||
 		!reflect.DeepEqual(got[0].IPs, []string{"9.9.9.9"}) {
 		t.Fatalf("bar obs = %+v, want bar.com/[9.9.9.9] (CNAME re-attributed to original)", got[0])
 	}
+	if got[0].Denied {
+		t.Fatalf("bar obs marked denied: %+v", got[0])
+	}
 	if got[1].Domain != "foo.com" || !reflect.DeepEqual(got[1].IPs, []string{"1.2.3.4"}) {
 		t.Fatalf("foo obs = %+v, want foo.com/[1.2.3.4]", got[1])
 	}
-	// missing.lan (NXDOMAIN) and the AAAA foo.com must never surface.
+	// The refused name surfaces as a refusal — no addresses, flagged.
+	if got[2].Domain != "missing.lan" || !got[2].Denied || len(got[2].IPs) != 0 {
+		t.Fatalf("missing.lan obs = %+v, want a denied observation with no addresses", got[2])
+	}
+	// The AAAA query never surfaces at all: a v6-only answer is not a refusal,
+	// and reporting it as one would put every IPv6 name under suspicion.
 	assertNoMore(t, out, 100*time.Millisecond)
 }
 

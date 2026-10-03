@@ -48,9 +48,9 @@ var version = "dev"
 // fallback keeps `go run` working from the repo root.
 func defaultDBPath() string {
 	switch runtime.GOOS {
-	case "freebsd": // OPNsense plugin (release/opnsense/plugin/src/etc/rc.d/ladon)
+	case "freebsd": // OPNsense plugin (packaging/opnsense/plugin/src/etc/rc.d/ladon)
 		return "/var/db/ladon/engine.db"
-	case "linux": // systemd unit default prefix (release/ladon.service)
+	case "linux": // systemd unit default prefix (packaging/linux/ladon.service)
 		return "/opt/ladon/state/engine.db"
 	default:
 		return filepath.Join("state", "ladon.db")
@@ -842,6 +842,17 @@ func doctorCmd(ctx context.Context, store *storage.Store, configPath string, res
 	}
 	cfg := engine.Defaults("")
 	applyConfigFile(&cfg, file)
+
+	// The kernel sets can only be read as root. Run without it, every set check
+	// sees nothing but "operation not permitted", and a report built on that
+	// is worse than none: it calls the engine set missing and suggests
+	// recreating it and restarting the daemon, on a gateway where both are
+	// fine. So doctor says what it needs instead of reporting on what it could
+	// not see. Without sets configured there is nothing to read, and root is
+	// not asked for.
+	if cfg.IpsetName != "" && (runtime.GOOS == "linux" || runtime.GOOS == "freebsd") && os.Geteuid() != 0 {
+		fatal("doctor читает наборы ядра, а без root они не видны — запусти: sudo ladon doctor")
+	}
 
 	rep := doctor.Run(ctx, store, doctor.Params{
 		Version:         version,

@@ -133,15 +133,35 @@ func canonical(entry string) string {
 type ipsetBackend struct{}
 
 func (ipsetBackend) exists(ctx context.Context, name string) (bool, error) {
+	var stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, "ipset", "list", "-n", name)
-	if err := cmd.Run(); err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			return false, nil
-		}
-		return false, err
+	cmd.Stderr = &stderr
+	return existsResult("ipset", name, cmd.Run(), stderr.String())
+}
+
+// existsResult turns the outcome of a "show me this set" command into an
+// answer. Only the tool saying the set does not exist means it is absent.
+// Anything else it complains about — no permission, no kernel support — means
+// the set could not be looked at, and that is an error, not an answer: calling
+// it absent sends whoever reads the verdict off to recreate a set that is
+// already there, and to restart a daemon that is fine. That is exactly what
+// doctor told anyone who ran it without root.
+func existsResult(tool, name string, err error, stderr string) (bool, error) {
+	if err == nil {
+		return true, nil
 	}
-	return true, nil
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		return false, err // the tool did not run at all, e.g. it is not installed
+	}
+	msg := strings.TrimSpace(stderr)
+	if strings.Contains(strings.ToLower(msg), "does not exist") {
+		return false, nil
+	}
+	if msg == "" {
+		msg = err.Error()
+	}
+	return false, fmt.Errorf("%s cannot inspect %s: %s", tool, name, msg)
 }
 
 func (ipsetBackend) members(ctx context.Context, name string) ([]string, error) {
@@ -191,15 +211,12 @@ type pfctlBackend struct{}
 
 func (pfctlBackend) exists(ctx context.Context, name string) (bool, error) {
 	// `pfctl -t <name> -T show` exits non-zero ("Table does not exist") when
-	// the table is absent; zero (possibly empty output) when it exists.
-	if err := exec.CommandContext(ctx, "pfctl", "-t", name, "-T", "show").Run(); err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
+	// the table is absent; zero (possibly empty output) when it exists. It also
+	// exits non-zero when /dev/pf cannot be opened, which is a different thing.
+	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "pfctl", "-t", name, "-T", "show")
+	cmd.Stderr = &stderr
+	return existsResult("pfctl", name, cmd.Run(), stderr.String())
 }
 
 func (pfctlBackend) members(ctx context.Context, name string) ([]string, error) {

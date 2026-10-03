@@ -39,13 +39,13 @@ jobs:
 
           # Tarball is runtime-only — docs (README, install, methodology, etc.)
           # live in the repo under docs/ and are read on GitHub.
-          cp release/ladon.service            "${STAGE}/"
-          cp release/manual-allow.txt.example "${STAGE}/"
-          cp release/manual-deny.txt.example  "${STAGE}/"
-          cp release/config.yaml.example      "${STAGE}/"
-          cp release/install.sh               "${STAGE}/"
-          cp release/uninstall.sh             "${STAGE}/"
-          cp -r release/extensions            "${STAGE}/"
+          cp packaging/linux/ladon.service    "${STAGE}/"
+          cp packaging/manual-allow.txt.example "${STAGE}/"
+          cp packaging/manual-deny.txt.example  "${STAGE}/"
+          cp packaging/config.yaml.example      "${STAGE}/"
+          cp packaging/install.sh               "${STAGE}/"
+          cp packaging/uninstall.sh             "${STAGE}/"
+          cp -r packaging/extensions            "${STAGE}/"
 
           tar -czf "dist/ladon-linux-${ARCH}.tar.gz" -C dist "ladon-linux-${ARCH}-${TAG}"
           # sha256 file must contain the bare filename so `sha256sum -c` works
@@ -90,7 +90,7 @@ jobs:
           # which is exactly what install.sh `cp -R "$SRC/plugin/." /usr/local/`
           # expects. .gitattributes keeps these scripts LF, so the checkout
           # carries no CRLF into the tarball.
-          cp -R release/opnsense/plugin/src/. "${STAGE}/plugin/"
+          cp -R packaging/opnsense/plugin/src/. "${STAGE}/plugin/"
 
           tar -czf "dist/ladon-freebsd-amd64.tar.gz" -C dist "ladon-freebsd-amd64-${TAG}"
           (cd dist && sha256sum "ladon-freebsd-amd64.tar.gz" \
@@ -132,8 +132,8 @@ jobs:
           TAG_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          cp release/install.sh   dist/install.sh
-          cp release/uninstall.sh dist/uninstall.sh
+          cp packaging/install.sh   dist/install.sh
+          cp packaging/uninstall.sh dist/uninstall.sh
           sed -i "s|^TAG=\"\${TAG:-}\"|TAG=\"\${TAG:-${TAG_NAME}}\"|" dist/install.sh
           grep -q "^TAG=\"\${TAG:-${TAG_NAME}}\"\$" dist/install.sh \
             || { echo "could not bake TAG into install.sh — the TAG= line format changed"; exit 1; }

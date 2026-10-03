@@ -64,7 +64,7 @@ curl -fsSL https://github.com/belotserkovtsev/ladon/releases/latest/download/uni
 
 Для нестандартных путей есть переменные окружения: `IPSET_ENGINE`, `IPSET_MANUAL`,
 `LADON_PREFIX`, `LADON_CONFIG_DIR`; дефолты смотри в
-[`release/install.sh`](../release/install.sh).
+[`packaging/install.sh`](../packaging/install.sh).
 
 ---
 
