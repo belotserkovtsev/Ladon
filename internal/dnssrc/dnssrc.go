@@ -34,6 +34,16 @@ type Observation struct {
 	Domain string
 	Client string // querying client IP
 	IPs    []string
+
+	// Denied marks a name the resolver answered with a refusal — NXDOMAIN, or
+	// an empty answer where an address was asked for.
+	//
+	// Such a name carries nothing to probe: there is no address to connect to.
+	// It is reported anyway because the refusal itself is evidence. A resolver
+	// on the path can answer "no such name" for a name that is perfectly alive,
+	// and that is a block the engine would otherwise never see — the query
+	// simply vanishes before any transport is attempted. IPs is empty here.
+	Denied bool
 }
 
 // Source yields a neutral Observation stream until ctx is cancelled.
@@ -181,7 +191,13 @@ func serveConn(ctx context.Context, conn net.Conn, out chan<- Observation) {
 			}
 		}
 		if len(ips) == 0 {
-			continue // no A-records: nothing to probe or tunnel
+			// Dropped rather than reported as a refusal, unlike the dnsmasq
+			// path. The module fires on the reply and does not say what was
+			// asked, so a line with no A-records is equally a refused name and
+			// a name that simply lives in v6 — and calling the second one a
+			// refusal would put every IPv6 host under suspicion. Reporting
+			// refusals here needs the module to pass the query type first.
+			continue
 		}
 		if !send(ctx, out, Observation{Domain: domain, Client: client, IPs: ips}) {
 			return
@@ -225,11 +241,13 @@ func (s *dnsmasqSource) Events(ctx context.Context) (<-chan Observation, <-chan 
 		}
 		byID := map[string]*pending{}
 
-		// emit sends a settled query if it actually resolved; unresolved ids
-		// (NXDOMAIN / AAAA / NODATA — no v4 answer) are dropped.
+		// emit sends a settled query. A query that resolved carries its
+		// addresses; one that did not is still reported, marked as denied —
+		// the refusal is what the engine needs to notice a name being
+		// answered away rather than blocked on the wire.
 		emit := func(p *pending) bool {
 			if len(p.ips) == 0 {
-				return true
+				return send(ctx, out, Observation{Domain: p.domain, Client: p.client, Denied: true})
 			}
 			return send(ctx, out, Observation{Domain: p.domain, Client: p.client, IPs: p.ips})
 		}

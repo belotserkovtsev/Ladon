@@ -187,6 +187,11 @@ type Config struct {
 	// (cache / ignore). Disabled by default — see RevalidateConfig.
 	Revalidate RevalidateConfig
 
+	// DNSVerify asks a second opinion when the resolver refuses a name. The
+	// probe pipeline cannot judge such a name — there is no address to reach —
+	// so without this a name answered away is simply never seen.
+	DNSVerify DNSVerifyConfig
+
 	// ManageDNSMasq lets the engine own dnsmasq's snippet: it writes the
 	// manual/extension domains as `ipset=` directives and restarts dnsmasq so
 	// they take effect. Default true, and the right choice on a host where
@@ -310,6 +315,7 @@ func Defaults(logPath string) Config {
 		IgnorePeer:             "10.10.0.1",
 		ManageDNSMasq:          true,
 		Publish:                PublishConfig{Interval: time.Minute},
+		DNSVerify:              DNSVerifyDefaults(),
 		Revalidate: RevalidateConfig{
 			Enabled:  false,
 			Interval: 6 * time.Hour,
@@ -432,9 +438,16 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 		}()
 	}
 
+	// Second opinion on refusals, when the operator asked for one.
+	var verifier *dnsVerifier
+	if cfg.DNSVerify.Enabled {
+		verifier = newDNSVerifier(cfg.DNSVerify)
+		logEngine.Info("resolver refusals will be verified", "via", cfg.DNSVerify.URL)
+	}
+
 	ingestSrc := dnssrc.New(dnssrc.Config{Kind: cfg.DNSSource, LogPath: cfg.LogPath, StartAtEnd: !cfg.FromStart, UnboundSocket: cfg.UnboundSocket})
 	launch("ingest", func() error {
-		return runIngest(ctx, store, cfg, sem, ipsetTrigger, ingestSrc, manualNames, manualTrigger)
+		return runIngest(ctx, store, cfg, sem, ipsetTrigger, ingestSrc, manualNames, manualTrigger, verifier)
 	})
 	launch("probe-worker", func() error { return runProbeWorker(ctx, store, cfg, ipsetTrigger) })
 	launch("expiry-sweeper", func() error { return runExpirySweeper(ctx, store, cfg) })
@@ -493,7 +506,7 @@ func (s *nameSet) matches(domain string) bool {
 	return false
 }
 
-func runIngest(ctx context.Context, store *storage.Store, cfg Config, sem chan struct{}, ipsetTrigger chan<- struct{}, src dnssrc.Source, manualNames *nameSet, manualTrigger chan<- struct{}) error {
+func runIngest(ctx context.Context, store *storage.Store, cfg Config, sem chan struct{}, ipsetTrigger chan<- struct{}, src dnssrc.Source, manualNames *nameSet, manualTrigger chan<- struct{}, verifier *dnsVerifier) error {
 	events, errs := src.Events(ctx)
 	ingested, skipped := 0, 0
 	report := time.NewTicker(30 * time.Second)
@@ -520,6 +533,16 @@ func runIngest(ctx context.Context, store *storage.Store, cfg Config, sem chan s
 			}
 			if deny, _ := store.IsInDenyList(ctx, obs.Domain, etld.Compute(obs.Domain)); deny {
 				skipped++
+				continue
+			}
+			// A refusal cannot be probed — there is no address to connect to —
+			// so it is settled here instead of entering the probe pipeline.
+			if obs.Denied {
+				if verifier == nil {
+					skipped++
+					continue
+				}
+				go verifyDenial(ctx, store, cfg, verifier, obs.Domain, ipsetTrigger)
 				continue
 			}
 			if _, err := watcher.Ingest(ctx, store, watcher.Event{
@@ -707,6 +730,18 @@ func probeDomain(ctx context.Context, store *storage.Store, cfg Config, domain s
 		default:
 		}
 	case decision.Clear:
+		// A name settled by the resolver check is not up for revision here.
+		// The probe reaches the address and reports success — correctly, the
+		// address is alive — but the block is on the name: whoever asks the
+		// ordinary resolver for it is told it does not exist and never gets
+		// as far as an address. Letting transport overrule that would drop
+		// the name out of the tunnel while it stays unreachable in practice.
+		if _, reason, ok, err := store.HotEntryFor(ctx, domain); err == nil && ok &&
+			strings.HasPrefix(reason, "dns_poison") {
+			logProbe.Debug("probe clear ignored — name is answered away, not blocked in transit",
+				"domain", domain)
+			return
+		}
 		if err := store.SetDomainState(ctx, domain, "ignore", cooldown); err != nil {
 			logProbe.Error("set state ignore failed", "domain", domain, "err", err)
 		}
