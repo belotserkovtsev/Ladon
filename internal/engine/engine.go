@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -191,6 +192,23 @@ type Config struct {
 	// probe pipeline cannot judge such a name — there is no address to reach —
 	// so without this a name answered away is simply never seen.
 	DNSVerify DNSVerifyConfig
+
+	// Source, when set, replaces the source the engine would have picked for
+	// itself. Ingest consumes Observations without knowing who produced them,
+	// so an embedder that already sees DNS — a desktop client carrying its own
+	// resolver — hands one in here instead of pointing the engine at a query
+	// log that platform does not have.
+	//
+	// Nil keeps the existing behaviour: choose by DNSSource / OS.
+	Source dnssrc.Source
+
+	// OnVerdict, when set, is called with the blocked-domain list whenever it
+	// changes. It is the in-memory counterpart of Publish, for enforcement
+	// that acts on names rather than on kernel sets: a proxy client routes by
+	// domain and needs the verdict itself, not a file to poll for it.
+	//
+	// Called from the publisher stage, so it must not block.
+	OnVerdict func(domains []string)
 
 	// ManageDNSMasq lets the engine own dnsmasq's snippet: it writes the
 	// manual/extension domains as `ipset=` directives and restarts dnsmasq so
@@ -445,7 +463,12 @@ func Run(ctx context.Context, store *storage.Store, cfg Config) error {
 		logEngine.Info("resolver refusals will be verified", "via", cfg.DNSVerify.URL)
 	}
 
-	ingestSrc := dnssrc.New(dnssrc.Config{Kind: cfg.DNSSource, LogPath: cfg.LogPath, StartAtEnd: !cfg.FromStart, UnboundSocket: cfg.UnboundSocket})
+	// An embedder that already sees DNS supplies its own source; otherwise the
+	// engine picks one for the platform it is running on.
+	ingestSrc := cfg.Source
+	if ingestSrc == nil {
+		ingestSrc = dnssrc.New(dnssrc.Config{Kind: cfg.DNSSource, LogPath: cfg.LogPath, StartAtEnd: !cfg.FromStart, UnboundSocket: cfg.UnboundSocket})
+	}
 	launch("ingest", func() error {
 		return runIngest(ctx, store, cfg, sem, ipsetTrigger, ingestSrc, manualNames, manualTrigger, verifier)
 	})
@@ -1120,6 +1143,26 @@ func triggerDue(now, lastSync time.Time, spacing time.Duration) (time.Duration, 
 	return 0, true
 }
 
+// DesiredIPs returns the addresses that should be diverted right now — the same
+// set the gateway programs into its ipset, family expansion included.
+//
+// It exists for embedders that enforce by address without owning a kernel set:
+// a desktop client diverting through its routing table needs exactly what the
+// gateway needs, and computing it a second time on their side would drift from
+// this one the first time either changed.
+func DesiredIPs(ctx context.Context, store *storage.Store, cfg Config) ([]string, error) {
+	desired, _, err := computeDesiredIPs(ctx, store, cfg)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(desired))
+	for ip := range desired {
+		out = append(out, ip)
+	}
+	sort.Strings(out) // stable order: callers diff this against what they programmed
+	return out, nil
+}
+
 // computeDesiredIPs walks hot ∪ cache and returns the union of IPs that
 // should sit in the engine-managed ipset (ladon_engine). Pulled out of
 // runIpsetSyncer's inline closure so tests can validate the eTLD+1
@@ -1243,7 +1286,11 @@ func runVerdictPublisher(ctx context.Context, store *storage.Store, cfg Config) 
 	// A stage that returns before shutdown is treated as a failure, so the
 	// disabled path waits on ctx instead: publishing is optional and must never
 	// bring the daemon down with it.
-	if cfg.Publish.Path == "" {
+	//
+	// Two consumers share this stage: a file for whoever polls one, and a
+	// callback for an embedder holding the engine in-process. Either alone is
+	// reason enough to run; neither means there is nothing to publish.
+	if cfg.Publish.Path == "" && cfg.OnVerdict == nil {
 		<-ctx.Done()
 		return nil
 	}
@@ -1253,6 +1300,7 @@ func runVerdictPublisher(ctx context.Context, store *storage.Store, cfg Config) 
 	}
 
 	var last string
+	var lastDomains []string
 	writeOnce := func() {
 		domains, err := store.ListBlockedDomains(ctx)
 		if err != nil {
@@ -1262,6 +1310,17 @@ func runVerdictPublisher(ctx context.Context, store *storage.Store, cfg Config) 
 			logEngine.Error("publish: list failed", "err", err)
 			return
 		}
+		// The embedder hears about the verdict itself, not about its rendering,
+		// and hears about it before any file work — a client routing by name
+		// should not wait on the disk to learn what changed.
+		if cfg.OnVerdict != nil && !sameDomains(lastDomains, domains) {
+			lastDomains = append(lastDomains[:0], domains...)
+			cfg.OnVerdict(append([]string(nil), domains...))
+		}
+		if cfg.Publish.Path == "" {
+			return
+		}
+
 		body, err := renderVerdict(cfg.Publish.Format, domains)
 		if err != nil {
 			logEngine.Error("publish: cannot render", "err", err)
@@ -1384,4 +1443,19 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// sameDomains reports whether two verdict lists carry the same names.
+// ListBlockedDomains returns them ordered, so a positional compare is enough
+// and the callback fires on real changes rather than on every tick.
+func sameDomains(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
