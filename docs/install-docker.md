@@ -18,7 +18,7 @@
 ## Запуск
 
 ```bash
-docker compose -f release/docker/docker-compose.yml up -d
+docker compose -f packaging/docker/docker-compose.yml up -d
 docker exec -it ladon /opt/ladon/ladon doctor
 ```
 

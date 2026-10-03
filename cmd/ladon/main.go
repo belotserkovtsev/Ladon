@@ -48,9 +48,9 @@ var version = "dev"
 // fallback keeps `go run` working from the repo root.
 func defaultDBPath() string {
 	switch runtime.GOOS {
-	case "freebsd": // OPNsense plugin (release/opnsense/plugin/src/etc/rc.d/ladon)
+	case "freebsd": // OPNsense plugin (packaging/opnsense/plugin/src/etc/rc.d/ladon)
 		return "/var/db/ladon/engine.db"
-	case "linux": // systemd unit default prefix (release/ladon.service)
+	case "linux": // systemd unit default prefix (packaging/linux/ladon.service)
 		return "/opt/ladon/state/engine.db"
 	default:
 		return filepath.Join("state", "ladon.db")

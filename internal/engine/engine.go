@@ -157,7 +157,7 @@ type Config struct {
 	// AllowExtensions are bundled allow-list presets (e.g. "ai", "twitch")
 	// that ship with ladon and are opt-in by name. Each name resolves to
 	// ExtensionsPath/<name>.txt, which is loaded with the same parser as
-	// ManualAllowPath. See release/extensions/ for the shipped presets.
+	// ManualAllowPath. See packaging/extensions/ for the shipped presets.
 	AllowExtensions []string
 	ExtensionsPath  string // default "extensions" (relative to WorkingDirectory)
 

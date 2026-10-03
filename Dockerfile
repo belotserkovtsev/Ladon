@@ -32,9 +32,9 @@ RUN apk add --no-cache dnsmasq ipset iptables ip6tables iproute2 ca-certificates
 # Mirrors the layout the systemd unit uses, so paths read the same either way.
 WORKDIR /opt/ladon
 COPY --from=build /out/ladon /opt/ladon/ladon
-COPY release/extensions/ /opt/ladon/extensions/
-COPY release/docker/entrypoint.sh /opt/ladon/entrypoint.sh
-COPY release/docker/healthcheck.sh /opt/ladon/healthcheck.sh
+COPY packaging/extensions/ /opt/ladon/extensions/
+COPY packaging/docker/entrypoint.sh /opt/ladon/entrypoint.sh
+COPY packaging/docker/healthcheck.sh /opt/ladon/healthcheck.sh
 RUN chmod +x /opt/ladon/entrypoint.sh /opt/ladon/healthcheck.sh
 
 # Carried by the image so a plain `docker run` is watched too, not only compose.

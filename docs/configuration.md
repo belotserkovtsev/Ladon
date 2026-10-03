@@ -61,7 +61,7 @@ log:
 
 Полный набор полей с дефолтами смотри в
 [`internal/engine/Defaults()`](../internal/engine/engine.go) и
-[`release/config.yaml.example`](../release/config.yaml.example).
+[`packaging/config.yaml.example`](../packaging/config.yaml.example).
 
 > `promote_threshold` считает не сырые сетевые сбои, а итоговые вердикты
 > «заблокировано». Поэтому тонкие блокировки, где TCP и TLS проходят, а режется
@@ -290,7 +290,7 @@ probe:
 Как именно это отсекает ложные срабатывания, расписано в
 [методологии](methodology.md#второй-наблюдатель-exit-compare-опционально).
 Формат запросов к второй точке описан в [probe-api.md](probe-api.md). Готовая
-реализация на Go лежит в [`probe-server/ladon/`](../probe-server/ladon/): она
+реализация на Go лежит в [`cmd/probe-server/`](../cmd/probe-server/): она
 гоняет ровно те же стадии пробы, что и локальная, поэтому любое расхождение между
 точками говорит о разнице в сети, а не в логике проверки.
 

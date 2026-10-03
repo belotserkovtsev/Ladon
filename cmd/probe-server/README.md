@@ -14,7 +14,7 @@ Raspberry Pi за residential ISP) — замени `probeIt.Probe(...)` в `mai
 ## Сборка и запуск
 
 ```bash
-cd probe-server/ladon
+cd cmd/probe-server
 go build -o probe-server .
 ./probe-server -listen :8080 -token secret -timeout 2s
 ```

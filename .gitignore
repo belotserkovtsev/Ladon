@@ -1,5 +1,5 @@
 .DS_Store
-state/*.db
+state/
 /ladon
 /ladon.exe
 /dist/
