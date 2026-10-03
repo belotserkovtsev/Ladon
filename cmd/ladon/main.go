@@ -843,6 +843,17 @@ func doctorCmd(ctx context.Context, store *storage.Store, configPath string, res
 	cfg := engine.Defaults("")
 	applyConfigFile(&cfg, file)
 
+	// The kernel sets can only be read as root. Run without it, every set check
+	// sees nothing but "operation not permitted", and a report built on that
+	// is worse than none: it calls the engine set missing and suggests
+	// recreating it and restarting the daemon, on a gateway where both are
+	// fine. So doctor says what it needs instead of reporting on what it could
+	// not see. Without sets configured there is nothing to read, and root is
+	// not asked for.
+	if cfg.IpsetName != "" && (runtime.GOOS == "linux" || runtime.GOOS == "freebsd") && os.Geteuid() != 0 {
+		fatal("doctor читает наборы ядра, а без root они не видны — запусти: sudo ladon doctor")
+	}
+
 	rep := doctor.Run(ctx, store, doctor.Params{
 		Version:         version,
 		IpsetEngineName: cfg.IpsetName,
