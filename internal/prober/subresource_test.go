@@ -223,10 +223,114 @@ func TestSameOriginSubresource(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := sameOriginSubresource([]byte(c.html), "example.com"); got != c.want {
-				t.Errorf("got %q want %q", got, c.want)
+			if got := sameOriginSubresource([]byte(c.html), "example.com", "/"); got.path != c.want {
+				t.Errorf("got %q want %q", got.path, c.want)
 			}
 		})
+	}
+}
+
+// TestSameOriginSubresource_PageBase — a relative reference resolves against
+// the page it came from, which after a redirect is no longer the root.
+func TestSameOriginSubresource_PageBase(t *testing.T) {
+	cases := []struct{ page, src, want string }{
+		{"/int/en", "assets/x.js", "/int/assets/x.js"},
+		{"/int/en/", "assets/x.js", "/int/en/assets/x.js"},
+		{"/int/en", "/assets/x.js", "/assets/x.js"},
+		{"/int/en?x=1", "x.js", "/int/x.js"},
+	}
+	for _, c := range cases {
+		html := `<script src="` + c.src + `"></script>`
+		if got := sameOriginSubresource([]byte(html), "example.com", c.page); got.path != c.want {
+			t.Errorf("page %q src %q: got %q want %q", c.page, c.src, got.path, c.want)
+		}
+	}
+}
+
+// TestSameOriginSubresource_Kind — the asset comes with what it is, since the
+// request for a module, a classic script and a stylesheet each read differently.
+func TestSameOriginSubresource_Kind(t *testing.T) {
+	cases := []struct {
+		name, html string
+		want       fetchKind
+	}{
+		{"classic script", `<script src="/a.js"></script>`, fetchScript},
+		{"module script", `<script type="module" src="/a.js"></script>`, fetchModule},
+		{"stylesheet", `<link rel="stylesheet" href="/a.css">`, fetchStyle},
+		{"module preload", `<link rel="modulepreload" href="/a.js">`, fetchModule},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := sameOriginSubresource([]byte(c.html), "example.com", "/"); got.kind != c.want {
+				t.Errorf("kind %d want %d", got.kind, c.want)
+			}
+		})
+	}
+}
+
+// TestRequestsReadAsChrome — both requests must carry what a bot filter looks
+// for in a browser's: a navigation that asks for a document, an asset fetch
+// that names its destination and the page it came from, one Chrome release
+// across the User-Agent and the client hints. And no Accept-Encoding: the
+// cutoff counts bytes on the wire, and compression shrinks them below it.
+func TestRequestsReadAsChrome(t *testing.T) {
+	var page, bundle atomic.Pointer[http.Header]
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		h := r.Header.Clone()
+		page.Store(&h)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, smallSPA)
+	})
+	mux.HandleFunc("/assets/index.js", func(w http.ResponseWriter, r *http.Request) {
+		h := r.Header.Clone()
+		bundle.Store(&h)
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Write([]byte(strings.Repeat("a", 2*httpReadLimit)))
+	})
+	srv := httptest.NewTLSServer(mux)
+	defer srv.Close()
+
+	runHTTPStage(t, srv, 2*time.Second)
+
+	pg, bn := page.Load(), bundle.Load()
+	if pg == nil || bn == nil {
+		t.Fatalf("page seen=%v, bundle seen=%v: both requests must reach the server", pg != nil, bn != nil)
+	}
+	expect := func(what string, h *http.Header, key, want string) {
+		t.Helper()
+		if got := h.Get(key); got != want {
+			t.Errorf("%s %s = %q want %q", what, key, got, want)
+		}
+	}
+	if !strings.HasPrefix(pg.Get("Accept"), "text/html") {
+		t.Errorf("page Accept = %q: a navigation asks for a document, and Accept: */* is what draws the 403", pg.Get("Accept"))
+	}
+	expect("page", pg, "Sec-Fetch-Mode", "navigate")
+	expect("page", pg, "Sec-Fetch-Dest", "document")
+	// smallSPA loads its bundle as a module, so it is fetched in cors mode, with an Origin.
+	expect("bundle", bn, "Sec-Fetch-Mode", "cors")
+	expect("bundle", bn, "Sec-Fetch-Dest", "script")
+	expect("bundle", bn, "Sec-Fetch-Site", "same-origin")
+	expect("bundle", bn, "Origin", "https://example.com")
+	expect("bundle", bn, "Referer", "https://example.com/")
+	for what, h := range map[string]*http.Header{"page": pg, "bundle": bn} {
+		if ae := h.Get("Accept-Encoding"); ae != "" {
+			t.Errorf("%s Accept-Encoding = %q, want none", what, ae)
+		}
+		ua := h.Get("User-Agent")
+		i := strings.Index(ua, "Chrome/")
+		if i < 0 {
+			t.Fatalf("%s User-Agent %q names no Chrome release", what, ua)
+		}
+		major, _, _ := strings.Cut(ua[i+len("Chrome/"):], ".")
+		if !strings.Contains(h.Get("Sec-Ch-Ua"), `"Google Chrome";v="`+major+`"`) {
+			t.Errorf("%s client hints %q name another release than User-Agent %q", what, h.Get("Sec-Ch-Ua"), ua)
+		}
 	}
 }
 
