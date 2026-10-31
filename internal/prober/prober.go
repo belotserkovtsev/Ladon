@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/html"
 )
 
@@ -46,6 +47,56 @@ var DialControl func(network, address string, c syscall.RawConn) error
 // dialer builds the probe's dialer with DialControl applied.
 func dialer(timeout time.Duration) *net.Dialer {
 	return &net.Dialer{Timeout: timeout, Control: DialControl}
+}
+
+// tlsConn is a live, probed TLS connection, abstracted over the stack that
+// built it. The handshake is Chrome's, sent through uTLS, so the ClientHello a
+// bot filter or a ClientHello-targeting middlebox sees is the one it sees from
+// a browser, not Go's — the request headers alone (browserGET) are not enough
+// when the filter fingerprints the hello. The caller keeps reading the HTTP
+// stage on the embedded net.Conn and must Close it. Only the two facts later
+// stages read are carried forward: the negotiated version (the 1.3/1.2 split)
+// and the peer chain (the cert-substitution check).
+type tlsConn struct {
+	net.Conn
+	cs tls.ConnectionState
+}
+
+// ConnectionState exposes the carried version and peer certificates in the
+// crypto/tls shape interceptCode and the tests already read.
+func (c *tlsConn) ConnectionState() tls.ConnectionState { return c.cs }
+
+// chromeSpec returns a Chrome ClientHello spec adjusted for the probe. ALPN is
+// pinned to HTTP/1.1: the HTTP stage speaks 1.1 and counts bytes on the wire,
+// and h2 framing would hide the cutoff. When maxVersion is set, supported
+// versions above it are dropped (GREASE kept) so the 1.2 retry offers a real
+// 1.2 hello rather than a 1.3 one the server negotiates down — that offer is
+// what tells ClientHello-targeting DPI apart.
+func chromeSpec(maxVersion uint16) (*utls.ClientHelloSpec, error) {
+	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
+	if err != nil {
+		return nil, err
+	}
+	for _, ext := range spec.Extensions {
+		switch e := ext.(type) {
+		case *utls.ALPNExtension:
+			e.AlpnProtocols = []string{"http/1.1"}
+		case *utls.SupportedVersionsExtension:
+			if maxVersion == 0 {
+				continue
+			}
+			kept := e.Versions[:0]
+			for _, v := range e.Versions {
+				// GREASE (v&0x0f0f==0x0a0a) is a decoy the server ignores;
+				// keep it so the capped hello still looks like Chrome's.
+				if v <= maxVersion || v&0x0f0f == 0x0a0a {
+					kept = append(kept, v)
+				}
+			}
+			e.Versions = kept
+		}
+	}
+	return &spec, nil
 }
 
 // Result holds the outcome of a staged probe.
@@ -261,11 +312,11 @@ func liftTLS13Verdict(r *Result) {
 // TLSOK and HTTPOK are set to true so decision.Classify treats the result
 // as Ignore. mTLS-required servers (Apple Push, iCloud Private Relay) hit
 // this path.
-func probeTLSStaged(r *Result, ip, port string, timeout time.Duration) *tls.Conn {
-	conn, code, reason, version := tlsHandshake(ip, port, r.Domain, timeout, 0)
+func probeTLSStaged(r *Result, ip, port string, timeout time.Duration) *tlsConn {
+	conn, code, reason := tlsHandshake(ip, port, r.Domain, timeout, 0)
 	if conn != nil {
 		r.TLSOK = true
-		recordTLSVersion(r, version)
+		recordTLSVersion(r, conn.cs.Version)
 		return conn
 	}
 	// First attempt failed. Two sub-cases:
@@ -295,7 +346,7 @@ func probeTLSStaged(r *Result, ip, port string, timeout time.Duration) *tls.Conn
 	// underlying socket too. We already paid for one failed handshake so
 	// this can stretch latency, but it's the price of distinguishing
 	// "real block" from "1.3-only block".
-	conn2, code2, _, _ := tlsHandshake(ip, port, r.Domain, timeout, tls.VersionTLS12)
+	conn2, code2, _ := tlsHandshake(ip, port, r.Domain, timeout, tls.VersionTLS12)
 	if conn2 != nil {
 		t := true
 		r.TLS12OK = &t
@@ -321,25 +372,46 @@ func probeTLSStaged(r *Result, ip, port string, timeout time.Duration) *tls.Conn
 	return nil
 }
 
-// tlsHandshake runs one TLS dial. maxVersion=0 means "unrestricted" (Go
-// negotiates whatever it can). Returns the live conn on success so the
-// caller can run further stages (HTTP probe) without a fresh dial.
-func tlsHandshake(ip, port, sni string, timeout time.Duration, maxVersion uint16) (conn *tls.Conn, code FailureCode, reason string, version uint16) {
-	cfg := &tls.Config{
-		ServerName:         sni,
-		InsecureSkipVerify: true, // #nosec G402 — we're probing reachability, not verifying identity
-	}
-	if maxVersion != 0 {
-		cfg.MaxVersion = maxVersion
-	}
-	c, err := tls.DialWithDialer(dialer(timeout),
-		"tcp", net.JoinHostPort(ip, port), cfg)
+// tlsHandshake runs one browser-shaped TLS dial to ip:port for sni, using a
+// Chrome ClientHello (see chromeSpec). maxVersion=0 offers up to TLS 1.3, as
+// Chrome does; a cap drives the 1.2 retry. It returns a live tlsConn the caller
+// keeps reading on and must Close, or the categorized failure.
+//
+// The raw TCP connect goes through dialer() so DialControl still binds the
+// socket to the physical interface — a probe through the client's own tunnel
+// would call every diverted name reachable. A deadline covers the handshake
+// and is cleared on success so the HTTP stage can set its own.
+func tlsHandshake(ip, port, sni string, timeout time.Duration, maxVersion uint16) (*tlsConn, FailureCode, string) {
+	raw, err := dialer(timeout).Dial("tcp", net.JoinHostPort(ip, port))
 	if err != nil {
 		code := categorize(stageTLS, err)
-		return nil, code, formatReason(code, err), 0
+		return nil, code, formatReason(code, err)
 	}
-	state := c.ConnectionState()
-	return c, CodeOK, "", state.Version
+	fail := func(err error) (*tlsConn, FailureCode, string) {
+		raw.Close()
+		code := categorize(stageTLS, err)
+		return nil, code, formatReason(code, err)
+	}
+	if err := raw.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return fail(err)
+	}
+	spec, err := chromeSpec(maxVersion)
+	if err != nil {
+		return fail(err)
+	}
+	// #nosec G402 — reachability probe; identity is weighed separately in interceptCode.
+	c := utls.UClient(raw, &utls.Config{ServerName: sni, InsecureSkipVerify: true}, utls.HelloCustom)
+	if err := c.ApplyPreset(spec); err != nil {
+		return fail(err)
+	}
+	if err := c.Handshake(); err != nil {
+		return fail(err)
+	}
+	if err := raw.SetDeadline(time.Time{}); err != nil {
+		return fail(err)
+	}
+	st := c.ConnectionState()
+	return &tlsConn{Conn: c, cs: tls.ConnectionState{Version: st.Version, PeerCertificates: st.PeerCertificates}}, CodeOK, ""
 }
 
 // interceptCode reports CodeTLSIntercept when the peer's certificate chains to
@@ -390,11 +462,75 @@ func recordTLSVersion(r *Result, version uint16) {
 	}
 }
 
-// probeHTTPStaged sends a minimal GET on a live TLS conn and tries to
-// consume up to httpReadLimit bytes of the response. It catches the
-// "TLS handshake fine, but DPI cuts the actual stream after N KB" pattern
-// that classifies linkedin.com / instagram.com / rutracker.org under
-// existing TCP+TLS-only probing — the L7-blindspot we want to close.
+// The probe's HTTP requests copy Chrome's. Bot filters in front of CDNs judge
+// the request, not the TLS client: on Akamai a client that calls itself
+// Mozilla and asks for a page with "Accept: */*" draws a 373-byte 403, while
+// the same request with Chrome's navigation headers gets the page, from Go's
+// own handshake as from a copied Chrome one. A 403 that short can never show
+// the cutoff, so the probe called such a path clear while a browser's
+// downloads on it froze at ~16 KB.
+//
+// The User-Agent and the client hints name one Chrome release; move them
+// together, since a request that contradicts itself is what the filters catch.
+const (
+	chromeUA    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
+	chromeHints = `"Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156"`
+)
+
+// fetchKind is what a request asks for. A browser states it in the Sec-Fetch
+// headers, and a filter checks them against what is fetched.
+type fetchKind int
+
+const (
+	fetchPage   fetchKind = iota // the navigation itself
+	fetchScript                  // a classic <script src>
+	fetchModule                  // a module script or a <link rel=modulepreload>
+	fetchStyle                   // a <link rel=stylesheet>
+)
+
+// asset is a resource a page loads from its own host.
+type asset struct {
+	path string
+	kind fetchKind
+}
+
+// browserGET renders an HTTP/1.1 GET the way Chrome sends one for this kind of
+// fetch. It departs from Chrome twice, and Akamai answers both normally: no
+// Accept-Encoding, because the cutoff counts bytes on the wire and a page
+// compressed below ~16 KB finishes where the full one would freeze; and
+// Connection: close, because the probe reads one response and leaves.
+func browserGET(host, path string, kind fetchKind) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n", path, host)
+	fmt.Fprintf(&b, "sec-ch-ua: %s\r\nsec-ch-ua-mobile: ?0\r\nsec-ch-ua-platform: \"Windows\"\r\n", chromeHints)
+	if kind == fetchPage {
+		b.WriteString("Upgrade-Insecure-Requests: 1\r\n")
+	}
+	fmt.Fprintf(&b, "User-Agent: %s\r\n", chromeUA)
+	switch kind {
+	case fetchPage:
+		b.WriteString("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7\r\n" +
+			"Sec-Fetch-Site: none\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-User: ?1\r\nSec-Fetch-Dest: document\r\n")
+	case fetchStyle:
+		b.WriteString("Accept: text/css,*/*;q=0.1\r\nSec-Fetch-Site: same-origin\r\nSec-Fetch-Mode: no-cors\r\nSec-Fetch-Dest: style\r\n")
+	case fetchModule:
+		fmt.Fprintf(&b, "Origin: https://%s\r\nAccept: */*\r\nSec-Fetch-Site: same-origin\r\nSec-Fetch-Mode: cors\r\nSec-Fetch-Dest: script\r\n", host)
+	default:
+		b.WriteString("Accept: */*\r\nSec-Fetch-Site: same-origin\r\nSec-Fetch-Mode: no-cors\r\nSec-Fetch-Dest: script\r\n")
+	}
+	if kind != fetchPage {
+		fmt.Fprintf(&b, "Referer: https://%s/\r\n", host)
+	}
+	b.WriteString("Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7\r\n\r\n")
+	return b.String()
+}
+
+// probeHTTPStaged sends a page GET shaped like Chrome's (see browserGET) on a
+// live TLS conn and tries to consume up to httpReadLimit bytes of the
+// response. It catches the "TLS handshake fine, but DPI cuts the actual stream
+// after N KB" pattern that classifies linkedin.com / instagram.com /
+// rutracker.org under existing TCP+TLS-only probing — the L7-blindspot we want
+// to close.
 //
 // HTTPOK is a tri-state: nil if we didn't run the stage (caller skipped),
 // ptr(true) if a complete response (any status) was parsed, ptr(false)
@@ -409,18 +545,18 @@ func recordTLSVersion(r *Result, version uint16) {
 // probe saw a clean response and called it clear. So when the page is small
 // HTML, one same-origin asset from it is fetched too (see probeSubresource):
 // that is where the bytes live, and where a browser hits the cutoff.
-func probeHTTPStaged(r *Result, conn *tls.Conn, timeout time.Duration) {
+//
+// A landing page that answers with a redirect proves even less: it has no body
+// at all. When it points elsewhere on the same host, the probe follows it and
+// checks that page instead (see probeRedirect).
+func probeHTTPStaged(r *Result, conn *tlsConn, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	if err := conn.SetDeadline(deadline); err != nil {
 		setHTTPFail(r, stageHTTP, err)
 		return
 	}
 
-	req := fmt.Sprintf(
-		"GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (compatible; ladon-probe)\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-		r.Domain,
-	)
-	if _, err := io.WriteString(conn, req); err != nil {
+	if _, err := io.WriteString(conn, browserGET(r.Domain, "/", fetchPage)); err != nil {
 		setHTTPFail(r, stageHTTP, err)
 		return
 	}
@@ -463,12 +599,117 @@ func probeHTTPStaged(r *Result, conn *tls.Conn, timeout time.Duration) {
 	t := true
 	r.HTTPOK = &t
 
+	if to := redirectTarget(resp, r.Domain, "/"); to != "" {
+		probeRedirect(r, conn, to, timeout)
+		return
+	}
 	if len(body) < httpReadLimit && resp.StatusCode/100 == 2 &&
 		isHTML(resp.Header.Get("Content-Type"), body) {
-		if path := sameOriginSubresource(body, r.Domain); path != "" {
-			probeSubresource(r, conn, path, timeout)
+		if a := sameOriginSubresource(body, r.Domain, "/"); a.path != "" {
+			probeSubresource(r, conn, a, timeout)
 		}
 	}
+}
+
+// maxRedirects bounds how far the probe follows the landing page's redirects.
+// A browser goes further, but one or two hops cover the landing redirects that
+// matter here (/ → /en, / → /home), and the bound keeps a loop from eating the
+// probe's time.
+const maxRedirects = 2
+
+// redirectTarget returns the path a same-host redirect points to, or "" when
+// the response is no redirect or points where the probe cannot follow: another
+// host has addresses the probe does not hold, and the engine probes that name
+// on its own once the browser resolves it.
+func redirectTarget(resp *http.Response, domain, from string) string {
+	switch resp.StatusCode {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+	default:
+		return ""
+	}
+	base, err := url.Parse("https://" + domain + from)
+	if err != nil {
+		return ""
+	}
+	if to := resolveSameOrigin(base, resp.Header.Get("Location"), domain); to != from {
+		return to
+	}
+	return ""
+}
+
+// probeRedirect follows a same-host redirect from the landing page, the way the
+// browser does, and checks the page it leads to. A redirect carries no body, so
+// the cutoff cannot show on it, and the probe called such a site clear while
+// the page the browser actually lands on froze at ~16 KB.
+//
+// Each hop opens a fresh connection to the same address, with no newer TLS than
+// the landing page negotiated, as probeSubresource does and for the same
+// reasons.
+func probeRedirect(r *Result, page *tlsConn, to string, timeout time.Duration) {
+	ip, port, err := net.SplitHostPort(page.RemoteAddr().String())
+	if err != nil {
+		return
+	}
+	version := page.ConnectionState().Version
+	for hop := 0; hop < maxRedirects && to != ""; hop++ {
+		to = probeRedirectHop(r, ip, port, version, to, timeout)
+	}
+}
+
+// probeRedirectHop fetches one redirect target and returns where it redirects
+// on to, or "" once the chain ends.
+//
+// Like probeSubresource it acts on one signature only: bytes flowed, then
+// stopped. A handshake that fails, headers that never come, a non-2xx answer —
+// none of these say anything about the cutoff, so the verdict stays as the
+// landing page left it. A small HTML target gets the asset check a small
+// landing page would.
+func probeRedirectHop(r *Result, ip, port string, version uint16, path string, timeout time.Duration) string {
+	conn, _, _ := tlsHandshake(ip, port, r.Domain, timeout, version)
+	if conn == nil {
+		return ""
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return ""
+	}
+	if _, err := io.WriteString(conn, browserGET(r.Domain, path, fetchPage)); err != nil {
+		return ""
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if next := redirectTarget(resp, r.Domain, path); next != "" {
+		return next
+	}
+	if resp.StatusCode/100 != 2 {
+		return ""
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, httpReadLimit))
+	if err != nil {
+		if len(body) == 0 {
+			return "" // never started: no cutoff seen
+		}
+		// Classify the raw error: categorize recognises a timeout by its type,
+		// so the context below goes into the reason only.
+		if code := categorize(stageHTTP, err); !IsServerReachable(code) {
+			f := false
+			r.HTTPOK = &f
+			r.FailureCode = code
+			r.FailureReason = formatReason(code, fmt.Errorf("redirected to %s, cut after %d bytes: %w", path, len(body), err))
+		}
+		return ""
+	}
+	if len(body) < httpReadLimit && isHTML(resp.Header.Get("Content-Type"), body) {
+		if a := sameOriginSubresource(body, r.Domain, path); a.path != "" {
+			probeSubresource(r, conn, a, timeout)
+		}
+	}
+	return ""
 }
 
 // probeSubresource fetches one same-origin asset from the address the page
@@ -484,7 +725,7 @@ func probeHTTPStaged(r *Result, conn *tls.Conn, timeout time.Duration) {
 // about the cutoff, and the page did load, so the verdict is left untouched. A
 // false block here would tunnel a working site; a missed one costs no more than
 // the probe already missed before this stage existed.
-func probeSubresource(r *Result, page *tls.Conn, path string, timeout time.Duration) {
+func probeSubresource(r *Result, page *tlsConn, a asset, timeout time.Duration) {
 	ip, port, err := net.SplitHostPort(page.RemoteAddr().String())
 	if err != nil {
 		return
@@ -492,7 +733,7 @@ func probeSubresource(r *Result, page *tls.Conn, path string, timeout time.Durat
 	// Same address, same name, and no newer TLS than the page negotiated: if
 	// 1.3 is what is being blocked, the asset must not trip over that instead
 	// of over the cutoff we are looking for.
-	conn, _, _, _ := tlsHandshake(ip, port, r.Domain, timeout, page.ConnectionState().Version)
+	conn, _, _ := tlsHandshake(ip, port, r.Domain, timeout, page.ConnectionState().Version)
 	if conn == nil {
 		return
 	}
@@ -501,11 +742,7 @@ func probeSubresource(r *Result, page *tls.Conn, path string, timeout time.Durat
 		return
 	}
 
-	req := fmt.Sprintf(
-		"GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (compatible; ladon-probe)\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-		path, r.Domain,
-	)
-	if _, err := io.WriteString(conn, req); err != nil {
+	if _, err := io.WriteString(conn, browserGET(r.Domain, a.path, a.kind)); err != nil {
 		return
 	}
 	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
@@ -530,7 +767,7 @@ func probeSubresource(r *Result, page *tls.Conn, path string, timeout time.Durat
 	f := false
 	r.HTTPOK = &f
 	r.FailureCode = code
-	r.FailureReason = formatReason(code, fmt.Errorf("subresource %s cut after %d bytes: %w", path, n, err))
+	r.FailureReason = formatReason(code, fmt.Errorf("subresource %s cut after %d bytes: %w", a.path, n, err))
 }
 
 // sameOriginSubresource picks the asset most likely to be large: the first
@@ -538,9 +775,14 @@ func probeSubresource(r *Result, page *tls.Conn, path string, timeout time.Durat
 // module preload. Only same-origin URLs qualify — the probe has this host's
 // addresses and no others. An asset on another host is that host's own name;
 // the resolver sees it when the browser asks, and the engine probes it then.
-func sameOriginSubresource(body []byte, domain string) string {
-	base := &url.URL{Scheme: "https", Host: domain, Path: "/"}
-	style := ""
+// The kind comes along so the request for it reads as the page's own. Relative
+// references resolve against page, the path the markup was served from.
+func sameOriginSubresource(body []byte, domain, page string) asset {
+	base, err := url.Parse("https://" + domain + page)
+	if err != nil {
+		return asset{}
+	}
+	var style asset
 	z := html.NewTokenizer(bytes.NewReader(body))
 	for {
 		tt := z.Next()
@@ -564,15 +806,22 @@ func sameOriginSubresource(body []byte, domain string) string {
 		switch tag {
 		case "script":
 			if p := resolveSameOrigin(base, attrs["src"], domain); p != "" {
-				return p
+				if strings.EqualFold(strings.TrimSpace(attrs["type"]), "module") {
+					return asset{p, fetchModule}
+				}
+				return asset{p, fetchScript}
 			}
 		case "link":
-			if style != "" {
+			if style.path != "" {
 				continue
 			}
 			for _, rel := range strings.Fields(strings.ToLower(attrs["rel"])) {
 				if rel == "stylesheet" || rel == "modulepreload" {
-					style = resolveSameOrigin(base, attrs["href"], domain)
+					kind := fetchStyle
+					if rel == "modulepreload" {
+						kind = fetchModule
+					}
+					style = asset{resolveSameOrigin(base, attrs["href"], domain), kind}
 					break
 				}
 			}
